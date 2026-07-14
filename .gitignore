@@ -3,6 +3,7 @@ dist/
 .scratch/
 .playwright-cli/
 output/
+test-results/
 .env
 .env.*
 !.env.example

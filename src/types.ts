@@ -1,5 +1,7 @@
 export type StoryStatus = "active" | "paused" | "completed" | "archived";
 
+export type UserRole = "reader" | "admin";
+
 export type CoverTheme = "tide" | "fog" | "moon" | "ember" | "forest";
 
 export interface ChapterRevision {
@@ -70,10 +72,18 @@ export interface RetconChange {
   kind: "required" | "supporting" | "outline";
   summary: string;
   revisionId?: string;
+  previousRevisionId?: string;
+}
+
+export interface CharacterStateSnapshot {
+  characterId: string;
+  before: Pick<CharacterProfile, "status" | "location" | "role">;
+  after: Pick<CharacterProfile, "status" | "location" | "role">;
 }
 
 export interface RetconTransaction {
   id: string;
+  kind: "intervention" | "rollback";
   title: string;
   sourceText: string;
   summary: string;
@@ -82,7 +92,11 @@ export interface RetconTransaction {
   canonVersionAfter: number;
   changes: RetconChange[];
   cost: string;
-  status: "committed" | "rolled_back";
+  status: "committed" | "reversed";
+  targetEventId?: string;
+  reversesRetconId?: string;
+  reversedByRetconId?: string;
+  characterSnapshots?: CharacterStateSnapshot[];
 }
 
 export type ConversationMessageType =
@@ -109,13 +123,58 @@ export interface ReadingProgress {
   updatedAt: string;
 }
 
+export interface StoryGene {
+  version: number;
+  protagonistPosition: string;
+  visibleGoal: string;
+  hiddenNeed: string;
+  conflictEngine: string;
+  recurringCost: string;
+  endingShape: string;
+  creativeAxes: string[];
+  createdAt: string;
+}
+
+export interface EndingContract {
+  version: number;
+  targetEnding: string;
+  characterArc: string;
+  prerequisites: string[];
+  status: "viable" | "needs_review" | "reframed";
+  lastEvaluatedAt: string;
+}
+
+export type StoryEventType =
+  | "discovery"
+  | "choice"
+  | "relationship"
+  | "death"
+  | "survival"
+  | "consequence";
+
+export interface StoryEvent {
+  id: string;
+  chapterNumber: number;
+  revisionId: string;
+  type: StoryEventType;
+  title: string;
+  cause: string;
+  outcome: string;
+  participantIds: string[];
+  location: string;
+  dependsOn: string[];
+  active: boolean;
+}
+
 export interface Story {
   id: string;
+  ownerId: string;
   title: string;
   subtitle: string;
   genre: string;
   tone: string;
   length: string;
+  targetChapterCount: number;
   inspiration: string;
   coverTheme: CoverTheme;
   status: StoryStatus;
@@ -126,6 +185,9 @@ export interface Story {
   updatedAt: string;
   unreadCanonChanges: number;
   readingProgress: ReadingProgress;
+  storyGene: StoryGene;
+  endingContract: EndingContract;
+  events: StoryEvent[];
   chapters: Chapter[];
   characters: CharacterProfile[];
   rules: StoryRule[];
@@ -143,6 +205,7 @@ export interface StorySummary {
   genre: string;
   tone: string;
   length: string;
+  targetChapterCount: number;
   coverTheme: CoverTheme;
   status: StoryStatus;
   canonVersion: number;
@@ -184,6 +247,7 @@ export interface ModelConnection {
   id: string;
   name: string;
   ownerScope: "platform" | "user";
+  ownerId: string | null;
   protocol: "openai_compatible";
   baseUrl: string;
   maskedKey: string;
@@ -202,11 +266,29 @@ export interface GenerationJob {
   chapterNumber: number;
   task: "chapter" | "retcon" | "extract";
   model: string;
+  connectionId: string;
+  promptVersion: string;
   status: "completed" | "running" | "failed";
   tokens: number;
   latencyMs: number;
   cost: number;
   createdAt: string;
+  candidateTrace?: NarrativeCandidate[];
+  filterSummary?: string;
+}
+
+export interface NarrativeCandidate {
+  id: string;
+  seed: number;
+  creativeAxis: string;
+  event: string;
+  cause: string;
+  cost: string;
+  impact: string;
+  novelty: string;
+  score: number;
+  status: "selected" | "rejected";
+  reasons: string[];
 }
 
 export interface OpsMetrics {
@@ -218,25 +300,66 @@ export interface OpsMetrics {
   activeStories: number;
 }
 
+export interface UserAccount {
+  id: string;
+  email: string;
+  passwordSalt: string;
+  passwordHash: string;
+  name: string;
+  initials: string;
+  role: UserRole;
+  activeStoryId: string | null;
+  defaultConnectionId: string;
+}
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  name: string;
+  initials: string;
+  role: UserRole;
+  activeStoryId: string | null;
+  defaultConnectionId: string;
+}
+
+export interface AuthSession {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface AuditEvent {
+  id: string;
+  actorUserId: string;
+  action: string;
+  targetType: "auth" | "story" | "connection" | "generation" | "retcon";
+  targetId: string;
+  createdAt: string;
+  metadata: Record<string, string | number | boolean>;
+}
+
 export interface AppStore {
-  user: {
-    id: string;
-    name: string;
-    initials: string;
-    activeStoryId: string | null;
-    defaultConnectionId: string;
-  };
+  users: UserAccount[];
+  sessions: AuthSession[];
   stories: Story[];
   connections: ModelConnection[];
   jobs: GenerationJob[];
+  auditEvents: AuditEvent[];
   metrics: OpsMetrics;
   idempotencyKeys: string[];
 }
 
 export interface BootstrapPayload {
-  user: AppStore["user"];
+  user: UserProfile;
   stories: StorySummary[];
   activeStoryId: string | null;
+}
+
+export interface AuthPayload {
+  token: string;
+  user: UserProfile;
 }
 
 export interface CreateStoryInput {

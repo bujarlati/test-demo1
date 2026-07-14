@@ -3,6 +3,7 @@ import {
   BookOpenText,
   ChevronRight,
   Library,
+  LogOut,
   Plus,
   Settings2,
 } from "lucide-react";
@@ -18,15 +19,18 @@ const navigation = [
 ];
 
 export function AppShell() {
-  const { data } = useApp();
+  const { data, logout } = useApp();
   const activeStory = data?.stories.find((story) => story.id === data.activeStoryId);
+  const visibleNavigation = data?.user.role === "admin"
+    ? navigation
+    : navigation.filter((item) => item.to !== "/settings/models" && item.to !== "/ops");
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
       <aside className="sidebar">
         <Logo />
         <nav className="sidebar__nav" aria-label="主导航">
-          {navigation.map(({ to, label, icon: Icon, end }) => (
+          {visibleNavigation.map(({ to, label, icon: Icon, end }) => (
             <NavLink key={to} to={to} end={end} className={({ isActive }) => (isActive ? "active" : "")}>
               <Icon size={18} strokeWidth={1.8} />
               <span>{label}</span>
@@ -49,8 +53,9 @@ export function AppShell() {
           <span className="avatar">{data?.user.initials ?? "默"}</span>
           <span>
             <strong>{data?.user.name ?? "读者"}</strong>
-            <small>私人书架</small>
+            <small>{data?.user.role === "admin" ? "平台管理员 · 私人书架" : "私人书架"}</small>
           </span>
+          <button type="button" aria-label="退出登录" title="退出登录" onClick={() => void logout()}><LogOut size={16} /></button>
         </div>
       </aside>
 
@@ -64,7 +69,7 @@ export function AppShell() {
       </main>
 
       <nav className="mobile-nav" aria-label="移动端主导航">
-        {navigation.slice(0, 3).map(({ to, label, icon: Icon, end }) => (
+        {visibleNavigation.filter((item) => item.to !== "/ops").slice(0, 3).map(({ to, label, icon: Icon, end }) => (
           <NavLink key={to} to={to} end={end} className={({ isActive }) => (isActive ? "active" : "")}>
             <Icon size={20} />
             <span>{label === "开始新故事" ? "新故事" : label.replace("我的", "")}</span>

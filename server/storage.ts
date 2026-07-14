@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AppStore } from "../src/types";
@@ -7,6 +7,7 @@ import { createSeedStore } from "./seed";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const dataDirectory = path.join(currentDirectory, "data");
 const storePath = path.join(dataDirectory, "store.json");
+let saveQueue = Promise.resolve();
 
 export async function loadStore(): Promise<AppStore> {
   await mkdir(dataDirectory, { recursive: true });
@@ -25,6 +26,12 @@ export async function loadStore(): Promise<AppStore> {
 }
 
 export async function saveStore(store: AppStore): Promise<void> {
-  await mkdir(dataDirectory, { recursive: true });
-  await writeFile(storePath, JSON.stringify(store, null, 2), "utf8");
+  const snapshot = JSON.stringify(store, null, 2);
+  saveQueue = saveQueue.catch(() => undefined).then(async () => {
+    await mkdir(dataDirectory, { recursive: true });
+    const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, snapshot, "utf8");
+    await rename(temporaryPath, storePath);
+  });
+  await saveQueue;
 }

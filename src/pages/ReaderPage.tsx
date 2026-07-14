@@ -41,6 +41,7 @@ import { ErrorState, LoadingState } from "../components/States";
 import { Logo } from "../components/Logo";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
+import { currentRevision } from "../storyDomain";
 import type { Chapter, ConversationMessage, Story } from "../types";
 import { formatDateTime } from "../utils";
 
@@ -62,10 +63,6 @@ function loadSettings(): ReaderSettings {
   } catch {
     return defaultSettings;
   }
-}
-
-function revisionOf(chapter: Chapter) {
-  return chapter.revisions.find((revision) => revision.id === chapter.currentRevisionId) ?? chapter.revisions.at(-1);
 }
 
 function ConversationCard({ message, story }: { message: ConversationMessage; story: Story }) {
@@ -103,6 +100,9 @@ export function ReaderPage() {
   const [sending, setSending] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [generationStage, setGenerationStage] = useState(0);
+  const [streamedTitle, setStreamedTitle] = useState("");
+  const [streamedParagraphs, setStreamedParagraphs] = useState<string[]>([]);
+  const [generationFailure, setGenerationFailure] = useState<string | null>(null);
   const [selection, setSelection] = useState("");
   const progressTimer = useRef<number | null>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
@@ -126,7 +126,7 @@ export function ReaderPage() {
 
   const currentIndex = story?.chapters.findIndex((chapter) => chapter.id === chapterId) ?? -1;
   const chapter = currentIndex >= 0 ? story?.chapters[currentIndex] ?? null : story?.chapters.at(-1) ?? null;
-  const revision = chapter ? revisionOf(chapter) : null;
+  const revision = chapter ? currentRevision(chapter) : null;
 
   useEffect(() => {
     if (!story || !chapter) return;
@@ -185,19 +185,27 @@ export function ReaderPage() {
 
   const generateNext = async () => {
     if (!story || generating) return;
-    setGenerating(true); setGenerationStage(0);
-    const timer = window.setInterval(() => setGenerationStage((value) => Math.min(4, value + 1)), 650);
+    setGenerating(true); setGenerationStage(0); setStreamedTitle(""); setStreamedParagraphs([]); setGenerationFailure(null);
     try {
-      const result = await api.generateChapter(story.id);
+      const result = await api.generateChapter(story, (update) => {
+        if (update.event === "stage" && typeof update.stage === "number") setGenerationStage(update.stage);
+        if (update.event === "paragraph" && update.paragraph) {
+          if (update.title) setStreamedTitle(update.title);
+          setStreamedParagraphs((paragraphs) => [...paragraphs, update.paragraph!]);
+        }
+      });
       setStory(result.story);
       const next = result.story.chapters.at(-1);
       if (next) { restorePosition.current = false; setChapterId(next.id); }
       await refresh();
+      setStreamedParagraphs([]);
       toast(`第 ${next?.number ?? "下一"} 章已经成为正史。`);
     } catch (requestError) {
-      toast(requestError instanceof Error ? requestError.message : "续章失败。", "error");
+      const message = requestError instanceof Error ? requestError.message : "续章失败。";
+      setGenerationFailure(message);
+      toast(message, "error");
     } finally {
-      window.clearInterval(timer); setGenerating(false);
+      setGenerating(false);
     }
   };
 
@@ -241,6 +249,11 @@ export function ReaderPage() {
   if (!story || !chapter || !revision) return <main className="reader-state"><LoadingState label="正在恢复正史、阅读位置与对话…" /></main>;
 
   const retcon = story.retcons[0];
+  const revisedChapterLabel = story.chapters
+    .filter((item) => item.hasUnreadRevision)
+    .map((item) => item.number)
+    .slice(0, 4)
+    .join("、");
   const hasNext = currentIndex < story.chapters.length - 1;
   const hasPrevious = currentIndex > 0;
 
@@ -260,7 +273,7 @@ export function ReaderPage() {
 
       {story.unreadCanonChanges > 0 && (
         <div className="canon-update-banner">
-          <div><span className="canon-update-banner__icon"><ScrollText size={18} /></span><span><strong>正史已更新至 v{story.canonVersion}</strong><small>第 11、18 章有可追溯修订；无需强制重读。</small></span></div>
+          <div><span className="canon-update-banner__icon"><ScrollText size={18} /></span><span><strong>正史已更新至 v{story.canonVersion}</strong><small>{revisedChapterLabel ? `第 ${revisedChapterLabel} 章有可追溯修订` : "存在可追溯修订"}；无需强制重读。</small></span></div>
           <div><Link to={`/story/${story.id}/history`}>查看修改</Link><button type="button" onClick={() => { void api.markCanonChangesRead(story.id); setStory({ ...story, unreadCanonChanges: 0 }); }}>我知道了</button></div>
         </div>
       )}
@@ -276,6 +289,15 @@ export function ReaderPage() {
           <div className="chapter-body">
             {revision.paragraphs.map((paragraph, index) => <p key={`${revision.id}-${index}`} className={index === 0 ? "dropcap" : ""}>{paragraph}</p>)}
           </div>
+
+          {generationFailure && streamedParagraphs.length > 0 && (
+            <section className="generation-interrupted" aria-live="polite">
+              <div><CircleAlert size={18} /><span><strong>生成在提交正史前中断</strong><small>{generationFailure} · 已完成段落仅保留为草稿，不会产生重复章节。</small></span></div>
+              {streamedTitle && <h3>{streamedTitle}</h3>}
+              {streamedParagraphs.map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 12)}`}>{paragraph}</p>)}
+              <button className="text-link" type="button" onClick={() => { setGenerationFailure(null); setStreamedParagraphs([]); }}>收起草稿</button>
+            </section>
+          )}
 
           <footer className="chapter-footer">
             <div className="chapter-end-mark" aria-hidden="true"><span /><i>续</i><span /></div>
@@ -296,7 +318,7 @@ export function ReaderPage() {
       <aside className={`reader-side-panel contents-panel${panel === "contents" ? " open" : ""}`} aria-hidden={panel !== "contents"}>
         <header><div><span className="eyebrow">目录</span><h2>{story.title}</h2></div><button type="button" aria-label="关闭目录" onClick={() => setPanel(null)}><X size={19} /></button></header>
         <div className="contents-scroll">
-          {chaptersByAct.map((act) => <section key={act.label}><h3>{act.label}</h3>{act.chapters.map((item) => <button type="button" key={item.id} className={item.id === chapter.id ? "active" : ""} onClick={() => changeChapter(item)}><span>{String(item.number).padStart(2, "0")}</span><strong>{revisionOf(item)?.title ?? item.title}</strong>{item.hasUnreadRevision && <i>已修订</i>}</button>)}</section>)}
+          {chaptersByAct.map((act) => <section key={act.label}><h3>{act.label}</h3>{act.chapters.map((item) => <button type="button" key={item.id} className={item.id === chapter.id ? "active" : ""} onClick={() => changeChapter(item)}><span>{String(item.number).padStart(2, "0")}</span><strong>{currentRevision(item)?.title ?? item.title}</strong>{item.hasUnreadRevision && <i>已修订</i>}</button>)}</section>)}
         </div>
       </aside>
 
@@ -319,13 +341,13 @@ export function ReaderPage() {
           {story.conversation.map((message) => <ConversationCard key={message.id} message={message} story={story} />)}
           <div ref={chatEnd} />
         </div>
-        <div className="quick-prompts"><button type="button" onClick={() => setDraft("不，我不希望她死。")}>不希望她死</button><button type="button" onClick={() => setDraft("这段关系发展太快了。")}>关系太快</button><button type="button" onClick={() => setDraft("她为什么不相信周砚？")}>问一个事实</button></div>
+        <div className="quick-prompts"><button type="button" onClick={() => setDraft(`不，我不希望${story.characters[0]?.name ?? "她"}死。`)}>不希望主角死</button><button type="button" onClick={() => setDraft("这段关系发展太快了。")}>关系太快</button><button type="button" onClick={() => setDraft(`${story.characters[0]?.name ?? "主角"}为什么会这样选择？`)}>问一个事实</button></div>
         <form className="chat-composer" onSubmit={(event) => void sendMessage(event)}>
           <textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={2} maxLength={500} placeholder="对故事说一句……" />
           <button type="submit" aria-label="发送" disabled={sending || !draft.trim()}>{sending ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}</button>
           <small>{draft.length}/500</small>
         </form>
-        {retcon && retcon.status === "committed" && !story.characters[0]?.protected && <button className="protect-suggestion" type="button" onClick={() => void protectLead()}><ShieldCheck size={16} /><span><strong>希望以后都避免她死亡？</strong><small>设为保护角色；受伤与失败仍可能发生。</small></span><ChevronRight size={16} /></button>}
+        {retcon && retcon.kind === "intervention" && retcon.status === "committed" && !story.characters[0]?.protected && <button className="protect-suggestion" type="button" onClick={() => void protectLead()}><ShieldCheck size={16} /><span><strong>希望以后都避免主角死亡？</strong><small>设为保护角色；受伤与失败仍可能发生。</small></span><ChevronRight size={16} /></button>}
       </aside>
 
       {generating && (
@@ -333,7 +355,7 @@ export function ReaderPage() {
           <div className="generation-card">
             <span className="generation-glyph"><Sparkles size={22} /></span><span className="eyebrow">后台自主创作</span><h2>下一章正在发生</h2>
             <ol>{["组装当前正史与相关记忆", "生成 5 个短剧情胶囊", "执行正史与因果门禁", "选择并扩写一个方案", "提取事件并提交 Revision"].map((item, index) => <li key={item} className={index < generationStage ? "done" : index === generationStage ? "active" : ""}><span>{index < generationStage ? <Check size={13} /> : index + 1}</span>{item}</li>)}</ol>
-            <p>只扩写一个完整章节；不会把整本小说反复发送给模型。</p>
+            {streamedParagraphs.length > 0 ? <blockquote><strong>{streamedTitle}</strong><span>{streamedParagraphs.at(-1)}</span><small>已完成 {streamedParagraphs.length} 段，提交前仍是草稿</small></blockquote> : <p>只扩写一个完整章节；不会把整本小说反复发送给模型。</p>}
           </div>
         </div>
       )}

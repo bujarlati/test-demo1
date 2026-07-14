@@ -41,11 +41,12 @@ export function HistoryPage() {
     .reverse();
 
   const rollback = async () => {
-    if (!selected || selected.status !== "committed") return;
+    if (!selected || selected.kind !== "intervention" || selected.status !== "committed") return;
     setRollingBack(true);
     try {
       const result = await api.rollbackRetcon(story.id, selected.id);
       setStory(result.story);
+      setSelectedId(result.retcon.id);
       toast("旧正史已作为新的回滚记录恢复，历史没有被删除。");
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "回滚失败。", "error");
@@ -93,8 +94,8 @@ export function HistoryPage() {
           {selected ? (
             <>
               <div className="history-detail__top">
-                <div><span className={`transaction-status transaction-status--${selected.status}`}><CheckCircle2 size={15} />{selected.status === "committed" ? "已提交正史" : "已回滚，记录保留"}</span><h2>{selected.title}</h2><p>读者原话：“{selected.sourceText}”</p></div>
-                {selected.status === "committed" && <button className="button button--secondary" type="button" onClick={() => void rollback()} disabled={rollingBack}><RotateCcw size={16} />{rollingBack ? "正在回滚" : "恢复旧正史"}</button>}
+                <div><span className={`transaction-status transaction-status--${selected.status}`}><CheckCircle2 size={15} />{selected.kind === "rollback" ? "独立回滚事务" : selected.status === "committed" ? "已提交正史" : "已由回滚事务反转"}</span><h2>{selected.title}</h2><p>{selected.kind === "rollback" ? selected.sourceText : `读者原话：“${selected.sourceText}”`}</p></div>
+                {selected.kind === "intervention" && selected.status === "committed" && <button className="button button--secondary" type="button" onClick={() => void rollback()} disabled={rollingBack}><RotateCcw size={16} />{rollingBack ? "正在回滚" : "恢复旧正史"}</button>}
               </div>
 
               <div className="impact-summary">
@@ -111,13 +112,13 @@ export function HistoryPage() {
                 ))}
               </div>
 
-              <div className="diff-preview">
+              {selected.characterSnapshots && selected.characterSnapshots.length > 0 && <div className="diff-preview">
                 <div className="section-heading"><div><span className="eyebrow">事实差异</span><h3>正史发生了什么变化</h3></div></div>
                 <div className="diff-columns">
-                  <div className="diff-old"><span>v{selected.canonVersionBefore} · 旧正史</span><p><del>林夏在第 18 章因中毒死亡。</del></p><p><del>周砚因她的死亡开始复仇。</del></p></div>
-                  <div className="diff-new"><span>v{selected.canonVersionAfter} · 当前正史</span><p><ins>林夏因低代谢状态被误判死亡。</ins></p><p><ins>她存活，但永久失去执法身份。</ins></p></div>
+                  <div className="diff-old"><span>v{selected.canonVersionBefore} · 旧正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><del>{character?.name ?? "角色"}：{snapshot.before.status}</del></p><p><del>位置：{snapshot.before.location}</del></p></div>; })}</div>
+                  <div className="diff-new"><span>v{selected.canonVersionAfter} · 新正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><ins>{character?.name ?? "角色"}：{snapshot.after.status}</ins></p><p><ins>位置：{snapshot.after.location}</ins></p></div>; })}</div>
                 </div>
-              </div>
+              </div>}
             </>
           ) : (
             <div className="history-pristine"><span className="pristine-glyph"><CheckCircle2 size={28} /></span><h2>正史尚未被修订</h2><p>当你否决一个事件时，影响章节、事实差异和回滚入口都会出现在这里。</p><Link className="button button--primary" to={`/story/${story.id}`}>返回阅读</Link></div>

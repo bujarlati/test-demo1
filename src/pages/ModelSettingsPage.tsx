@@ -121,7 +121,7 @@ export function ModelSettingsPage() {
   return (
     <div className="page page--models">
       <header className="page-heading models-heading">
-        <div><span className="eyebrow">模型与密钥域</span><h1>模型连接</h1><p>业务只使用 planner、writer 等逻辑别名；连接不会改变历史正史与 Revision。</p></div>
+        <div><span className="eyebrow">管理员 · 模型与密钥域</span><h1>平台模型连接</h1><p>业务按 planner、writer、extractor 等逻辑别名路由；连接变更不会改变历史正史与 Revision。</p></div>
         <button className="button button--primary" type="button" onClick={() => setShowForm(true)}><Plus size={18} /> 新建连接</button>
       </header>
 
@@ -151,7 +151,7 @@ export function ModelSettingsPage() {
                   <small>{capabilities ? `${capabilities.latencyMs}ms · ${formatDateTime(capabilities.testedAt)}` : "尚无能力快照"}</small>
                 </div>
                 <div className="connection-row__actions">
-                  {connection.ownerScope === "user" && <button className="button button--secondary" type="button" onClick={() => void test(connection.id)} disabled={testingId === connection.id}>{testingId === connection.id ? <LoaderCircle className="spin" size={16} /> : <TestTube2 size={16} />}{testingId === connection.id ? "测试中" : "测试连接"}</button>}
+                  {!connection.secretRef.startsWith("platform://managed") && <button className="button button--secondary" type="button" onClick={() => void test(connection.id)} disabled={testingId === connection.id}>{testingId === connection.id ? <LoaderCircle className="spin" size={16} /> : <TestTube2 size={16} />}{testingId === connection.id ? "测试中" : "测试连接"}</button>}
                   {!isDefault && connection.status === "active" && <button className="text-link" type="button" onClick={() => void setDefault(connection.id)}>设为默认</button>}
                 </div>
               </article>
@@ -169,7 +169,7 @@ export function ModelSettingsPage() {
       {showForm && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowForm(false); }}>
           <section className="connection-modal" role="dialog" aria-modal="true" aria-labelledby="connection-title">
-            <header><div><span className="eyebrow">OpenAI-compatible</span><h2 id="connection-title">新建模型连接</h2><p>保存不会立即发起外部请求；请随后主动测试。</p></div><button type="button" aria-label="关闭" onClick={() => setShowForm(false)}><X size={20} /></button></header>
+            <header><div><span className="eyebrow">管理员 · OpenAI-compatible</span><h2 id="connection-title">新建平台连接</h2><p>保存不会立即发起外部请求；请随后主动测试并留下审计记录。</p></div><button type="button" aria-label="关闭" onClick={() => setShowForm(false)}><X size={20} /></button></header>
             <form onSubmit={(event) => void submit(event)}>
               <label><span>连接名称</span><input required autoComplete="off" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="我的自托管模型" /></label>
               <label><span>Base URL</span><input required type="url" autoComplete="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} /><small>SaaS 仅允许公网 HTTPS；保存前会阻断明显的本地与元数据地址。</small></label>

@@ -1,3 +1,4 @@
+import { randomBytes, scryptSync } from "node:crypto";
 import type {
   AppStore,
   Chapter,
@@ -7,6 +8,39 @@ import type {
 } from "../src/types";
 
 const now = "2026-07-14T10:12:00+08:00";
+const demoOwnerId = "user_demo";
+
+function passwordRecord(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  return {
+    passwordSalt: salt,
+    passwordHash: scryptSync(password, salt, 64).toString("hex"),
+  };
+}
+
+function storyMemory(title: string, genre: string, createdAt = now) {
+  return {
+    storyGene: {
+      version: 1,
+      protagonistPosition: `一位被卷入“${title}”核心异常的普通人`,
+      visibleGoal: "查清眼前异常并保护仍可挽回的人",
+      hiddenNeed: "学会为自己的选择承担代价，而不是只追求正确答案",
+      conflictEngine: `${genre}谜团持续迫使主角在真相、关系与安全之间取舍`,
+      recurringCost: "每次接近真相都会失去一部分原有身份或信任",
+      endingShape: "主角主动选择一种有代价但不违背自我的结局",
+      creativeAxes: ["错误证词", "关系代价", "空间误导", "旧物回声", "身份交换"],
+      createdAt,
+    },
+    endingContract: {
+      version: 1,
+      targetEnding: "核心异常被解释，但解决方式要求主角主动支付贯穿全书的代价",
+      characterArc: "从被动追查到主动定义何为值得保留的真相",
+      prerequisites: ["至少一次因信任而失败", "核心异常留下三次可回溯前兆", "结局代价与开篇选择呼应"],
+      status: "viable" as const,
+      lastEvaluatedAt: createdAt,
+    },
+  };
+}
 
 function revision(
   id: string,
@@ -145,11 +179,13 @@ function compactStory(
 
   return {
     id,
+    ownerId: demoOwnerId,
     title,
     subtitle,
     genre,
     tone,
     length: "中篇",
+    targetChapterCount: 24,
     inspiration: "",
     coverTheme,
     status,
@@ -164,6 +200,20 @@ function compactStory(
       scrollProgress: status === "paused" ? 0.18 : 0.76,
       updatedAt: now,
     },
+    ...storyMemory(title, genre),
+    events: chapters.map((item) => ({
+      id: `event_${id}_${item.number}`,
+      chapterNumber: item.number,
+      revisionId: item.currentRevisionId,
+      type: "discovery" as const,
+      title: item.title,
+      cause: item.number === 1 ? "主角遇见异常" : "上一章留下的未解线索",
+      outcome: `第 ${item.number} 章产生一条可继续追查的事实`,
+      participantIds: [],
+      location: "故事当前场景",
+      dependsOn: item.number === 1 ? [] : [`event_${id}_${item.number - 1}`],
+      active: true,
+    })),
     chapters,
     characters: [],
     rules: [],
@@ -178,11 +228,13 @@ function compactStory(
 export function createSeedStore(): AppStore {
   const blackTide: Story = {
     id: "story_black_tide",
+    ownerId: demoOwnerId,
     title: "黑潮之下",
     subtitle: "海底城的第七码头",
     genre: "悬疑",
     tone: "冷冽 · 克制",
     length: "中篇 · 预计 36 章",
+    targetChapterCount: 36,
     inspiration: "发生在海底城市，一封来自禁区的信改变了所有人的身份。",
     coverTheme: "tide",
     status: "active",
@@ -199,6 +251,38 @@ export function createSeedStore(): AppStore {
       scrollProgress: 0.42,
       updatedAt: "2026-07-14T09:42:00+08:00",
     },
+    storyGene: {
+      version: 3,
+      protagonistPosition: "被王室抹去血统的海底城执法官",
+      visibleGoal: "查明母亲失踪与旧城灾难的真相",
+      hiddenNeed: "承认秩序并不天然等于正义，并选择愿意承担的身份",
+      conflictEngine: "城市生存依赖潮门，揭露王室谎言可能让所有居民失去氧气",
+      recurringCost: "每次取得证据，林夏都会失去一层合法身份与同盟信任",
+      endingShape: "真相被公开，但林夏必须放弃回到旧秩序中的位置",
+      creativeAxes: ["有限氧气", "证词偏差", "身份注销", "深海空间", "代谢时间差"],
+      createdAt: now,
+    },
+    endingContract: {
+      version: 2,
+      targetEnding: "潮门真相公开，城市得到新的生存方案，林夏无法恢复原有身份",
+      characterArc: "从秩序执行者转为愿意承担混乱后果的事实守护者",
+      prerequisites: ["确认母亲去向", "解释慢三分钟的钟", "王室徽章承担潮门代价"],
+      status: "viable",
+      lastEvaluatedAt: now,
+    },
+    events: blackTideChapters.map((item) => ({
+      id: item.number === 18 ? "event_black_lin_death" : `event_black_${item.number}`,
+      chapterNumber: item.number,
+      revisionId: item.currentRevisionId,
+      type: item.number === 18 ? "death" : item.number === 17 ? "choice" : "discovery",
+      title: item.number === 18 ? "林夏在潮门前死亡" : item.title,
+      cause: item.number === 18 ? "毒素与潮门能量同时作用" : "旧案线索继续推进",
+      outcome: item.number === 18 ? "林夏被确认死亡，周砚转向复仇" : "获得新的可追溯事实",
+      participantIds: item.number === 18 ? ["char_lin_xia", "char_zhou_yan"] : ["char_lin_xia"],
+      location: item.number === 18 ? "第七码头潮门" : "海底城",
+      dependsOn: item.number === 1 ? [] : [item.number === 18 ? "event_black_17" : `event_black_${item.number - 1}`],
+      active: true,
+    })),
     chapters: blackTideChapters,
     characters: [
       {
@@ -347,19 +431,36 @@ export function createSeedStore(): AppStore {
   );
 
   return {
-    user: {
-      id: "user_demo",
-      name: "林默",
-      initials: "默",
-      activeStoryId: blackTide.id,
-      defaultConnectionId: "conn_platform",
-    },
+    users: [
+      {
+        id: demoOwnerId,
+        email: "admin@xumo.local",
+        name: "林默",
+        initials: "默",
+        role: "admin",
+        activeStoryId: blackTide.id,
+        defaultConnectionId: "conn_platform",
+        ...passwordRecord("xumo2026"),
+      },
+      {
+        id: "user_reader",
+        email: "reader@xumo.local",
+        name: "沈读",
+        initials: "读",
+        role: "reader",
+        activeStoryId: null,
+        defaultConnectionId: "conn_platform",
+        ...passwordRecord("read2026"),
+      },
+    ],
+    sessions: [],
     stories: [blackTide, fogLetters, paperMoon],
     connections: [
       {
         id: "conn_platform",
         name: "续墨托管模型",
         ownerScope: "platform",
+        ownerId: null,
         protocol: "openai_compatible",
         baseUrl: "平台安全网关",
         maskedKey: "由平台托管",
@@ -390,6 +491,8 @@ export function createSeedStore(): AppStore {
         chapterNumber: 18,
         task: "chapter",
         model: "novel-writer-v2",
+        connectionId: "conn_platform",
+        promptVersion: "story-v7",
         status: "completed",
         tokens: 6840,
         latencyMs: 18420,
@@ -402,6 +505,8 @@ export function createSeedStore(): AppStore {
         chapterNumber: 6,
         task: "chapter",
         model: "novel-writer-v2",
+        connectionId: "conn_platform",
+        promptVersion: "story-v7",
         status: "completed",
         tokens: 5710,
         latencyMs: 14980,
@@ -414,6 +519,8 @@ export function createSeedStore(): AppStore {
         chapterNumber: 4,
         task: "extract",
         model: "json-fast",
+        connectionId: "conn_platform",
+        promptVersion: "extract-v3",
         status: "completed",
         tokens: 1280,
         latencyMs: 2840,
@@ -421,6 +528,7 @@ export function createSeedStore(): AppStore {
         createdAt: "2026-07-13T17:05:00+08:00",
       },
     ],
+    auditEvents: [],
     metrics: {
       acceptedChapterRate: 0.76,
       retconSuccessRate: 0.68,
