@@ -1,0 +1,434 @@
+import type {
+  AppStore,
+  Chapter,
+  ChapterRevision,
+  CoverTheme,
+  Story,
+} from "../src/types";
+
+const now = "2026-07-14T10:12:00+08:00";
+
+function revision(
+  id: string,
+  title: string,
+  paragraphs: string[],
+  reason = "AI 自主续章",
+): ChapterRevision {
+  return {
+    id,
+    parentRevisionId: null,
+    title,
+    paragraphs,
+    reason,
+    createdAt: now,
+    modelName: "platform-writer",
+    promptVersion: "story-v7",
+  };
+}
+
+function chapter(
+  number: number,
+  title: string,
+  paragraphs: string[],
+  estimatedMinutes = 8,
+): Chapter {
+  const currentRevision = revision(`rev_black_${number}_1`, title, paragraphs);
+  return {
+    id: `chapter_black_${number}`,
+    number,
+    title,
+    currentRevisionId: currentRevision.id,
+    revisions: [currentRevision],
+    estimatedMinutes,
+  };
+}
+
+const blackTideTitles = [
+  "沉入黎明之前",
+  "无光海的钟声",
+  "第七码头",
+  "玻璃肺",
+  "蓝鲸法庭",
+  "陌生人的氧气",
+  "旧城在下沉",
+  "盐写的名字",
+  "王室潜水员",
+  "潮汐证词",
+  "缓慢的代谢",
+  "封锁线以内",
+  "没有影子的鱼",
+  "三分钟静默",
+  "证据在呼吸",
+  "禁区来信",
+  "王冠与锈",
+  "氧气尽头",
+];
+
+const blackTideSpecial: Record<number, string[]> = {
+  1: [
+    "海底城没有真正的黎明。清晨六点，穹顶只会把灯光调亮两度，提醒所有人黑暗仍在玻璃之外耐心等待。",
+    "林夏在换气站的噪声里醒来，腕表上多了一条没有来源的讯息：别去第七码头。",
+    "她删掉讯息，穿上执法局的深蓝外套。十分钟后，第七码头的警报响了。",
+  ],
+  11: [
+    "白医生把针管对着灯，药液里漂着细小的银屑。林夏没有问那是什么，只看着自己的心率从一百二十降到四十。",
+    "“你的代谢反应和档案不一致。”他说。",
+    "林夏把袖口拉下来，盖住旧治疗留下的环形疤痕。“那就别把它写进档案。”",
+  ],
+  16: [
+    "禁区的信封没有封口，里面只有一片干燥的海藻和六个字：你母亲没有离开。",
+    "林夏把海藻贴在舷窗上。城外的黑潮正缓慢翻身，像一头从未睡着的兽。",
+    "周砚站在她身后，没有问信里写了什么。他只是说，第七码头的潮门今晚会开。",
+  ],
+  17: [
+    "王室的旧徽章在盐水里浮出锈红。林夏认得它——那是档案里早已被抹去的一支血脉。",
+    "审判官把证据推到她面前：“签字，你仍然是执法官。不签，你就是共犯。”",
+    "她拿起笔，却在最后一刻把纸翻了过来。背面是一张通往禁区的换气图。",
+  ],
+  18: [
+    "毒素进入血液的第九秒，林夏听见城市的泵站同时停了一拍。她跪在潮门前，掌心压着那枚已经发热的旧徽章。",
+    "周砚冲过封锁线时，监测器上的曲线已经归零。审判官俯身确认了她的瞳孔，又把白布盖过她的脸。",
+    "潮门在他们身后打开。黑色海水涌入缓冲舱，带走了她最后一点体温，也带走了周砚原本准备说出口的话。",
+    "那一夜，海底城所有钟表都慢了三分钟。周砚站在空荡的执法局里，把复仇对象的名字写在墙上。",
+  ],
+};
+
+function earlyBlackTideParagraphs(number: number, title: string): string[] {
+  return [
+    `第${number}次潮汐警报越过穹顶时，林夏正在追查“${title}”留下的线索。城里的每一道门都比昨天更沉默。`,
+    "她从旧档案与新证词之间找出一处细小矛盾：有人记得海水的颜色，却没人记得警报响起的时间。",
+    "线索没有给她答案，只把她推向更深的一层城市。那里没有地图，只有仍在工作的呼吸管道。",
+  ];
+}
+
+const blackTideChapters = blackTideTitles.map((title, index) => {
+  const number = index + 1;
+  return chapter(
+    number,
+    title,
+    blackTideSpecial[number] ?? earlyBlackTideParagraphs(number, title),
+    number === 18 ? 10 : 7,
+  );
+});
+
+function compactStory(
+  id: string,
+  title: string,
+  subtitle: string,
+  genre: string,
+  tone: string,
+  coverTheme: CoverTheme,
+  chapterTitles: string[],
+  status: Story["status"],
+  excerpt: string,
+): Story {
+  const chapters = chapterTitles.map((chapterTitle, index) => {
+    const number = index + 1;
+    const currentRevision = revision(
+      `rev_${id}_${number}_1`,
+      chapterTitle,
+      [
+        `${chapterTitle}发生在一个风向刚刚改变的清晨。主人公还不知道，这个细小变化会让所有熟悉的事情重新排列。`,
+        "街道尽头传来一声短促的铃响。没有人回头，只有窗上的雾慢慢散开，露出昨天并不存在的一行字。",
+        excerpt,
+      ],
+    );
+    return {
+      id: `chapter_${id}_${number}`,
+      number,
+      title: chapterTitle,
+      currentRevisionId: currentRevision.id,
+      revisions: [currentRevision],
+      estimatedMinutes: 6,
+    };
+  });
+
+  return {
+    id,
+    title,
+    subtitle,
+    genre,
+    tone,
+    length: "中篇",
+    inspiration: "",
+    coverTheme,
+    status,
+    activeBranchId: `branch_${id}_main`,
+    canonVersion: chapterTitles.length,
+    summary: subtitle,
+    latestExcerpt: excerpt,
+    updatedAt: now,
+    unreadCanonChanges: 0,
+    readingProgress: {
+      chapterId: chapters.at(-1)?.id ?? "",
+      scrollProgress: status === "paused" ? 0.18 : 0.76,
+      updatedAt: now,
+    },
+    chapters,
+    characters: [],
+    rules: [],
+    clues: [],
+    preferences: [],
+    conversation: [],
+    retcons: [],
+    modelConnectionId: null,
+  };
+}
+
+export function createSeedStore(): AppStore {
+  const blackTide: Story = {
+    id: "story_black_tide",
+    title: "黑潮之下",
+    subtitle: "海底城的第七码头",
+    genre: "悬疑",
+    tone: "冷冽 · 克制",
+    length: "中篇 · 预计 36 章",
+    inspiration: "发生在海底城市，一封来自禁区的信改变了所有人的身份。",
+    coverTheme: "tide",
+    status: "active",
+    activeBranchId: "branch_black_main",
+    canonVersion: 24,
+    summary:
+      "海底城执法官林夏追查一宗被王室删除的旧案，却发现自己的身世与城市赖以生存的潮门相连。",
+    latestExcerpt:
+      "潮门在他们身后打开。黑色海水涌入缓冲舱，带走了她最后一点体温。",
+    updatedAt: "2026-07-14T09:42:00+08:00",
+    unreadCanonChanges: 0,
+    readingProgress: {
+      chapterId: "chapter_black_18",
+      scrollProgress: 0.42,
+      updatedAt: "2026-07-14T09:42:00+08:00",
+    },
+    chapters: blackTideChapters,
+    characters: [
+      {
+        id: "char_lin_xia",
+        name: "林夏",
+        role: "主角 · 前执法官",
+        initials: "林",
+        status: "确认死亡",
+        location: "第七码头潮门",
+        goal: "查明母亲失踪与王室旧案的关系",
+        knowledge: ["潮门换气图", "王室旧徽章", "禁区入口"],
+        relationship: "与周砚互相信任，但仍隐瞒自己的治疗史",
+        protected: false,
+        accent: "jade",
+      },
+      {
+        id: "char_zhou_yan",
+        name: "周砚",
+        role: "调查记者",
+        initials: "周",
+        status: "存活 · 被通缉",
+        location: "旧执法局",
+        goal: "公开王室对旧城灾难的掩盖",
+        knowledge: ["林夏的王室血统", "潮门将在三日后失效"],
+        relationship: "把林夏视为唯一仍可信任的人",
+        protected: false,
+        accent: "blue",
+      },
+      {
+        id: "char_he_jing",
+        name: "何静川",
+        role: "王室审判官",
+        initials: "何",
+        status: "存活",
+        location: "上层穹顶",
+        goal: "维持城市秩序，阻止旧案公开",
+        knowledge: ["旧城真实死亡人数", "林夏母亲的去向"],
+        relationship: "对林夏既警惕又抱有补偿心理",
+        protected: false,
+        accent: "rust",
+      },
+    ],
+    rules: [
+      {
+        id: "rule_tide_gate",
+        title: "潮门守恒",
+        description: "潮门每次开启都必须由一枚有效王室徽章承担能量代价。",
+        source: "第 5、14 章",
+        hardness: "hard",
+      },
+      {
+        id: "rule_no_resurrection",
+        title: "不存在复活术",
+        description: "本世界没有死者复生；生死误判必须有医学或视角依据。",
+        source: "故事基因 v3",
+        hardness: "hard",
+      },
+      {
+        id: "rule_voice",
+        title: "叙事温度",
+        description: "近距离第三人称；克制，不用旁白直接宣布人物善恶。",
+        source: "文风基线 v2",
+        hardness: "soft",
+      },
+    ],
+    clues: [
+      {
+        id: "clue_scar",
+        title: "环形治疗疤痕",
+        status: "planted",
+        sourceChapter: 11,
+        description: "林夏曾接受未记录在案的代谢治疗。",
+        spoiler: false,
+      },
+      {
+        id: "clue_three_minutes",
+        title: "慢三分钟的钟",
+        status: "strengthened",
+        sourceChapter: 4,
+        description: "全城钟表的误差与潮门能量波动同步。",
+        spoiler: false,
+      },
+      {
+        id: "clue_mother",
+        title: "来自禁区的信",
+        status: "planted",
+        sourceChapter: 16,
+        description: "有人声称林夏的母亲仍在禁区内。",
+        spoiler: true,
+      },
+    ],
+    preferences: [
+      {
+        id: "pref_pacing",
+        label: "关系慢热",
+        description: "重要关系至少经过共同选择与代价后再确认。",
+        kind: "soft",
+        confidence: 0.76,
+        active: true,
+      },
+      {
+        id: "pref_no_easy_redemption",
+        label: "反派不轻易洗白",
+        description: "理解动机不等于免除责任。",
+        kind: "hard",
+        confidence: 1,
+        active: true,
+      },
+    ],
+    conversation: [
+      {
+        id: "msg_restore_1",
+        role: "system",
+        type: "progress",
+        content: "已恢复到第 18 章，上次正史版本为 v24。",
+        createdAt: "2026-07-14T09:42:00+08:00",
+        observedCanonVersion: 24,
+      },
+    ],
+    retcons: [],
+    modelConnectionId: null,
+  };
+
+  const fogLetters = compactStory(
+    "story_fog_letters",
+    "雾港书简",
+    "所有寄不出的信，都会在雾最浓时抵达",
+    "奇幻",
+    "温暖 · 轻盈",
+    "fog",
+    ["没有地址的信", "雨伞修理铺", "收信人已离开", "灯塔的回邮", "第十三枚邮戳", "雾散以前"],
+    "active",
+    "她把信塞进门缝，第二天却在自己的枕边看见了回信。",
+  );
+
+  const paperMoon = compactStory(
+    "story_paper_moon",
+    "纸月病房",
+    "每位病人都梦见同一轮并不存在的月亮",
+    "科幻",
+    "静谧 · 诡谲",
+    "moon",
+    ["白色走廊", "共同梦境", "月光处方", "醒来的人"],
+    "paused",
+    "监护仪上没有异常，只有所有人的梦在同一秒翻了个身。",
+  );
+
+  return {
+    user: {
+      id: "user_demo",
+      name: "林默",
+      initials: "默",
+      activeStoryId: blackTide.id,
+      defaultConnectionId: "conn_platform",
+    },
+    stories: [blackTide, fogLetters, paperMoon],
+    connections: [
+      {
+        id: "conn_platform",
+        name: "续墨托管模型",
+        ownerScope: "platform",
+        protocol: "openai_compatible",
+        baseUrl: "平台安全网关",
+        maskedKey: "由平台托管",
+        secretRef: "platform://managed/default",
+        status: "active",
+        routes: {
+          planner: "reasoning-small",
+          writer: "novel-writer-v2",
+          extractor: "json-fast",
+          embedding: "embedding-large",
+        },
+        fallbackPolicy: "none",
+        capabilities: {
+          streaming: true,
+          jsonSchema: true,
+          embedding: true,
+          promptCache: true,
+          testedAt: "2026-07-14T08:00:00+08:00",
+          latencyMs: 382,
+        },
+        updatedAt: "2026-07-14T08:00:00+08:00",
+      },
+    ],
+    jobs: [
+      {
+        id: "job_2401",
+        storyTitle: "黑潮之下",
+        chapterNumber: 18,
+        task: "chapter",
+        model: "novel-writer-v2",
+        status: "completed",
+        tokens: 6840,
+        latencyMs: 18420,
+        cost: 0.42,
+        createdAt: "2026-07-14T09:36:00+08:00",
+      },
+      {
+        id: "job_2398",
+        storyTitle: "雾港书简",
+        chapterNumber: 6,
+        task: "chapter",
+        model: "novel-writer-v2",
+        status: "completed",
+        tokens: 5710,
+        latencyMs: 14980,
+        cost: 0.35,
+        createdAt: "2026-07-13T22:18:00+08:00",
+      },
+      {
+        id: "job_2389",
+        storyTitle: "纸月病房",
+        chapterNumber: 4,
+        task: "extract",
+        model: "json-fast",
+        status: "completed",
+        tokens: 1280,
+        latencyMs: 2840,
+        cost: 0.03,
+        createdAt: "2026-07-13T17:05:00+08:00",
+      },
+    ],
+    metrics: {
+      acceptedChapterRate: 0.76,
+      retconSuccessRate: 0.68,
+      canonConflictRate: 0.006,
+      firstTokenP95: 5.8,
+      acceptedChapterCost: 0.48,
+      activeStories: 1284,
+    },
+    idempotencyKeys: [],
+  };
+}

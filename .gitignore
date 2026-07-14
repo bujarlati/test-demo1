@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .scratch/
+.playwright-cli/
+output/
 .env
 .env.*
 !.env.example
@@ -8,4 +10,3 @@ server/data/store.json
 server/data/secrets.json
 server/data/.master-key
 *.log
-
