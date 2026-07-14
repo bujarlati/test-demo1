@@ -1,7 +1,12 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { CapabilitySnapshot, ModelConnection, Story } from "../src/types";
-import type { CandidateDraft, GeneratedChapter } from "./narrativeEngine";
+import type {
+  CandidateDraft,
+  ExtractedChapterState,
+  ExtractedEventDraft,
+  GeneratedChapter,
+} from "./narrativeEngine";
 import { readSecret } from "./vault";
 
 function isPrivateIpv4(address: string): boolean {
@@ -226,9 +231,19 @@ export async function generateCandidateDraftsWithConnection(
     `故事：${story.title}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；下一章编号：${story.chapters.length + 1}。生成 5 个结构不同的候选。`,
     40_000,
   );
-  const candidates = (payload.candidates ?? []).filter(
-    (item) => item.event && item.cause && item.cost && item.impact && item.novelty,
-  );
+  const candidates = (payload.candidates ?? [])
+    .filter((item) =>
+      item && [item.creativeAxis, item.event, item.cause, item.cost, item.impact, item.novelty]
+        .every((value) => typeof value === "string" && value.trim().length > 0),
+    )
+    .map((item) => ({
+      creativeAxis: item.creativeAxis.slice(0, 80),
+      event: item.event.slice(0, 220),
+      cause: item.cause.slice(0, 220),
+      cost: item.cost.slice(0, 180),
+      impact: item.impact.slice(0, 220),
+      novelty: item.novelty.slice(0, 180),
+    }));
   if (candidates.length < 3) throw new Error("规划模型未返回至少 3 个有效剧情胶囊。");
   return candidates.slice(0, 5);
 }
@@ -243,29 +258,163 @@ export async function generateChapterWithConnection(
     "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。生成 5 至 8 个完整段落，保持因果与克制。",
     prompt,
   );
-  if (!parsed.title || !Array.isArray(parsed.paragraphs) || parsed.paragraphs.length < 4) {
+  if (
+    typeof parsed.title !== "string" ||
+    !Array.isArray(parsed.paragraphs) ||
+    parsed.paragraphs.length < 4 ||
+    !parsed.paragraphs.every((paragraph) => typeof paragraph === "string")
+  ) {
     throw new Error("正文模型输出未通过章节 Schema 校验。");
   }
   return {
     title: parsed.title,
-    paragraphs: parsed.paragraphs.map(String),
+    paragraphs: parsed.paragraphs.map((paragraph) => paragraph.slice(0, 4_000)),
     model: connection.routes.writer,
   };
+}
+
+function completedChapterFields(content: string) {
+  const titleMatch = content.match(/"title"\s*:\s*("(?:\\.|[^"\\])*")/);
+  let title = "";
+  if (titleMatch) {
+    try { title = JSON.parse(titleMatch[1]) as string; } catch { title = ""; }
+  }
+  const marker = content.search(/"paragraphs"\s*:\s*\[/);
+  const paragraphs: string[] = [];
+  if (marker < 0) return { title, paragraphs };
+  let cursor = content.indexOf("[", marker) + 1;
+  while (cursor > 0 && cursor < content.length) {
+    while (/\s|,/.test(content[cursor] ?? "")) cursor += 1;
+    if (content[cursor] !== '"') break;
+    const start = cursor;
+    cursor += 1;
+    let escaped = false;
+    let completed = false;
+    while (cursor < content.length) {
+      const character = content[cursor];
+      if (!escaped && character === '"') {
+        completed = true;
+        cursor += 1;
+        break;
+      }
+      escaped = !escaped && character === "\\";
+      if (character !== "\\") escaped = false;
+      cursor += 1;
+    }
+    if (!completed) break;
+    try { paragraphs.push(JSON.parse(content.slice(start, cursor)) as string); } catch { break; }
+  }
+  return { title, paragraphs };
+}
+
+export async function streamChapterWithConnection(
+  connection: ModelConnection,
+  prompt: string,
+  onParagraph: (paragraph: string, index: number, title: string) => void,
+): Promise<GeneratedChapter> {
+  const apiKey = await readSecret(connection.id);
+  const body: Record<string, unknown> = {
+    model: connection.routes.writer,
+    messages: [
+      {
+        role: "system",
+        content: "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。生成 5 至 8 个完整段落。先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。",
+      },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0.7,
+    stream: true,
+  };
+  if (connection.capabilities?.jsonSchema) body.response_format = { type: "json_object" };
+  const response = await modelFetch(
+    connection,
+    apiKey,
+    "/chat/completions",
+    { method: "POST", body: JSON.stringify(body) },
+    120_000,
+  );
+  if (!response.ok || !response.body) {
+    throw new Error(`正文模型流式调用返回 ${response.status}；未启用静默回退。`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let eventBuffer = "";
+  let content = "";
+  let emitted = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    eventBuffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+    const frames = eventBuffer.split("\n\n");
+    eventBuffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+        const payload = JSON.parse(data) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        content += payload.choices?.[0]?.delta?.content ?? "";
+      }
+      const fields = completedChapterFields(content);
+      while (emitted < fields.paragraphs.length) {
+        onParagraph(fields.paragraphs[emitted], emitted, fields.title);
+        emitted += 1;
+      }
+    }
+    if (done) break;
+  }
+  const fields = completedChapterFields(content);
+  if (!fields.title || fields.paragraphs.length < 4) {
+    throw new Error("流式正文在完成前中断或未通过章节 Schema 校验。");
+  }
+  return { title: fields.title, paragraphs: fields.paragraphs, model: connection.routes.writer };
 }
 
 export async function extractChapterStateWithConnection(
   connection: ModelConnection,
   chapter: GeneratedChapter,
-) {
-  const parsed = await completeJson<{ events?: unknown[]; characterUpdates?: unknown[] }>(
+): Promise<ExtractedChapterState> {
+  const parsed = await completeJson<Partial<ExtractedChapterState>>(
     connection,
     connection.routes.extractor,
-    "你是正史状态抽取器。只返回 JSON：{\"events\":[],\"characterUpdates\":[]}；不得新增正文没有的事实。",
+    "你是正史状态抽取器。只返回 JSON：{\"events\":[{\"type\":\"choice\",\"title\":\"\",\"cause\":\"\",\"outcome\":\"\",\"participantNames\":[],\"location\":\"\"}],\"characterUpdates\":[{\"name\":\"\",\"status\":\"\",\"location\":\"\",\"goal\":\"\",\"knowledgeGained\":[]}]}; 不得新增正文没有的事实。",
     `${chapter.title}\n${chapter.paragraphs.join("\n")}`,
     30_000,
   );
   if (!Array.isArray(parsed.events) || !Array.isArray(parsed.characterUpdates)) {
     throw new Error("抽取模型输出未通过状态 Schema 校验。");
   }
-  return parsed;
+  const eventTypes = new Set(["discovery", "choice", "relationship", "death", "survival", "consequence"]);
+  const events = parsed.events
+    .filter((event) =>
+      event &&
+      typeof event.title === "string" &&
+      typeof event.cause === "string" &&
+      typeof event.outcome === "string",
+    )
+    .map((event) => ({
+      type: typeof event.type === "string" && eventTypes.has(event.type)
+        ? event.type as ExtractedEventDraft["type"]
+        : undefined,
+      title: event.title.slice(0, 180),
+      cause: event.cause.slice(0, 240),
+      outcome: event.outcome.slice(0, 280),
+      participantNames: Array.isArray(event.participantNames)
+        ? event.participantNames.filter((name): name is string => typeof name === "string").slice(0, 12)
+        : [],
+      location: typeof event.location === "string" ? event.location.slice(0, 120) : undefined,
+    }));
+  const characterUpdates = parsed.characterUpdates
+    .filter((item) => item && typeof item.name === "string" && item.name.length > 0)
+    .map((item) => ({
+      name: item.name.slice(0, 80),
+      status: typeof item.status === "string" ? item.status.slice(0, 80) : undefined,
+      location: typeof item.location === "string" ? item.location.slice(0, 120) : undefined,
+      goal: typeof item.goal === "string" ? item.goal.slice(0, 180) : undefined,
+      knowledgeGained: Array.isArray(item.knowledgeGained)
+        ? item.knowledgeGained.filter((value): value is string => typeof value === "string").slice(0, 12)
+        : [],
+    }));
+  return { events, characterUpdates };
 }

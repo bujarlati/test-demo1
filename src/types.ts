@@ -3,6 +3,7 @@ export type StoryStatus = "active" | "paused" | "completed" | "archived";
 export type UserRole = "reader" | "admin";
 
 export type CoverTheme = "tide" | "fog" | "moon" | "ember" | "forest";
+export type CharacterLifecycle = "alive" | "dead" | "missing" | "presumed_dead";
 
 export interface ChapterRevision {
   id: string;
@@ -32,6 +33,7 @@ export interface CharacterProfile {
   role: string;
   initials: string;
   status: string;
+  lifecycle: CharacterLifecycle;
   location: string;
   goal: string;
   knowledge: string[];
@@ -77,8 +79,8 @@ export interface RetconChange {
 
 export interface CharacterStateSnapshot {
   characterId: string;
-  before: Pick<CharacterProfile, "status" | "location" | "role">;
-  after: Pick<CharacterProfile, "status" | "location" | "role">;
+  before: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role">;
+  after: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role">;
 }
 
 export interface RetconTransaction {
@@ -97,6 +99,7 @@ export interface RetconTransaction {
   reversesRetconId?: string;
   reversedByRetconId?: string;
   characterSnapshots?: CharacterStateSnapshot[];
+  preferenceIds?: string[];
 }
 
 export type ConversationMessageType =
@@ -115,6 +118,29 @@ export interface ConversationMessage {
   observedCanonVersion: number;
   oldCanon?: boolean;
   retconId?: string;
+}
+
+export interface ReaderMessageContext {
+  chapterId: string;
+  revisionId: string;
+  selection?: string;
+  eventId?: string;
+}
+
+export interface InterventionProposal {
+  id: string;
+  sourceMessageId: string;
+  sourceText: string;
+  classification: "event_veto" | "local_rewrite" | "future_direction" | "hard_constraint" | "soft_preference" | "question";
+  confidence: number;
+  targetEventId?: string;
+  chapterId?: string;
+  revisionId?: string;
+  selection?: string;
+  scope: "current_event" | "current_chapter" | "future" | "conversation_only";
+  status: "parsed" | "committed" | "recorded" | "rejected" | "reversed";
+  transactionId?: string;
+  createdAt: string;
 }
 
 export interface ReadingProgress {
@@ -164,6 +190,7 @@ export interface StoryEvent {
   location: string;
   dependsOn: string[];
   active: boolean;
+  creativeAxis?: string;
 }
 
 export interface Story {
@@ -194,6 +221,7 @@ export interface Story {
   clues: StoryClue[];
   preferences: ReaderPreference[];
   conversation: ConversationMessage[];
+  proposals: InterventionProposal[];
   retcons: RetconTransaction[];
   modelConnectionId: string | null;
 }
@@ -262,6 +290,9 @@ export interface ModelConnection {
 
 export interface GenerationJob {
   id: string;
+  ownerId: string;
+  storyId: string;
+  idempotencyKey?: string;
   storyTitle: string;
   chapterNumber: number;
   task: "chapter" | "retcon" | "extract";
@@ -355,6 +386,7 @@ export interface BootstrapPayload {
   user: UserProfile;
   stories: StorySummary[];
   activeStoryId: string | null;
+  pendingJobs: GenerationJob[];
 }
 
 export interface AuthPayload {

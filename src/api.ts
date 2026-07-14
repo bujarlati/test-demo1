@@ -8,6 +8,7 @@ import type {
   ModelConnectionInput,
   OpsMetrics,
   RetconTransaction,
+  ReaderMessageContext,
   Story,
 } from "./types";
 
@@ -54,7 +55,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export interface GenerationStreamUpdate {
-  event: "stage" | "paragraph";
+  event: "stage" | "paragraph" | "reset_draft";
   stage?: number;
   label?: string;
   index?: number;
@@ -103,7 +104,7 @@ async function generateChapterStream(
       const data = frame.match(/^data:\s*(.+)$/m)?.[1];
       if (!event || !data) continue;
       const payload = JSON.parse(data) as Record<string, unknown>;
-      if (event === "stage" || event === "paragraph") {
+      if (event === "stage" || event === "paragraph" || event === "reset_draft") {
         onUpdate?.({ event, ...payload } as GenerationStreamUpdate);
       } else if (event === "complete") {
         completed = payload as unknown as { story: Story; duplicate: boolean };
@@ -129,7 +130,7 @@ export const api = {
   createStory: (input: CreateStoryInput) =>
     request<Story>("/api/stories", { method: "POST", body: JSON.stringify(input) }),
   generateChapter: generateChapterStream,
-  sendMessage: (story: Story, message: string) =>
+  sendMessage: (story: Story, message: string, clientContext?: ReaderMessageContext) =>
     request<{ story: Story; duplicate: boolean }>(`/api/stories/${story.id}/messages`, {
       method: "POST",
       body: JSON.stringify({
@@ -137,6 +138,7 @@ export const api = {
         branchId: story.activeBranchId,
         baseCanonVersion: story.canonVersion,
         idempotencyKey: crypto.randomUUID(),
+        clientContext,
       }),
     }),
   saveProgress: (storyId: string, chapterId: string, scrollProgress: number) =>
@@ -148,9 +150,14 @@ export const api = {
     request(`/api/stories/${storyId}/characters/${characterId}/protection`, {
       method: "POST",
     }),
-  rollbackRetcon: (storyId: string, retconId: string) =>
-    request<{ story: Story; retcon: RetconTransaction }>(`/api/stories/${storyId}/retcons/${retconId}/rollback`, {
+  rollbackRetcon: (story: Story, retconId: string) =>
+    request<{ story: Story; retcon: RetconTransaction }>(`/api/stories/${story.id}/retcons/${retconId}/rollback`, {
       method: "POST",
+      body: JSON.stringify({
+        branchId: story.activeBranchId,
+        baseCanonVersion: story.canonVersion,
+        idempotencyKey: crypto.randomUUID(),
+      }),
     }),
   markCanonChangesRead: (storyId: string) =>
     request<void>(`/api/stories/${storyId}/canon-changes/read`, { method: "POST" }),

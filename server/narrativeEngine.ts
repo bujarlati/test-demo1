@@ -34,13 +34,35 @@ export interface CandidateDraft {
   novelty: string;
 }
 
+export interface ExtractedEventDraft {
+  type?: StoryEvent["type"];
+  title: string;
+  cause: string;
+  outcome: string;
+  participantNames?: string[];
+  location?: string;
+}
+
+export interface ExtractedCharacterUpdate {
+  name: string;
+  status?: string;
+  location?: string;
+  goal?: string;
+  knowledgeGained?: string[];
+}
+
+export interface ExtractedChapterState {
+  events: ExtractedEventDraft[];
+  characterUpdates: ExtractedCharacterUpdate[];
+}
+
 function numericSeed(value: string) {
   return Number.parseInt(createHash("sha256").update(value).digest("hex").slice(0, 8), 16);
 }
 
 function activeLead(story: Story) {
   return (
-    story.characters.find((character) => !/死亡|失踪/.test(character.status)) ??
+    story.characters.find((character) => character.lifecycle === "alive") ??
     story.characters[0]
   );
 }
@@ -144,10 +166,40 @@ export function planNextChapter(story: Story, externalDrafts?: CandidateDraft[])
   const patterns = externalDrafts && externalDrafts.length >= 3
     ? externalDrafts.slice(0, 5)
     : localPatterns;
-  const protectedLead = Boolean(lead?.protected);
   const candidates = patterns.map<NarrativeCandidate>((pattern, index) => {
-    const hardConflict = index === 4 && protectedLead;
-    const recentAxis = story.events.slice(-3).some((event) => event.title.includes(axes[index % axes.length]));
+    const candidateText = `${pattern.event} ${pattern.cause} ${pattern.cost} ${pattern.impact}`;
+    const hardReasons: string[] = [];
+    for (const character of story.characters) {
+      const characterDeath =
+        candidateText.includes(character.name) && /死亡|死去|断气|牺牲|暂时死亡/.test(candidateText);
+      if (character.protected && characterDeath) {
+        hardReasons.push(`违反硬约束：${character.name}已设为死亡保护角色`);
+      }
+      if (
+        character.lifecycle === "dead" &&
+        candidateText.includes(character.name) &&
+        !/回忆|档案|遗物|证词|曾经/.test(candidateText)
+      ) {
+        hardReasons.push(`违反人物状态：已死亡角色 ${character.name} 无依据参与新事件`);
+      }
+    }
+    for (const rule of story.rules.filter((item) => item.hardness === "hard")) {
+      if (/不存在复活|不得复活|无复活/.test(rule.description) && /复活|死而复生|重新活过来/.test(candidateText)) {
+        hardReasons.push(`违反世界规则：${rule.title}`);
+      }
+      if (/不以梦境抹除/.test(rule.description) && /原来只是梦|一切都是梦/.test(candidateText)) {
+        hardReasons.push(`违反世界规则：${rule.title}`);
+      }
+    }
+    for (const preference of story.preferences.filter((item) => item.active && item.kind === "hard")) {
+      if (/洗白|免责|原谅.*反派/.test(`${preference.label} ${preference.description}`) && /洗白|免责|无罪|获得原谅/.test(candidateText)) {
+        hardReasons.push(`违反读者硬约束：${preference.label}`);
+      }
+    }
+    const hardConflict = hardReasons.length > 0;
+    const recentAxis = story.events
+      .slice(-4)
+      .some((event) => event.creativeAxis === pattern.creativeAxis);
     const score = 68 + ((seed >> (index * 3)) & 15) + (openClue && index !== 4 ? 7 : 0) - (recentAxis ? 8 : 0);
     return {
       id: `candidate_${randomUUID().slice(0, 8)}`,
@@ -156,7 +208,7 @@ export function planNextChapter(story: Story, externalDrafts?: CandidateDraft[])
       score: hardConflict ? 0 : score,
       status: "rejected",
       reasons: hardConflict
-        ? [`违反硬约束：${leadName}已设为死亡保护角色`]
+        ? hardReasons
         : recentAxis
           ? ["结构轴近期重复，已降低新颖度评分"]
           : ["通过人物知识、世界规则与硬偏好门禁"],
@@ -183,7 +235,11 @@ export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
     .map((rule) => rule.description)
     .join("；");
   const hardPreferences = story.preferences
-    .filter((preference) => preference.active)
+    .filter((preference) => preference.active && preference.kind === "hard")
+    .map((preference) => preference.description)
+    .join("；");
+  const softPreferences = story.preferences
+    .filter((preference) => preference.active && preference.kind === "soft")
     .map((preference) => preference.description)
     .join("；");
   return [
@@ -192,7 +248,7 @@ export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
     `暂定结局契约：${story.endingContract.targetEnding}。`,
     `上一章：第${latest?.number ?? 0}章《${latest?.title ?? "序章"}》。`,
     `入选剧情胶囊：事件=${plan.selected.event}；原因=${plan.selected.cause}；代价=${plan.selected.cost}；影响=${plan.selected.impact}。`,
-    `硬规则：${hardRules || "无"}。读者约束：${hardPreferences || "无"}。`,
+    `硬规则：${hardRules || "无"}。读者硬约束：${hardPreferences || "无"}。近期软偏好：${softPreferences || "无"}。`,
     `固定预算相关记忆：\n${plan.memories.map((memory) => `[${memory.sourceId}|${memory.confidence.toFixed(2)}] ${memory.text}`).join("\n")}`,
     "只扩写这个方案为完整下一章；不得违反硬规则、人物知识边界或已确认死亡状态。",
   ].join("\n");
@@ -223,7 +279,11 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
   };
 }
 
-export function validateGeneratedChapter(story: Story, generated: GeneratedChapter) {
+export function validateGeneratedChapter(
+  story: Story,
+  generated: GeneratedChapter,
+  plan: GenerationPlan,
+) {
   if (!generated.title.trim() || generated.paragraphs.length < 4) {
     throw new Error("章节未通过完整性校验，已阻止发布。");
   }
@@ -232,9 +292,29 @@ export function validateGeneratedChapter(story: Story, generated: GeneratedChapt
     if (character.protected && content.includes(character.name) && /死亡|死去|断气|曲线归零/.test(content)) {
       throw new Error(`章节违反“保护 ${character.name}”硬约束，已阻止发布。`);
     }
-    if (/确认死亡/.test(character.status) && content.includes(character.name) && !/回忆|档案|遗物|曾经/.test(content)) {
+    if (character.lifecycle === "dead" && content.includes(character.name) && !/回忆|档案|遗物|曾经/.test(content)) {
       throw new Error(`章节让已死亡角色 ${character.name} 无依据重新出现，已阻止发布。`);
     }
+  }
+  for (const rule of story.rules.filter((item) => item.hardness === "hard")) {
+    if (/不存在复活|不得复活|无复活/.test(rule.description) && /复活|死而复生|重新活过来/.test(content)) {
+      throw new Error(`章节违反世界规则“${rule.title}”，已阻止发布。`);
+    }
+    if (/不以梦境抹除/.test(rule.description) && /原来只是梦|一切都是梦/.test(content)) {
+      throw new Error(`章节以梦境抹除既有因果，已阻止发布。`);
+    }
+  }
+  for (const preference of story.preferences.filter((item) => item.active && item.kind === "hard")) {
+    if (/洗白|免责|原谅.*反派/.test(`${preference.label} ${preference.description}`) && /洗白|免责|无罪|获得原谅/.test(content)) {
+      throw new Error(`章节违反读者硬约束“${preference.label}”，已阻止发布。`);
+    }
+  }
+  const anchors = [
+    ...story.characters.map((character) => character.name),
+    ...story.clues.filter((clue) => clue.status !== "resolved").map((clue) => clue.title),
+  ].filter((anchor) => plan.selected.event.includes(anchor));
+  if (anchors.length > 0 && !anchors.some((anchor) => content.includes(anchor))) {
+    throw new Error("正文没有落实入选剧情胶囊中的角色或伏笔锚点，已阻止发布。");
   }
 }
 
@@ -243,20 +323,71 @@ export function eventFromChapter(
   chapterNumber: number,
   revisionId: string,
   plan: GenerationPlan,
+  extracted?: ExtractedEventDraft,
+  generated?: GeneratedChapter,
 ): StoryEvent {
   const previousEvent = story.events.filter((event) => event.active).at(-1);
   const lead = activeLead(story);
+  const eventTypes = new Set<StoryEvent["type"]>([
+    "discovery",
+    "choice",
+    "relationship",
+    "death",
+    "survival",
+    "consequence",
+  ]);
+  const chapterText = generated?.paragraphs.join("\n") ?? "";
+  let extractedType = extracted?.type && eventTypes.has(extracted.type) ? extracted.type : "choice";
+  if (extractedType === "death" && generated && !/死亡|死去|断气|曲线归零/.test(chapterText)) {
+    extractedType = "choice";
+  }
   return {
     id: `event_${randomUUID().slice(0, 10)}`,
     chapterNumber,
     revisionId,
-    type: "choice",
-    title: plan.selected.event,
-    cause: plan.selected.cause,
-    outcome: `${plan.selected.impact}；代价：${plan.selected.cost}`,
-    participantIds: lead ? [lead.id] : [],
-    location: lead?.location ?? "当前场景",
+    type: extractedType,
+    title: (extracted?.title ?? plan.selected.event).slice(0, 180),
+    cause: (extracted?.cause ?? plan.selected.cause).slice(0, 240),
+    outcome: (extracted?.outcome ?? `${plan.selected.impact}；代价：${plan.selected.cost}`).slice(0, 280),
+    participantIds: extracted?.participantNames?.length
+      ? story.characters
+          .filter((character) => extracted.participantNames?.includes(character.name))
+          .map((character) => character.id)
+      : lead ? [lead.id] : [],
+    location: extracted?.location ?? lead?.location ?? "当前场景",
     dependsOn: previousEvent ? [previousEvent.id] : [],
     active: true,
+    creativeAxis: plan.selected.creativeAxis,
   };
+}
+
+export function applyExtractedCharacterState(
+  story: Story,
+  extracted?: ExtractedChapterState,
+  generated?: GeneratedChapter,
+) {
+  if (!extracted) return;
+  const chapterText = generated?.paragraphs.join("\n") ?? "";
+  for (const update of extracted.characterUpdates) {
+    const character = story.characters.find((item) => item.name === update.name);
+    if (!character) continue;
+    if (update.location) character.location = update.location.slice(0, 120);
+    if (update.goal) character.goal = update.goal.slice(0, 180);
+    if (update.status) {
+      const marksDeath = /死亡|死去/.test(update.status);
+      const statusSupported =
+        !generated ||
+        (chapterText.includes(character.name) && (!marksDeath || /死亡|死去|断气|曲线归零/.test(chapterText)));
+      if (statusSupported && !(character.protected && marksDeath)) {
+        character.status = update.status.slice(0, 80);
+        if (marksDeath) character.lifecycle = "dead";
+        else if (/失踪/.test(update.status)) character.lifecycle = "missing";
+        else if (/存活|活着/.test(update.status)) character.lifecycle = "alive";
+      }
+    }
+    for (const knowledge of update.knowledgeGained ?? []) {
+      const normalized = knowledge.trim().slice(0, 180);
+      if (normalized && !character.knowledge.includes(normalized)) character.knowledge.push(normalized);
+    }
+  }
 }

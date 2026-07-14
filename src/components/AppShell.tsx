@@ -3,6 +3,7 @@ import {
   BookOpenText,
   ChevronRight,
   Library,
+  LoaderCircle,
   LogOut,
   Plus,
   Settings2,
@@ -37,6 +38,16 @@ export function AppShell() {
             </NavLink>
           ))}
         </nav>
+
+        {Boolean(data?.pendingJobs.length) && (
+          <div className="sidebar__jobs" role="status" aria-live="polite">
+            <LoaderCircle size={16} />
+            <span>
+              <strong>续写仍在后台进行</strong>
+              <small>{data?.pendingJobs[0]?.storyTitle} · 第 {data?.pendingJobs[0]?.chapterNumber} 章</small>
+            </span>
+          </div>
+        )}
 
         {activeStory && (
           <div className="sidebar__continue">

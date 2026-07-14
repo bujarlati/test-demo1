@@ -6,6 +6,8 @@ import type {
   ConversationMessage,
   RetconChange,
   RetconTransaction,
+  ReaderMessageContext,
+  InterventionProposal,
   Story,
   StoryEvent,
 } from "../src/types";
@@ -15,7 +17,15 @@ function addMessage(story: Story, message: ConversationMessage) {
   story.updatedAt = message.createdAt;
 }
 
-function activeDeathEvent(story: Story, text: string): StoryEvent | undefined {
+function activeDeathEvent(
+  story: Story,
+  text: string,
+  context?: ReaderMessageContext,
+): StoryEvent | undefined {
+  if (context?.eventId) {
+    const anchored = story.events.find((event) => event.id === context.eventId && event.active);
+    if (anchored?.type === "death") return anchored;
+  }
   const named = story.characters.find((character) => text.includes(character.name));
   const deaths = story.events
     .filter((event) => event.active && event.type === "death")
@@ -55,7 +65,7 @@ function targetCharacter(story: Story, event: StoryEvent) {
   return (
     event.participantIds
       .map((id) => story.characters.find((character) => character.id === id))
-      .find((character): character is CharacterProfile => Boolean(character && /死亡/.test(character.status))) ??
+      .find((character): character is CharacterProfile => Boolean(character && character.lifecycle === "dead")) ??
     event.participantIds
       .map((id) => story.characters.find((character) => character.id === id))
       .find((character): character is CharacterProfile => Boolean(character))
@@ -76,9 +86,16 @@ function rewriteDependentParagraphs(paragraphs: string[], name: string) {
   );
 }
 
-function applyDeathVeto(store: AppStore, story: Story, sourceText: string): ConversationMessage {
-  const deathEvent = activeDeathEvent(story, sourceText);
+function applyDeathVeto(
+  store: AppStore,
+  story: Story,
+  sourceText: string,
+  proposal: InterventionProposal,
+  context?: ReaderMessageContext,
+): ConversationMessage {
+  const deathEvent = activeDeathEvent(story, sourceText, context);
   if (!deathEvent) {
+    proposal.status = "rejected";
     return {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
@@ -91,6 +108,7 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
   const character = targetCharacter(story, deathEvent);
   const deathChapter = story.chapters.find((chapter) => chapter.number === deathEvent.chapterNumber);
   if (!character || !deathChapter) {
+    proposal.status = "rejected";
     return {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
@@ -100,6 +118,9 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
       observedCanonVersion: story.canonVersion,
     };
   }
+  proposal.targetEventId = deathEvent.id;
+  proposal.chapterId = deathChapter.id;
+  proposal.revisionId = deathEvent.revisionId;
   const alreadyApplied = story.retcons.some(
     (retcon) =>
       retcon.kind === "intervention" &&
@@ -107,6 +128,7 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
       retcon.status === "committed",
   );
   if (alreadyApplied) {
+    proposal.status = "recorded";
     return {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
@@ -229,9 +251,10 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
     });
   }
 
-  const before = { status: character.status, location: character.location, role: character.role };
+  const before = { status: character.status, lifecycle: character.lifecycle, location: character.location, role: character.role };
   const after = {
     status: "存活 · 官方死亡",
+    lifecycle: "alive" as const,
     location: `${deathEvent.location}附近的隐匿地点`,
     role: character.role.includes("前") ? character.role : `${character.role} · 身份已注销`,
   };
@@ -275,11 +298,15 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
     characterSnapshots: [{ characterId: character.id, before, after }],
   };
   story.retcons.unshift(retcon);
+  proposal.status = "committed";
+  proposal.transactionId = retconId;
   story.conversation.forEach((message) => {
     if (message.observedCanonVersion < story.canonVersion) message.oldCanon = true;
   });
   store.jobs.unshift({
     id: `job_${randomUUID().slice(0, 7)}`,
+    ownerId: story.ownerId,
+    storyId: story.id,
     storyTitle: story.title,
     chapterNumber: deathChapter.number,
     task: "retcon",
@@ -304,10 +331,183 @@ function applyDeathVeto(store: AppStore, story: Story, sourceText: string): Conv
   };
 }
 
-export function handleReaderMessage(store: AppStore, story: Story, text: string) {
+function applyLocalIntervention(
+  store: AppStore,
+  story: Story,
+  sourceText: string,
+  proposal: InterventionProposal,
+  context: ReaderMessageContext | undefined,
+  mode: "relationship" | "accountability" | "selection",
+): ConversationMessage {
+  const chapter =
+    (context?.chapterId && story.chapters.find((item) => item.id === context.chapterId)) ||
+    story.chapters.at(-1);
+  const parent = chapter ? currentRevision(chapter) : null;
+  if (!chapter || !parent || (context?.revisionId && context.revisionId !== parent.id)) {
+    proposal.status = "rejected";
+    return {
+      id: `msg_${randomUUID().slice(0, 8)}`,
+      role: "system",
+      type: "answer",
+      content: "你指向的段落已经不在当前 Revision 中。正史没有被改动，请在最新版本重新选择。",
+      createdAt: new Date().toISOString(),
+      observedCanonVersion: story.canonVersion,
+    };
+  }
   const createdAt = new Date().toISOString();
-  addMessage(story, {
+  const canonBefore = story.canonVersion;
+  const anchor =
+    (context?.eventId && story.events.find((event) => event.id === context.eventId && event.active)) ||
+    story.events.filter((event) => event.active && event.chapterNumber === chapter.number).at(-1);
+  let paragraphs = [...parent.paragraphs];
+  let summary: string;
+  let preferenceLabel: string;
+  let preferenceKind: "hard" | "soft";
+  if (mode === "relationship") {
+    paragraphs.push("他们没有在这一刻确认关系。共同经历只带来更多需要验证的信任，任何亲近都必须经过后续选择与代价，而不是被一次危机直接兑换。");
+    summary = "放慢当前关系确认，把亲近改为仍需验证的信任。";
+    preferenceLabel = "关系推进需要选择与代价";
+    preferenceKind = "soft";
+  } else if (mode === "accountability") {
+    paragraphs.push("理解他的动机没有抵消已经造成的伤害。人物可以复杂，也必须继续承担责任；这一章不把解释写成原谅。");
+    summary = "保留反派动机的复杂性，但撤销把解释等同于免责的表达。";
+    preferenceLabel = "反派不因解释获得免责";
+    preferenceKind = "hard";
+  } else {
+    const selection = context?.selection?.trim();
+    if (!selection) {
+      proposal.status = "rejected";
+      return {
+        id: `msg_${randomUUID().slice(0, 8)}`,
+        role: "system",
+        type: "answer",
+        content: "局部重写需要一个仍属于当前 Revision 的文本选择；这次没有改动正史。",
+        createdAt,
+        observedCanonVersion: story.canonVersion,
+      };
+    }
+    let replaced = false;
+    paragraphs = paragraphs.map((paragraph) => {
+      if (replaced || !paragraph.includes(selection)) return paragraph;
+      replaced = true;
+      return paragraph.replace(selection, `${selection.replace(/[。！？!?]$/, "")}；但这个判断仍需要在后续事件中付出代价才能成立。`);
+    });
+    if (!replaced) {
+      proposal.status = "rejected";
+      return {
+        id: `msg_${randomUUID().slice(0, 8)}`,
+        role: "system",
+        type: "answer",
+        content: "选中文本与当前 Revision 不一致，因此没有提交局部重写。",
+        createdAt,
+        observedCanonVersion: story.canonVersion,
+      };
+    }
+    summary = "只重写选中句并补回叙事代价，其余段落保持不变。";
+    preferenceLabel = "选中段落的局部约束";
+    preferenceKind = "soft";
+  }
+
+  const revisionId = createRevisionId(story, chapter.number, chapter.revisions.length);
+  chapter.revisions.push({
+    id: revisionId,
+    parentRevisionId: parent.id,
+    title: parent.title,
+    paragraphs,
+    reason: `读者介入：${sourceText}`,
+    createdAt,
+    modelName: "intervention-rewriter",
+    promptVersion: "intervention-v2",
+    changeSummary: summary,
+  });
+  chapter.currentRevisionId = revisionId;
+  chapter.hasUnreadRevision = true;
+  const preference = {
+    id: `pref_${randomUUID().slice(0, 8)}`,
+    label: preferenceLabel,
+    description: sourceText,
+    kind: preferenceKind,
+    confidence: mode === "accountability" ? 1 : 0.84,
+    active: true,
+  };
+  story.preferences.unshift(preference);
+  const retconId = `retcon_${randomUUID().slice(0, 8)}`;
+  const retcon: RetconTransaction = {
+    id: retconId,
+    kind: "intervention",
+    title: mode === "relationship" ? `放慢第 ${chapter.number} 章的关系推进` : mode === "accountability" ? `保留第 ${chapter.number} 章的责任边界` : `局部重写第 ${chapter.number} 章选中段落`,
+    sourceText,
+    summary,
+    createdAt,
+    canonVersionBefore: canonBefore,
+    canonVersionAfter: canonBefore + 1,
+    changes: [{
+      chapterNumber: chapter.number,
+      chapterTitle: chapter.title,
+      kind: "required",
+      summary,
+      revisionId,
+      previousRevisionId: parent.id,
+    }],
+    cost: "L1 · 1 个章节 Revision",
+    status: "committed",
+    targetEventId: anchor?.id,
+    preferenceIds: [preference.id],
+  };
+  story.retcons.unshift(retcon);
+  story.canonVersion += 1;
+  story.unreadCanonChanges += 1;
+  story.updatedAt = createdAt;
+  story.endingContract.version += 1;
+  story.endingContract.status = "needs_review";
+  story.endingContract.lastEvaluatedAt = createdAt;
+  if (anchor) anchor.revisionId = revisionId;
+  story.conversation.forEach((message) => {
+    if (message.observedCanonVersion < story.canonVersion) message.oldCanon = true;
+  });
+  proposal.targetEventId = anchor?.id;
+  proposal.chapterId = chapter.id;
+  proposal.revisionId = parent.id;
+  proposal.status = "committed";
+  proposal.transactionId = retconId;
+  store.jobs.unshift({
+    id: `job_${randomUUID().slice(0, 7)}`,
+    ownerId: story.ownerId,
+    storyId: story.id,
+    storyTitle: story.title,
+    chapterNumber: chapter.number,
+    task: "retcon",
+    model: "intervention-rewriter",
+    connectionId: story.modelConnectionId ?? "conn_platform",
+    promptVersion: "intervention-v2",
+    status: "completed",
+    tokens: 960,
+    latencyMs: 420,
+    cost: 0.05,
+    createdAt,
+    filterSummary: `介入分类=${proposal.classification}；事件锚点=${anchor?.id ?? "chapter-only"}；范围=current_chapter。`,
+  });
+  return {
     id: `msg_${randomUUID().slice(0, 8)}`,
+    role: "system",
+    type: "retcon_result",
+    content: `${summary} 已提交为正史 v${story.canonVersion}。`,
+    createdAt,
+    observedCanonVersion: story.canonVersion,
+    retconId,
+  };
+}
+
+export function handleReaderMessage(
+  store: AppStore,
+  story: Story,
+  text: string,
+  context?: ReaderMessageContext,
+) {
+  const createdAt = new Date().toISOString();
+  const sourceMessageId = `msg_${randomUUID().slice(0, 8)}`;
+  addMessage(story, {
+    id: sourceMessageId,
     role: "user",
     type: "text",
     content: text,
@@ -315,9 +515,47 @@ export function handleReaderMessage(store: AppStore, story: Story, text: string)
     observedCanonVersion: story.canonVersion,
   });
 
+  const isDeathVeto = /不希望.*死|不要.*死|别让.*死|不能.*死/.test(text);
+  const isRelationshipRewrite = /关系.*太快|感情.*太快|发展太快/.test(text);
+  const isAccountabilityConstraint = /不要.*洗白|不能.*洗白|反派.*洗白|不.*原谅.*反派/.test(text);
+  const isSelectionRewrite = Boolean(context?.selection) && /改|不要|别|不喜欢|不希望/.test(text);
+  const isQuestion = /为什么|怎么会|是谁|吗[？?]?$|[？?]$/.test(text);
+  const classification: InterventionProposal["classification"] = isDeathVeto
+    ? "event_veto"
+    : isRelationshipRewrite || isSelectionRewrite
+      ? "local_rewrite"
+      : isAccountabilityConstraint
+        ? "hard_constraint"
+        : isQuestion
+          ? "question"
+          : /太快|太慢|压抑|轻松|多看看|少一点/.test(text)
+            ? "soft_preference"
+            : "future_direction";
+  const proposal: InterventionProposal = {
+    id: `proposal_${randomUUID().slice(0, 8)}`,
+    sourceMessageId,
+    sourceText: text,
+    classification,
+    confidence: isDeathVeto || isRelationshipRewrite || isAccountabilityConstraint ? 0.94 : context?.selection ? 0.88 : 0.72,
+    chapterId: context?.chapterId,
+    revisionId: context?.revisionId,
+    selection: context?.selection,
+    targetEventId: context?.eventId,
+    scope: isDeathVeto ? "current_event" : isRelationshipRewrite || isSelectionRewrite || isAccountabilityConstraint ? "current_chapter" : isQuestion ? "conversation_only" : "future",
+    status: "parsed",
+    createdAt,
+  };
+  story.proposals.unshift(proposal);
+
   let response: ConversationMessage;
-  if (/不希望.*死|不要.*死|别让.*死|不能.*死/.test(text)) {
-    response = applyDeathVeto(store, story, text);
+  if (isDeathVeto) {
+    response = applyDeathVeto(store, story, text, proposal, context);
+  } else if (isRelationshipRewrite) {
+    response = applyLocalIntervention(store, story, text, proposal, context, "relationship");
+  } else if (isAccountabilityConstraint) {
+    response = applyLocalIntervention(store, story, text, proposal, context, "accountability");
+  } else if (isSelectionRewrite) {
+    response = applyLocalIntervention(store, story, text, proposal, context, "selection");
   } else if (/太快|太慢|压抑|轻松|多看看|少一点/.test(text)) {
     const label = text.includes("太快")
       ? "放慢关系与事件推进"
@@ -334,6 +572,7 @@ export function handleReaderMessage(store: AppStore, story: Story, text: string)
       confidence: 0.72,
       active: true,
     });
+    proposal.status = "recorded";
     response = {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
@@ -342,7 +581,8 @@ export function handleReaderMessage(store: AppStore, story: Story, text: string)
       createdAt: new Date().toISOString(),
       observedCanonVersion: story.canonVersion,
     };
-  } else if (/为什么|怎么会|是谁|吗[？?]?$|[？?]$/.test(text)) {
+  } else if (isQuestion) {
+    proposal.status = "recorded";
     const lead = story.characters[0];
     response = {
       id: `msg_${randomUUID().slice(0, 8)}`,
@@ -355,6 +595,7 @@ export function handleReaderMessage(store: AppStore, story: Story, text: string)
       observedCanonVersion: story.canonVersion,
     };
   } else {
+    proposal.status = "recorded";
     response = {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
@@ -371,7 +612,14 @@ export function handleReaderMessage(store: AppStore, story: Story, text: string)
 export function rollbackRetcon(story: Story, retconId: string) {
   const original = story.retcons.find((item) => item.id === retconId);
   if (!original || original.kind !== "intervention" || original.status !== "committed") {
-    throw new Error("该修史事务不可回滚。");
+    const error = new Error("该修史事务不可回滚。");
+    Object.assign(error, { status: 409 });
+    throw error;
+  }
+  if (story.canonVersion !== original.canonVersionAfter) {
+    const error = new Error("只能回滚最新的正史事务；请先处理它之后的修订。");
+    Object.assign(error, { status: 409 });
+    throw error;
   }
   const createdAt = new Date().toISOString();
   const canonBefore = story.canonVersion;
@@ -411,10 +659,18 @@ export function rollbackRetcon(story: Story, retconId: string) {
     if (character) Object.assign(character, snapshot.before);
   }
   const target = original.targetEventId ? story.events.find((event) => event.id === original.targetEventId) : null;
-  if (target) target.active = true;
+  if (target) {
+    target.active = true;
+    const restoredAnchor = rollbackChanges.find((change) => change.chapterNumber === target.chapterNumber);
+    if (restoredAnchor?.revisionId) target.revisionId = restoredAnchor.revisionId;
+  }
   story.events
     .filter((event) => event.type === "survival" && event.chapterNumber === target?.chapterNumber)
     .forEach((event) => { event.active = false; });
+  for (const preferenceId of original.preferenceIds ?? []) {
+    const preference = story.preferences.find((item) => item.id === preferenceId);
+    if (preference) preference.active = false;
+  }
 
   story.canonVersion += 1;
   story.unreadCanonChanges += rollbackChanges.length;
@@ -439,6 +695,9 @@ export function rollbackRetcon(story: Story, retconId: string) {
   };
   original.status = "reversed";
   original.reversedByRetconId = rollbackId;
+  story.proposals
+    .filter((proposal) => proposal.transactionId === original.id)
+    .forEach((proposal) => { proposal.status = "reversed"; });
   story.retcons.unshift(rollback);
   story.conversation.forEach((message) => {
     if (message.observedCanonVersion < story.canonVersion) message.oldCanon = true;
@@ -452,5 +711,7 @@ export function rollbackRetcon(story: Story, retconId: string) {
     observedCanonVersion: story.canonVersion,
   });
   story.updatedAt = createdAt;
+  const latestRevision = story.chapters.at(-1) ? currentRevision(story.chapters.at(-1)!) : null;
+  if (latestRevision?.paragraphs.length) story.latestExcerpt = latestRevision.paragraphs.at(-1) ?? story.latestExcerpt;
   return rollback;
 }

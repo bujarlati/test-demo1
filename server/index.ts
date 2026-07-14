@@ -3,13 +3,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type { ModelConnection, UserAccount } from "../src/types";
+import type { GenerationJob, ModelConnection, Story, UserAccount } from "../src/types";
 import { audit, authenticate, login, publicUser, requireAdmin, type AuthLocals } from "./auth";
 import {
   assertSafeEndpoint,
   extractChapterStateWithConnection,
   generateCandidateDraftsWithConnection,
   generateChapterWithConnection,
+  streamChapterWithConnection,
   testConnection,
 } from "./modelGateway";
 import {
@@ -18,6 +19,7 @@ import {
   planNextChapter,
   type GenerationPlan,
   type GeneratedChapter,
+  type ExtractedChapterState,
 } from "./narrativeEngine";
 import { handleReaderMessage, rollbackRetcon } from "./retconService";
 import { loadStore, saveStore } from "./storage";
@@ -31,10 +33,22 @@ import { storeSecret } from "./vault";
 
 const app = express();
 const store = await loadStore();
+const interruptedJobs = store.jobs.filter((job) => job.status === "running");
+if (interruptedJobs.length > 0) {
+  for (const job of interruptedJobs) {
+    job.status = "failed";
+    job.filterSummary = "服务重启中断了这次生成，正史没有提交；可以安全重试。";
+    if (job.idempotencyKey) {
+      const scopedKey = `${job.ownerId}:${job.idempotencyKey}`;
+      store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== scopedKey);
+    }
+  }
+  await saveStore(store);
+}
 const port = Number(process.env.PORT ?? 8787);
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(currentDirectory, "..");
-const generationLocks = new Set<string>();
+const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 
 app.disable("x-powered-by");
@@ -68,6 +82,50 @@ function connectionOrThrow(id: string, user: UserAccount) {
     throw error;
   }
   return connection;
+}
+
+function assertCanonCommand(
+  story: ReturnType<typeof storyOrThrow>,
+  command: { branchId: string; baseCanonVersion: number },
+) {
+  if (
+    command.branchId !== story.activeBranchId ||
+    command.baseCanonVersion !== story.canonVersion
+  ) {
+    const error = new Error("正史或活动分支已更新，请刷新后重试。");
+    Object.assign(error, { status: 409 });
+    throw error;
+  }
+}
+
+function reserveIdempotencyKey(userId: string, idempotencyKey: string) {
+  const scopedKey = `${userId}:${idempotencyKey}`;
+  if (store.idempotencyKeys.includes(scopedKey)) return { duplicate: true, scopedKey };
+  store.idempotencyKeys.push(scopedKey);
+  store.idempotencyKeys = store.idempotencyKeys.slice(-500);
+  return { duplicate: false, scopedKey };
+}
+
+function hasIdempotencyKey(userId: string, idempotencyKey: string) {
+  return store.idempotencyKeys.includes(`${userId}:${idempotencyKey}`);
+}
+
+function mergeConcurrentReaderState(next: Story, baseline: Story, current: Story) {
+  next.readingProgress = structuredClone(current.readingProgress);
+  const newUnreadChanges = Math.max(0, next.unreadCanonChanges - baseline.unreadCanonChanges);
+  next.unreadCanonChanges = current.unreadCanonChanges + newUnreadChanges;
+  for (const chapter of next.chapters) {
+    const baselineChapter = baseline.chapters.find((item) => item.id === chapter.id);
+    const currentChapter = current.chapters.find((item) => item.id === chapter.id);
+    if (
+      baselineChapter &&
+      currentChapter &&
+      chapter.currentRevisionId === baselineChapter.currentRevisionId &&
+      currentChapter.currentRevisionId === baselineChapter.currentRevisionId
+    ) {
+      chapter.hasUnreadRevision = currentChapter.hasUnreadRevision;
+    }
+  }
 }
 
 const createStorySchema = z.object({
@@ -139,6 +197,7 @@ app.get("/api/bootstrap", (_request, response) => {
       .map(summarizeStory)
       .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
     activeStoryId: user.activeStoryId,
+    pendingJobs: store.jobs.filter((job) => job.ownerId === user.id && job.status === "running"),
   });
 });
 
@@ -175,34 +234,59 @@ async function generateChapter(
   body: { idempotencyKey: string; branchId: string; baseCanonVersion: number },
   emit: (event: string, payload: unknown) => void,
 ): Promise<GenerationResult> {
-  const story = storyOrThrow(storyId, user);
-  if (body.branchId !== story.activeBranchId || body.baseCanonVersion !== story.canonVersion) {
-    const error = new Error("正史或活动分支已更新，请刷新后重试。");
-    Object.assign(error, { status: 409 });
-    throw error;
-  }
-  const scopedKey = `${user.id}:${body.idempotencyKey}`;
-  if (store.idempotencyKeys.includes(scopedKey)) {
-    return { story, chapter: story.chapters.at(-1)!, duplicate: true };
-  }
-  if (generationLocks.has(story.id)) {
+  const storedStory = storyOrThrow(storyId, user);
+  if (storyMutationLocks.has(storedStory.id)) {
     const error = new Error("这个故事已有续章作业在运行，请等待当前作业完成。");
     Object.assign(error, { status: 409 });
     throw error;
   }
-  generationLocks.add(story.id);
-  store.idempotencyKeys.push(scopedKey);
-  store.idempotencyKeys = store.idempotencyKeys.slice(-500);
-  const connectionId = story.modelConnectionId ?? user.defaultConnectionId;
+  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+    return { story: storedStory, chapter: storedStory.chapters.at(-1)!, duplicate: true };
+  }
+  assertCanonCommand(storedStory, body);
+  const connectionId = storedStory.modelConnectionId ?? user.defaultConnectionId;
   const connection = connectionOrThrow(connectionId, user);
+  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  if (reservation.duplicate) return { story: storedStory, chapter: storedStory.chapters.at(-1)!, duplicate: true };
+  storyMutationLocks.add(storedStory.id);
+  const baselineStory = structuredClone(storedStory);
+  const story = structuredClone(baselineStory);
+  const storyIndex = store.stories.findIndex((item) => item.id === storedStory.id);
   const startedAt = performance.now();
+  const job: GenerationJob = {
+    id: `job_${randomUUID().slice(0, 8)}`,
+    ownerId: user.id,
+    storyId: story.id,
+    idempotencyKey: body.idempotencyKey,
+    storyTitle: story.title,
+    chapterNumber: (story.chapters.at(-1)?.number ?? 0) + 1,
+    task: "chapter",
+    model: connection.routes.writer,
+    connectionId: connection.id,
+    promptVersion: "story-v8",
+    status: "running",
+    tokens: 0,
+    latencyMs: 0,
+    cost: 0,
+    createdAt: new Date().toISOString(),
+    filterSummary: "正在组装正史上下文与候选剧情。",
+  };
+  store.jobs.unshift(job);
+  audit(store, user.id, "generation.start", "generation", job.id, {
+    storyId: story.id,
+    connectionId: connection.id,
+    chapterNumber: job.chapterNumber,
+  });
   let plan: GenerationPlan | undefined;
   let generated: GeneratedChapter | undefined;
+  let extracted: ExtractedChapterState | undefined;
+  let streamedParagraphCount = 0;
   let effectiveConnection = connection;
   let isManagedLocal = connection.secretRef.startsWith("platform://managed");
   try {
+    await persist();
     emit("stage", { stage: 0, label: "组装当前正史与相关记忆" });
-    const runRoutes = async () => {
+    const runGenerationPipeline = async () => {
       const externalDrafts = isManagedLocal
         ? undefined
         : await generateCandidateDraftsWithConnection(effectiveConnection, story);
@@ -210,13 +294,26 @@ async function generateChapter(
       emit("stage", { stage: 1, label: `生成 ${plan.candidates.length} 个短剧情胶囊` });
       emit("stage", { stage: 2, label: plan.filterSummary });
       const prompt = buildChapterPrompt(story, plan);
-      generated = isManagedLocal
-        ? generateLocalChapter(story, plan)
-        : await generateChapterWithConnection(effectiveConnection, prompt);
-      if (!isManagedLocal) await extractChapterStateWithConnection(effectiveConnection, generated);
+      if (isManagedLocal) {
+        generated = generateLocalChapter(story, plan);
+      } else if (effectiveConnection.capabilities?.streaming) {
+        generated = await streamChapterWithConnection(
+          effectiveConnection,
+          prompt,
+          (paragraph, index, title) => {
+            streamedParagraphCount = index + 1;
+            emit("paragraph", { index, title, paragraph });
+          },
+        );
+      } else {
+        generated = await generateChapterWithConnection(effectiveConnection, prompt);
+      }
+      extracted = !isManagedLocal
+        ? await extractChapterStateWithConnection(effectiveConnection, generated)
+        : undefined;
     };
     try {
-      await runRoutes();
+      await runGenerationPipeline();
     } catch (routeError) {
       if (connection.fallbackPolicy === "none") throw routeError;
       if (connection.fallbackPolicy === "same_connection") {
@@ -236,34 +333,34 @@ async function generateChapter(
         stage: 0,
         label: `已按预授权策略切换至${connection.fallbackPolicy === "same_connection" ? "同连接正文模型" : "平台托管连接"}`,
       });
+      if (streamedParagraphCount > 0) {
+        streamedParagraphCount = 0;
+        emit("reset_draft", { reason: "原连接中断，已按预授权回退策略重新生成。" });
+      }
       audit(store, user.id, "generation.explicit-fallback", "generation", story.id, {
         fromConnectionId: connection.id,
         toConnectionId: effectiveConnection.id,
         policy: connection.fallbackPolicy,
       });
-      await runRoutes();
+      await runGenerationPipeline();
     }
     if (!plan || !generated) throw new Error("生成管线没有产生可提交的章节。");
     emit("stage", { stage: 3, label: "入选方案扩写完成，正在逐段提交" });
     for (const [index, paragraph] of generated.paragraphs.entries()) {
+      if (index < streamedParagraphCount) continue;
       emit("paragraph", { index, title: generated.title, paragraph });
       if (isManagedLocal) await new Promise((resolve) => setTimeout(resolve, 90));
     }
-    const chapter = commitNextChapter(story, plan, generated);
+    const chapter = commitNextChapter(story, plan, generated, extracted);
     emit("stage", { stage: 4, label: "事件已提取并提交为不可变 Revision" });
-    store.jobs.unshift({
-      id: `job_${randomUUID().slice(0, 8)}`,
-      storyTitle: story.title,
+    Object.assign(job, {
       chapterNumber: chapter.number,
-      task: "chapter",
       model: effectiveConnection.routes.writer,
       connectionId: effectiveConnection.id,
-      promptVersion: "story-v8",
-      status: "completed",
+      status: "completed" as const,
       tokens: isManagedLocal ? 5280 : 7320,
       latencyMs: Math.round(performance.now() - startedAt),
       cost: isManagedLocal ? 0.37 : 0,
-      createdAt: new Date().toISOString(),
       candidateTrace: plan.candidates,
       filterSummary: plan.filterSummary,
     });
@@ -274,23 +371,25 @@ async function generateChapter(
       writer: effectiveConnection.routes.writer,
       extractor: effectiveConnection.routes.extractor,
     });
-    await persist();
+    const concurrentStory = store.stories[storyIndex];
+    mergeConcurrentReaderState(story, baselineStory, concurrentStory);
+    store.stories[storyIndex] = story;
+    try {
+      await persist();
+    } catch (persistError) {
+      store.stories[storyIndex] = concurrentStory;
+      throw persistError;
+    }
     return { story, chapter, duplicate: false };
   } catch (error) {
-    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== scopedKey);
-    store.jobs.unshift({
-      id: `job_${randomUUID().slice(0, 8)}`,
-      storyTitle: story.title,
-      chapterNumber: (story.chapters.at(-1)?.number ?? 0) + 1,
-      task: "chapter",
-      model: connection.routes.writer,
-      connectionId: connection.id,
-      promptVersion: "story-v8",
-      status: "failed",
+    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    Object.assign(job, {
+      model: effectiveConnection.routes.writer,
+      connectionId: effectiveConnection.id,
+      status: "failed" as const,
       tokens: 0,
       latencyMs: Math.round(performance.now() - startedAt),
       cost: 0,
-      createdAt: new Date().toISOString(),
       candidateTrace: plan?.candidates,
       filterSummary: error instanceof Error ? error.message : "生成失败",
     });
@@ -301,7 +400,7 @@ async function generateChapter(
     await persist();
     throw error;
   } finally {
-    generationLocks.delete(story.id);
+    storyMutationLocks.delete(story.id);
   }
 }
 
@@ -344,29 +443,56 @@ app.post("/api/stories/:storyId/chapters/generate", async (request, response, ne
 
 app.post("/api/stories/:storyId/messages", async (request, response) => {
   const user = currentUser(response);
-  const story = storyOrThrow(request.params.storyId, user);
+  const storedStory = storyOrThrow(request.params.storyId, user);
   const body = z.object({
     message: z.string().trim().min(1).max(500),
     branchId: z.string().min(1),
     baseCanonVersion: z.number().int().positive(),
     idempotencyKey: z.string().min(8).max(120),
+    clientContext: z.object({
+      chapterId: z.string().min(1),
+      revisionId: z.string().min(1),
+      selection: z.string().max(500).optional(),
+      eventId: z.string().min(1).optional(),
+    }).optional(),
   }).parse(request.body);
-  if (body.branchId !== story.activeBranchId || body.baseCanonVersion !== story.canonVersion) {
-    response.status(409).json({ message: "正史或活动分支已更新，请刷新后重新提交。" });
+  if (storyMutationLocks.has(storedStory.id)) {
+    response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
     return;
   }
-  const scopedKey = `${user.id}:${body.idempotencyKey}`;
-  if (store.idempotencyKeys.includes(scopedKey)) {
-    response.json({ story, duplicate: true });
+  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+    response.json({ story: storedStory, duplicate: true });
     return;
   }
-  store.idempotencyKeys.push(scopedKey);
-  const message = handleReaderMessage(store, story, body.message);
-  audit(store, user.id, "retcon.message", "retcon", message.retconId ?? message.id, {
-    storyId: story.id,
-    changedCanon: Boolean(message.retconId),
-  });
-  await persist();
+  assertCanonCommand(storedStory, body);
+  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  if (reservation.duplicate) {
+    response.json({ story: storedStory, duplicate: true });
+    return;
+  }
+  storyMutationLocks.add(storedStory.id);
+  const story = structuredClone(storedStory);
+  const storyIndex = store.stories.findIndex((item) => item.id === storedStory.id);
+  const previousJobs = structuredClone(store.jobs);
+  const previousAuditEvents = structuredClone(store.auditEvents);
+  let message: ReturnType<typeof handleReaderMessage>;
+  try {
+    message = handleReaderMessage(store, story, body.message, body.clientContext);
+    audit(store, user.id, "retcon.message", "retcon", message.retconId ?? message.id, {
+      storyId: story.id,
+      changedCanon: Boolean(message.retconId),
+    });
+    store.stories[storyIndex] = story;
+    await persist();
+  } catch (error) {
+    store.stories[storyIndex] = storedStory;
+    store.jobs = previousJobs;
+    store.auditEvents = previousAuditEvents;
+    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    throw error;
+  } finally {
+    storyMutationLocks.delete(storedStory.id);
+  }
   response.status(201).json({ story, message, duplicate: false });
 });
 
@@ -395,6 +521,10 @@ app.put("/api/stories/:storyId/reading-progress", async (request, response) => {
 app.post("/api/stories/:storyId/characters/:characterId/protection", async (request, response) => {
   const user = currentUser(response);
   const story = storyOrThrow(request.params.storyId, user);
+  if (storyMutationLocks.has(story.id)) {
+    response.status(409).json({ message: "续章或修史正在提交，完成后再修改角色保护。" });
+    return;
+  }
   const character = toggleCharacterProtection(story, request.params.characterId);
   audit(store, user.id, "story.character-protection", "story", story.id, {
     characterId: character.id,
@@ -406,13 +536,46 @@ app.post("/api/stories/:storyId/characters/:characterId/protection", async (requ
 
 app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, response) => {
   const user = currentUser(response);
-  const story = storyOrThrow(request.params.storyId, user);
-  const retcon = rollbackRetcon(story, request.params.retconId);
-  audit(store, user.id, "retcon.rollback", "retcon", retcon.id, {
-    storyId: story.id,
-    reverses: request.params.retconId,
-  });
-  await persist();
+  const storedStory = storyOrThrow(request.params.storyId, user);
+  const body = generateSchema.parse(request.body);
+  if (storyMutationLocks.has(storedStory.id)) {
+    response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
+    return;
+  }
+  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+    const priorRollback = storedStory.retcons.find(
+      (item) => item.kind === "rollback" && item.reversesRetconId === request.params.retconId,
+    );
+    response.json({ story: storedStory, retcon: priorRollback, duplicate: true });
+    return;
+  }
+  assertCanonCommand(storedStory, body);
+  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  if (reservation.duplicate) {
+    response.json({ story: storedStory, duplicate: true });
+    return;
+  }
+  storyMutationLocks.add(storedStory.id);
+  const story = structuredClone(storedStory);
+  const storyIndex = store.stories.findIndex((item) => item.id === storedStory.id);
+  const previousAuditEvents = structuredClone(store.auditEvents);
+  let retcon: ReturnType<typeof rollbackRetcon>;
+  try {
+    retcon = rollbackRetcon(story, request.params.retconId);
+    audit(store, user.id, "retcon.rollback", "retcon", retcon.id, {
+      storyId: story.id,
+      reverses: request.params.retconId,
+    });
+    store.stories[storyIndex] = story;
+    await persist();
+  } catch (error) {
+    store.stories[storyIndex] = storedStory;
+    store.auditEvents = previousAuditEvents;
+    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    throw error;
+  } finally {
+    storyMutationLocks.delete(storedStory.id);
+  }
   response.json({ story, retcon });
 });
 

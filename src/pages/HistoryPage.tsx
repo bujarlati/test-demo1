@@ -44,7 +44,7 @@ export function HistoryPage() {
     if (!selected || selected.kind !== "intervention" || selected.status !== "committed") return;
     setRollingBack(true);
     try {
-      const result = await api.rollbackRetcon(story.id, selected.id);
+      const result = await api.rollbackRetcon(story, selected.id);
       setStory(result.story);
       setSelectedId(result.retcon.id);
       toast("旧正史已作为新的回滚记录恢复，历史没有被删除。");

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   Chapter,
   CreateStoryInput,
@@ -6,9 +6,11 @@ import type {
   StorySummary,
 } from "../src/types";
 import {
+  applyExtractedCharacterState,
   eventFromChapter,
   generateLocalChapter,
   type GeneratedChapter,
+  type ExtractedChapterState,
   type GenerationPlan,
   validateGeneratedChapter,
 } from "./narrativeEngine";
@@ -167,6 +169,60 @@ function targetChapterCount(length: string | undefined) {
   return Number(length?.match(/\d+/)?.[0]) || 24;
 }
 
+function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput, id: string) {
+  const inspiration = input.inspiration?.trim() || template.subtitle;
+  const tone = input.tone || "克制而有余韵";
+  const seed = Number.parseInt(
+    createHash("sha256").update(`${id}:${input.genre}:${tone}:${inspiration}`).digest("hex").slice(0, 8),
+    16,
+  );
+  const titles: Record<string, string[]> = {
+    悬疑: ["潮线失真", "无人认领的明天", "雾钟之后", "证词沉入海面"],
+    科幻: ["第七次日落", "零点之后的回声", "第二颗沉默行星", "明天拒绝重启"],
+    奇幻: ["灯塔之外", "影子保管局", "无岸海图", "借来的月光"],
+    治愈: ["风从面包房来", "替清晨留一盏灯", "失物慢慢归来", "今天的香气"],
+  };
+  const names: Record<string, string[]> = {
+    悬疑: ["程野", "闻溪", "纪临", "沈鸥"],
+    科幻: ["许澄", "陆弦", "季遥", "程霁"],
+    奇幻: ["顾遥", "迟萤", "闻舟", "祝岚"],
+    治愈: ["苏禾", "林葵", "乔安", "夏栀"],
+  };
+  const openings = ["异常第一次留下证据", "被提前写下的清晨", "没有归属的来信", "风向改变以前"];
+  const titlePool = titles[input.genre] ?? [template.title];
+  const namePool = names[input.genre] ?? [template.lead];
+  const title = titlePool[seed % titlePool.length];
+  const lead = namePool[(seed >>> 3) % namePool.length];
+  const firstTitle = openings[(seed >>> 6) % openings.length];
+  const motif = inspiration.replace(/[。！？!?]/g, "").slice(0, 46);
+  const paragraphs = [
+    `${tone}的天光落下来时，${lead}发现一件本不该出现在这里的东西。它与“${motif}”有关，却比任何解释都更像一份尚未发生的证据。`,
+    `${lead}先检查了时间、位置和自己的记忆。三者只有两项能够同时成立；剩下的那一项，正安静地改变周围人对昨天的说法。`,
+    `第一位证人拒绝承认异常，却准确说出了${lead}从未公开的细节。这个矛盾把可见目标变得清楚：必须在天黑以前找到证据的来源。`,
+    `追查不是免费的。${lead}为了留下线索，主动放弃了一条最安全的退路，也让一个原本愿意相信自己的人开始迟疑。`,
+    `当场景里最普通的物件第二次出现时，它的位置向左偏了一格。变化很小，却足以证明故事并没有重复——有人正在重排因果。`,
+    `${lead}没有向任何人询问下一步该怎么走。门在身后合上，第一条可追溯的事件已经成立，而真正的代价才刚刚开始。`,
+  ];
+  return {
+    title,
+    lead,
+    firstTitle,
+    paragraphs,
+    subtitle: inspiration,
+    gene: {
+      ...template.gene,
+      protagonistPosition: `${template.gene.protagonistPosition}；故事起点由“${motif}”触发`,
+      conflictEngine: `${template.gene.conflictEngine}；所有推进保持“${tone}”的叙事温度`,
+      recurringCost: `${template.gene.recurringCost}；每次选择必须在人物关系或身份上留下可追溯损失`,
+    },
+    ending: {
+      ...template.ending,
+      targetEnding: `${template.ending.targetEnding}；结局必须回应开篇意象“${motif}”`,
+      prerequisites: [...template.ending.prerequisites, `开篇灵感“${motif}”在结局前获得因果解释`],
+    },
+  };
+}
+
 export function createStory(input: CreateStoryInput, ownerId: string): Story {
   const template = storyTemplates[input.genre] ?? storyTemplates.悬疑;
   const id = `story_${randomUUID().slice(0, 8)}`;
@@ -175,11 +231,12 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
   const chapterId = `chapter_${id}_1`;
   const characterId = `char_${id}_lead`;
   const length = input.length || "中篇 · 预计 24 章";
+  const blueprint = personalizedBlueprint(template, input, id);
   return {
     id,
     ownerId,
-    title: template.title,
-    subtitle: input.inspiration?.trim() || template.subtitle,
+    title: blueprint.title,
+    subtitle: blueprint.subtitle,
     genre: input.genre,
     tone: input.tone || "由故事决定",
     length,
@@ -189,14 +246,14 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     status: "active",
     activeBranchId: `branch_${id}_main`,
     canonVersion: 1,
-    summary: input.inspiration?.trim() || template.subtitle,
-    latestExcerpt: template.paragraphs.at(-1) ?? "故事已经开始。",
+    summary: `${blueprint.subtitle}。${blueprint.gene.conflictEngine}`,
+    latestExcerpt: blueprint.paragraphs.at(-1) ?? "故事已经开始。",
     updatedAt: createdAt,
     unreadCanonChanges: 0,
     readingProgress: { chapterId, scrollProgress: 0, updatedAt: createdAt },
-    storyGene: { ...template.gene, version: 1, createdAt },
+    storyGene: { ...blueprint.gene, version: 1, createdAt },
     endingContract: {
-      ...template.ending,
+      ...blueprint.ending,
       version: 1,
       status: "viable",
       lastEvaluatedAt: createdAt,
@@ -207,9 +264,9 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         chapterNumber: 1,
         revisionId,
         type: "discovery",
-        title: template.firstTitle,
+        title: blueprint.firstTitle,
         cause: "主角第一次遇见故事核心异常",
-        outcome: template.paragraphs.at(-1) ?? "异常被确认存在",
+        outcome: blueprint.paragraphs.at(-1) ?? "异常被确认存在",
         participantIds: [characterId],
         location: "故事起点",
         dependsOn: [],
@@ -220,14 +277,14 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
       {
         id: chapterId,
         number: 1,
-        title: template.firstTitle,
+        title: blueprint.firstTitle,
         currentRevisionId: revisionId,
         revisions: [
           {
             id: revisionId,
             parentRevisionId: null,
-            title: template.firstTitle,
-            paragraphs: template.paragraphs,
+            title: blueprint.firstTitle,
+            paragraphs: blueprint.paragraphs,
             reason: "故事基因、结局契约与第一章初始化",
             createdAt,
             modelName: "platform-writer",
@@ -240,12 +297,13 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     characters: [
       {
         id: characterId,
-        name: template.lead,
+        name: blueprint.lead,
         role: "主角",
-        initials: template.lead.slice(0, 1),
+        initials: blueprint.lead.slice(0, 1),
         status: "存活",
+        lifecycle: "alive",
         location: "故事起点",
-        goal: template.gene.visibleGoal,
+        goal: blueprint.gene.visibleGoal,
         knowledge: ["第一章中亲眼看到的异常"],
         relationship: "尚未建立稳定同盟",
         protected: false,
@@ -282,6 +340,7 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         observedCanonVersion: 1,
       },
     ],
+    proposals: [],
     retcons: [],
     modelConnectionId: null,
   };
@@ -291,9 +350,10 @@ export function commitNextChapter(
   story: Story,
   plan: GenerationPlan,
   generated?: GeneratedChapter,
+  extracted?: ExtractedChapterState,
 ): Chapter {
   const result = generated ?? generateLocalChapter(story, plan);
-  validateGeneratedChapter(story, result);
+  validateGeneratedChapter(story, result, plan);
   const number = (story.chapters.at(-1)?.number ?? 0) + 1;
   const createdAt = new Date().toISOString();
   const chapterId = `chapter_${story.id}_${number}`;
@@ -318,7 +378,8 @@ export function commitNextChapter(
     estimatedMinutes: Math.max(5, Math.round(result.paragraphs.join("").length / 160)),
   };
   story.chapters.push(nextChapter);
-  story.events.push(eventFromChapter(story, number, revisionId, plan));
+  story.events.push(eventFromChapter(story, number, revisionId, plan, extracted?.events[0], result));
+  applyExtractedCharacterState(story, extracted, result);
   story.canonVersion += 1;
   story.updatedAt = createdAt;
   story.latestExcerpt = result.paragraphs.at(-1) ?? "";

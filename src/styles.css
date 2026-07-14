@@ -72,6 +72,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .sidebar__nav > a { display: flex; height: 44px; align-items: center; gap: 12px; padding: 0 13px; border-radius: 10px; color: #596663; font-size: 14px; font-weight: 620; }
 .sidebar__nav > a:hover { color: var(--ink); background: #f0eee7; }
 .sidebar__nav > a.active { color: var(--jade-dark); background: var(--jade-soft); }
+.sidebar__jobs { display: flex; gap: 9px; align-items: center; margin-top: auto; padding: 11px 12px; border: 1px solid #e2c98f; border-radius: 11px; color: #76561b; background: #fbf2de; }
+.sidebar__jobs svg { flex: 0 0 auto; animation: spin 1.2s linear infinite; }
+.sidebar__jobs span { display: flex; min-width: 0; flex-direction: column; }
+.sidebar__jobs strong { font-size: 10px; }
+.sidebar__jobs small { overflow: hidden; margin-top: 2px; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar__jobs + .sidebar__continue { margin-top: 12px; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .sidebar__continue { position: relative; margin-top: auto; padding: 18px 16px 16px 19px; overflow: hidden; border: 1px solid #ccd5d0; border-radius: 14px; background: #f4f7f4; }
 .sidebar__continue::before { position: absolute; inset: 0 auto 0 0; width: 3px; content: ""; background: var(--jade); }
 .sidebar__continue strong { display: block; margin-top: 8px; color: var(--ink); font-family: "Songti SC", STSong, serif; font-size: 18px; }

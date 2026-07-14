@@ -220,6 +220,7 @@ function compactStory(
     clues: [],
     preferences: [],
     conversation: [],
+    proposals: [],
     retcons: [],
     modelConnectionId: null,
   };
@@ -291,6 +292,7 @@ export function createSeedStore(): AppStore {
         role: "主角 · 前执法官",
         initials: "林",
         status: "确认死亡",
+        lifecycle: "dead",
         location: "第七码头潮门",
         goal: "查明母亲失踪与王室旧案的关系",
         knowledge: ["潮门换气图", "王室旧徽章", "禁区入口"],
@@ -304,6 +306,7 @@ export function createSeedStore(): AppStore {
         role: "调查记者",
         initials: "周",
         status: "存活 · 被通缉",
+        lifecycle: "alive",
         location: "旧执法局",
         goal: "公开王室对旧城灾难的掩盖",
         knowledge: ["林夏的王室血统", "潮门将在三日后失效"],
@@ -317,6 +320,7 @@ export function createSeedStore(): AppStore {
         role: "王室审判官",
         initials: "何",
         status: "存活",
+        lifecycle: "alive",
         location: "上层穹顶",
         goal: "维持城市秩序，阻止旧案公开",
         knowledge: ["旧城真实死亡人数", "林夏母亲的去向"],
@@ -402,6 +406,7 @@ export function createSeedStore(): AppStore {
         observedCanonVersion: 24,
       },
     ],
+    proposals: [],
     retcons: [],
     modelConnectionId: null,
   };
@@ -484,10 +489,12 @@ export function createSeedStore(): AppStore {
         updatedAt: "2026-07-14T08:00:00+08:00",
       },
     ],
-    jobs: [
-      {
-        id: "job_2401",
-        storyTitle: "黑潮之下",
+      jobs: [
+        {
+          id: "job_2401",
+          ownerId: demoOwnerId,
+          storyId: blackTide.id,
+          storyTitle: "黑潮之下",
         chapterNumber: 18,
         task: "chapter",
         model: "novel-writer-v2",
@@ -499,9 +506,11 @@ export function createSeedStore(): AppStore {
         cost: 0.42,
         createdAt: "2026-07-14T09:36:00+08:00",
       },
-      {
-        id: "job_2398",
-        storyTitle: "雾港书简",
+        {
+          id: "job_2398",
+          ownerId: demoOwnerId,
+          storyId: fogLetters.id,
+          storyTitle: "雾港书简",
         chapterNumber: 6,
         task: "chapter",
         model: "novel-writer-v2",
@@ -513,9 +522,11 @@ export function createSeedStore(): AppStore {
         cost: 0.35,
         createdAt: "2026-07-13T22:18:00+08:00",
       },
-      {
-        id: "job_2389",
-        storyTitle: "纸月病房",
+        {
+          id: "job_2389",
+          ownerId: demoOwnerId,
+          storyId: paperMoon.id,
+          storyTitle: "纸月病房",
         chapterNumber: 4,
         task: "extract",
         model: "json-fast",

@@ -104,6 +104,7 @@ export function ReaderPage() {
   const [streamedParagraphs, setStreamedParagraphs] = useState<string[]>([]);
   const [generationFailure, setGenerationFailure] = useState<string | null>(null);
   const [selection, setSelection] = useState("");
+  const [feedbackContext, setFeedbackContext] = useState("");
   const progressTimer = useRef<number | null>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
   const restorePosition = useRef(true);
@@ -189,6 +190,7 @@ export function ReaderPage() {
     try {
       const result = await api.generateChapter(story, (update) => {
         if (update.event === "stage" && typeof update.stage === "number") setGenerationStage(update.stage);
+        if (update.event === "reset_draft") { setStreamedTitle(""); setStreamedParagraphs([]); }
         if (update.event === "paragraph" && update.paragraph) {
           if (update.title) setStreamedTitle(update.title);
           setStreamedParagraphs((paragraphs) => [...paragraphs, update.paragraph!]);
@@ -211,11 +213,19 @@ export function ReaderPage() {
 
   const sendMessage = async (event: FormEvent) => {
     event.preventDefault();
-    if (!story || !draft.trim() || sending) return;
+    if (!story || !chapter || !revision || !draft.trim() || sending) return;
     const text = draft.trim(); setDraft(""); setSending(true);
     try {
-      const result = await api.sendMessage(story, text);
+      const result = await api.sendMessage(story, text, {
+        chapterId: chapter.id,
+        revisionId: revision.id,
+        selection: feedbackContext || undefined,
+        eventId: story.events
+          .filter((event) => event.active && event.chapterNumber === chapter.number)
+          .at(-1)?.id,
+      });
       setStory(result.story);
+      setFeedbackContext("");
       await refresh();
       if (/不希望.*死|不要.*死|别让.*死/.test(text)) toast("正史修订完成：没有追问写法，也没有覆盖旧版本。" );
     } catch (requestError) {
@@ -231,6 +241,7 @@ export function ReaderPage() {
   };
 
   const openSelectionFeedback = () => {
+    setFeedbackContext(selection);
     setDraft(`关于“${selection}${selection.length >= 90 ? "…" : ""}”：`);
     setPanel("chat"); setSelection("");
   };
@@ -341,7 +352,7 @@ export function ReaderPage() {
           {story.conversation.map((message) => <ConversationCard key={message.id} message={message} story={story} />)}
           <div ref={chatEnd} />
         </div>
-        <div className="quick-prompts"><button type="button" onClick={() => setDraft(`不，我不希望${story.characters[0]?.name ?? "她"}死。`)}>不希望主角死</button><button type="button" onClick={() => setDraft("这段关系发展太快了。")}>关系太快</button><button type="button" onClick={() => setDraft(`${story.characters[0]?.name ?? "主角"}为什么会这样选择？`)}>问一个事实</button></div>
+        <div className="quick-prompts"><button type="button" onClick={() => { setFeedbackContext(""); setDraft(`不，我不希望${story.characters[0]?.name ?? "她"}死。`); }}>不希望主角死</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft("这段关系发展太快了。"); }}>关系太快</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft("不要把这个反派洗白。"); }}>不要洗白反派</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft(`${story.characters[0]?.name ?? "主角"}为什么会这样选择？`); }}>问一个事实</button></div>
         <form className="chat-composer" onSubmit={(event) => void sendMessage(event)}>
           <textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={2} maxLength={500} placeholder="对故事说一句……" />
           <button type="submit" aria-label="发送" disabled={sending || !draft.trim()}>{sending ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}</button>
