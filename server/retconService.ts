@@ -11,9 +11,38 @@ import type {
   Story,
   StoryEvent,
 } from "../src/types";
+import { captureCanonState, replayBranchState, restoreCanonState } from "./canonState";
+import { rebuildBranchSummaries } from "./storyService";
 
 function addMessage(story: Story, message: ConversationMessage) {
+  let thread = story.conversationThreads.find((item) => item.branchId === story.activeBranchId);
+  if (!thread) {
+    thread = { id: `thread_${randomUUID().slice(0, 8)}`, branchId: story.activeBranchId, summary: null, summaries: [], parentThreadId: null };
+    story.conversationThreads.push(thread);
+  }
+  message.branchId = story.activeBranchId;
+  message.threadId = thread.id;
   story.conversation.push(message);
+  const branchMessages = story.conversation.filter((item) => item.branchId === story.activeBranchId);
+  const summarized = branchMessages.slice(0, -4).slice(-12);
+  if (summarized.length) {
+    const previousSummary = thread.summary;
+    const nextSummary = {
+      id: `summary_${randomUUID().slice(0, 8)}`,
+      branchId: story.activeBranchId,
+      content: summarized.map((item) => `${item.role === "user" ? "读者" : "系统"}：${item.content}`).join("；").slice(-900),
+      sourceMessageIds: summarized.map((item) => item.id),
+      fromMessageId: summarized[0].id,
+      toMessageId: summarized.at(-1)!.id,
+      updatedAt: message.createdAt,
+      version: (previousSummary?.version ?? 0) + 1,
+      parentSummaryId: previousSummary?.id ?? null,
+      sourceThreadId: thread.id,
+    };
+    thread.summaries.push(nextSummary);
+    thread.summaries = thread.summaries.slice(-20);
+    thread.summary = nextSummary;
+  }
   story.updatedAt = message.createdAt;
 }
 
@@ -23,12 +52,12 @@ function activeDeathEvent(
   context?: ReaderMessageContext,
 ): StoryEvent | undefined {
   if (context?.eventId) {
-    const anchored = story.events.find((event) => event.id === context.eventId && event.active);
+    const anchored = story.events.find((event) => event.id === context.eventId && event.active && event.branchId === story.activeBranchId);
     if (anchored?.type === "death") return anchored;
   }
   const named = story.characters.find((character) => text.includes(character.name));
   const deaths = story.events
-    .filter((event) => event.active && event.type === "death")
+    .filter((event) => event.active && event.branchId === story.activeBranchId && event.type === "death")
     .filter((event) => !named || event.participantIds.includes(named.id))
     .sort((a, b) => b.chapterNumber - a.chapterNumber);
   if (deaths[0]) return deaths[0];
@@ -52,8 +81,11 @@ function activeDeathEvent(
       outcome: `${character.name}死亡并离开活动人物状态`,
       participantIds: [character.id],
       location: character.location,
-      dependsOn: story.events.filter((item) => item.active && item.chapterNumber < chapter.number).slice(-1).map((item) => item.id),
+      dependsOn: story.events.filter((item) => item.active && item.branchId === story.activeBranchId && item.chapterNumber < chapter.number).slice(-1).map((item) => item.id),
       active: true,
+      sequence: Math.max(0, ...story.events.map((item) => item.sequence)) + 1,
+      storyTime: `第${chapter.number}章·死亡结果`,
+      branchId: story.activeBranchId,
     };
     story.events.push(event);
     return event;
@@ -76,14 +108,207 @@ function createRevisionId(story: Story, chapterNumber: number, count: number) {
   return `rev_${story.id}_${chapterNumber}_${count + 1}_${randomUUID().slice(0, 5)}`;
 }
 
+function recordBranchRevision(story: Story, chapterId: string, revisionId: string) {
+  const branch = story.branches.find((item) => item.id === story.activeBranchId);
+  if (branch) branch.chapterRevisionIds[chapterId] = revisionId;
+}
+
 function rewriteDependentParagraphs(paragraphs: string[], name: string) {
   return paragraphs.map((paragraph) =>
     paragraph
       .replaceAll(`${name}的葬礼`, `${name}的秘密转移`)
       .replaceAll(`为${name}复仇`, `护送${name}离开`)
       .replaceAll(`${name}已经死去`, `${name}已被官方宣告死亡`)
-      .replaceAll(`${name}死后`, `${name}失去身份后`),
+      .replaceAll(`${name}死亡后`, `${name}被官方宣告死亡并秘密转移后`)
+      .replaceAll(`${name}的死亡`, `${name}的官方死亡记录`)
+      .replaceAll(`${name}死亡`, `${name}被官方宣告死亡并秘密转移`)
+      .replaceAll(`${name}死后`, `${name}失去身份后`)
+      .replaceAll("复仇对象", "追查对象"),
   );
+}
+
+function deathRepairStrategy(event: StoryEvent) {
+  const context = `${event.title} ${event.cause} ${event.outcome}`;
+  if (/溺水|缺氧|氧气|海水|窒息/.test(context)) {
+    return {
+      mechanism: "低温与残余气囊让生命体征短暂低于监测阈值",
+      setup: "曾有一次低温环境下生命体征被设备漏报的医疗记录",
+      supportPattern: /低温|气囊|漏报|生命体征.*异常/,
+      cost: "肺部留下不可逆损伤，此后无法再承受深潜或长时间缺氧",
+    };
+  }
+  if (/枪|刀|刺|弹|武器|失血/.test(context)) {
+    return {
+      mechanism: "防护夹层改变了创口路径，但没有消除失血与器官损伤",
+      setup: "角色此前更换过一件带旧式夹层的防护装备",
+      supportPattern: /防护|夹层|护甲|旧伤/,
+      cost: "永久失去原有行动能力，并因治疗记录暴露而注销身份",
+    };
+  }
+  if (/爆炸|火|坍塌|燃烧/.test(context)) {
+    return {
+      mechanism: "结构坍塌形成的狭窄空腔隔开了致命冲击，却造成严重灼伤",
+      setup: "现场图曾标出一处不符合施工记录的承重空腔",
+      supportPattern: /空腔|承重|施工图|隔热/,
+      cost: "身体留下永久伤残，原有身份也因救援记录被迫终止",
+    };
+  }
+  if (/坠|跌落|高处/.test(context)) {
+    return {
+      mechanism: "坠落途中被隐蔽检修架截住，公开视角只看见角色消失",
+      setup: "场景旧图记录过一层被封存的检修架",
+      supportPattern: /检修架|旧图|缓冲|安全绳/,
+      cost: "脊柱受伤并失去公开行动能力，必须长期隐匿接受治疗",
+    };
+  }
+  return {
+    mechanism: "现场判定依赖的单一监测信号存在可追溯误差",
+    setup: "此前检查记录过一次不会重复出现的监测误差",
+    supportPattern: /监测误差|误判|旧伤|医疗记录/,
+    cost: "角色虽然存活，却永久失去原有身份、位置与一部分信任",
+  };
+}
+
+function deathConclusionTargetsCharacter(sentence: string, characterName: string, allCharacterNames: string[]) {
+  const deathPattern = /死亡|死去|断气|曲线(?:已经)?归零|白布盖过|最后一点体温|确认死亡/g;
+  for (const match of sentence.matchAll(deathPattern)) {
+    const matchIndex = match.index;
+    const clauseStart = Math.max(
+      sentence.lastIndexOf("，", matchIndex),
+      sentence.lastIndexOf(",", matchIndex),
+      sentence.lastIndexOf("；", matchIndex),
+      sentence.lastIndexOf(";", matchIndex),
+      sentence.lastIndexOf("：", matchIndex),
+      sentence.lastIndexOf(":", matchIndex),
+    ) + 1;
+    const nextSeparators = ["，", ",", "；", ";", "：", ":", "。", "！", "？"]
+      .map((separator) => sentence.indexOf(separator, matchIndex + match[0].length))
+      .filter((index) => index >= 0);
+    const clauseEnd = nextSeparators.length ? Math.min(...nextSeparators) : sentence.length;
+    const clause = sentence.slice(clauseStart, clauseEnd);
+    const names = allCharacterNames
+      .flatMap((name) => {
+        const positions: number[] = [];
+        let from = 0;
+        while (from < clause.length) {
+          const index = clause.indexOf(name, from);
+          if (index < 0) break;
+          positions.push(index);
+          from = index + name.length;
+        }
+        return positions.map((index) => ({ name, index: clauseStart + index, end: clauseStart + index + name.length }));
+      });
+    let boundName: string | undefined;
+    if (match[0].startsWith("白布盖过")) {
+      const prefix = sentence.slice(clauseStart, matchIndex);
+      boundName = names.find((name) => {
+        const localName = name.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`把[^，,；;：:。！？!?]{0,12}${localName}(?:的)?(?:脸|面孔|身体)[^，,；;：:。！？!?]{0,12}$`).test(prefix) ||
+          new RegExp(`${localName}(?:的)?(?:脸|面孔|身体)[^，,；;：:。！？!?]{0,8}(?:被|让|由)?$`).test(prefix);
+      })?.name;
+      const followingNames = names
+        .filter((name) => name.index >= matchIndex + match[0].length)
+        .sort((left, right) => left.index - right.index);
+      boundName ??= followingNames.find((name) => name.name === characterName)?.name ?? followingNames[0]?.name;
+    } else if (/死亡|死去|断气|确认死亡/.test(match[0])) {
+      boundName = names
+        .filter((name) => name.end <= matchIndex)
+        .sort((left, right) => right.end - left.end)[0]?.name;
+      if (!boundName) {
+        boundName = names
+          .filter((name) => name.index >= matchIndex + match[0].length)
+          .sort((left, right) => left.index - right.index)[0]?.name;
+      }
+    } else {
+      boundName = names.find((name) => {
+        const between = sentence.slice(name.end, matchIndex);
+        return name.end <= matchIndex && /^(?:的|其)?[^，,；;：:。！？!?]{0,8}$/.test(between);
+      })?.name;
+    }
+    if ((boundName ?? characterName) === characterName) return true;
+  }
+  return false;
+}
+
+function repairDeathChapter(
+  paragraphs: string[],
+  character: CharacterProfile,
+  strategy: ReturnType<typeof deathRepairStrategy>,
+  allCharacterNames: string[],
+) {
+  let repairedDeathSentence = false;
+  const repaired = paragraphs.map((paragraph) => {
+    const sentences = paragraph.match(/[^。！？!?]+[。！？!?]?/g) ?? [paragraph];
+    const next = sentences.map((sentence) => {
+      const containsDeathConclusion = /死亡|死去|断气|曲线已经归零|曲线归零|白布盖过|最后一点体温/.test(sentence);
+      const referencesTarget = deathConclusionTargetsCharacter(sentence, character.name, allCharacterNames);
+      const onlyReferencesAnotherCharacter = !referencesTarget;
+      if (!containsDeathConclusion || onlyReferencesAnotherCharacter) return sentence;
+      const whiteCover = sentence.match(/白布盖过([^，,；;。！？!?]{1,48}?)(?:的)?(?:脸|面孔)/);
+      if (whiteCover) {
+        const coveredNames = allCharacterNames.filter((name) => whiteCover[1].includes(name));
+        const otherCoveredNames = coveredNames.filter((name) => name !== character.name);
+        if (coveredNames.includes(character.name) && otherCoveredNames.length > 0) {
+          let preservedObjects = whiteCover[1]
+            .replace(character.name, "")
+            .replace(/^[与和及、跟同]+|[与和及、跟同]+$/g, "")
+            .trim();
+          if (!preservedObjects) preservedObjects = otherCoveredNames.join("与");
+          const targetRepair = repairedDeathSentence
+            ? `${character.name}的体温与读数仍低到仪器无法辨认，同伴只能在封锁完成前将她转移。`
+            : `${character.name}的生命体征一度被现场判定为死亡；但${strategy.mechanism}。${strategy.cost}。`;
+          repairedDeathSentence = true;
+          const suffix = sentence.slice((whiteCover.index ?? 0) + whiteCover[0].length);
+          const positionedRepair = /^[，,]/.test(suffix) ? targetRepair.replace(/[。！？!?]$/, "") : targetRepair;
+          return sentence.replace(whiteCover[0], `白布盖过${preservedObjects}的脸；${positionedRepair}`);
+        }
+      }
+      if (!repairedDeathSentence) {
+        repairedDeathSentence = true;
+        return `${character.name}的生命体征一度被现场判定为死亡；但${strategy.mechanism}。${strategy.cost}。`;
+      }
+      return `${character.name}的体温与读数仍低到仪器无法辨认，同伴只能在封锁完成前将她转移。`;
+    }).join("");
+    return rewriteDependentParagraphs([next], character.name)[0];
+  });
+  if (!repairedDeathSentence) {
+    const index = Math.max(0, repaired.length - 1);
+    repaired[index] = `${repaired[index]} ${character.name}一度被判定死亡；但${strategy.mechanism}。${strategy.cost}。`;
+  }
+  return repaired;
+}
+
+function assertRetconRevisionComplies(
+  story: Story,
+  before: string[],
+  after: string[],
+  character: CharacterProfile,
+  strategy: ReturnType<typeof deathRepairStrategy>,
+) {
+  if (before.length !== after.length) throw new Error("修史扩大了章节段落范围，已拒绝提交。");
+  const content = after.join("\n");
+  if (!content.includes(strategy.mechanism) || !content.includes(strategy.cost)) {
+    throw new Error("修史没有落实存活机制与不可逆代价，已拒绝提交。");
+  }
+  if (/原来只是梦|一切都是梦|死而复生|复活术/.test(content)) {
+    throw new Error("修史违反世界硬规则，已拒绝提交。");
+  }
+  const residualDeathConclusion = content
+    .split(/(?<=[，,；;：:。！？!?])/)
+    .some((clause) => {
+      if (!/曲线(?:已经)?归零|白布盖过|最后一点体温|已经死去|确认死亡/.test(clause)) return false;
+      return deathConclusionTargetsCharacter(clause, character.name, story.characters.map((item) => item.name));
+    });
+  if (residualDeathConclusion) {
+    throw new Error("修史仍保留目标角色的死亡结论，已拒绝提交。" );
+  }
+  for (const preference of story.preferences.filter((item) => item.active && item.kind === "hard")) {
+    if (/洗白|免责/.test(`${preference.label}${preference.description}`) && /无罪|获得原谅|无需负责/.test(content)) {
+      throw new Error(`修史违反读者硬约束“${preference.label}”，已拒绝提交。`);
+    }
+  }
+  const preserved = before.filter((paragraph, index) => paragraph === after[index]).length;
+  if (before.length > 1 && preserved === 0) throw new Error(`修史没有保留${character.name}死亡之外的独立场景，已拒绝提交。`);
 }
 
 function applyDeathVeto(
@@ -93,8 +318,8 @@ function applyDeathVeto(
   proposal: InterventionProposal,
   context?: ReaderMessageContext,
 ): ConversationMessage {
-  const deathEvent = activeDeathEvent(story, sourceText, context);
-  if (!deathEvent) {
+  const matchedDeathEvent = activeDeathEvent(story, sourceText, context);
+  if (!matchedDeathEvent) {
     proposal.status = "rejected";
     return {
       id: `msg_${randomUUID().slice(0, 8)}`,
@@ -105,6 +330,7 @@ function applyDeathVeto(
       observedCanonVersion: story.canonVersion,
     };
   }
+  let deathEvent: StoryEvent = matchedDeathEvent;
   const character = targetCharacter(story, deathEvent);
   const deathChapter = story.chapters.find((chapter) => chapter.number === deathEvent.chapterNumber);
   if (!character || !deathChapter) {
@@ -141,33 +367,87 @@ function applyDeathVeto(
 
   const createdAt = new Date().toISOString();
   const canonBefore = story.canonVersion;
+  const branchIdBefore = story.activeBranchId;
+  const trustedStateBefore = captureCanonState(story);
+  const sourceBranch = story.branches.find((branch) => branch.id === branchIdBefore);
+  const sourceBaseEventSequence = sourceBranch?.baseEventSequence ?? Number.MAX_SAFE_INTEGER;
+  const sourceBaseStateSnapshot = sourceBranch?.baseStateSnapshot;
+  if (!sourceBaseStateSnapshot || sourceBaseEventSequence >= deathEvent.sequence) {
+    throw new Error("当前故事缺少死亡事件前的可信状态快照，已拒绝提交可能污染人物状态的修史。");
+  }
+  if (sourceBranch) {
+    sourceBranch.stateSnapshot = structuredClone(trustedStateBefore);
+  }
+  const latestChapterNumber = story.chapters.at(-1)?.number ?? deathChapter.number;
+  if (latestChapterNumber > deathChapter.number) {
+    const previousBranch = story.branches.find((branch) => branch.id === story.activeBranchId);
+    if (previousBranch) previousBranch.status = "superseded";
+    const branchId = `branch_${story.id}_retcon_${randomUUID().slice(0, 6)}`;
+    story.branches.push({
+      id: branchId,
+      name: `从第 ${deathChapter.number} 章改写`,
+      basedOnBranchId: story.activeBranchId,
+      baseCanonVersion: canonBefore,
+      headCanonVersion: canonBefore,
+      createdAt,
+      status: "active",
+      chapterRevisionIds: structuredClone(previousBranch?.chapterRevisionIds ?? Object.fromEntries(story.chapters.map((chapter) => [chapter.id, chapter.currentRevisionId]))),
+      baseStateSnapshot: structuredClone(sourceBaseStateSnapshot),
+      stateSnapshot: structuredClone(trustedStateBefore),
+      baseEventSequence: sourceBaseEventSequence,
+    });
+    story.activeBranchId = branchId;
+    const parentThread = story.conversationThreads.find((item) => item.branchId === branchIdBefore);
+    const thread = { id: `thread_${randomUUID().slice(0, 8)}`, branchId, summary: null, summaries: [], parentThreadId: parentThread?.id ?? null };
+    story.conversationThreads.push(thread);
+    const sourceMessage = story.conversation.find((message) => message.id === proposal.sourceMessageId);
+    if (sourceMessage) {
+      sourceMessage.branchId = branchId;
+      sourceMessage.threadId = thread.id;
+    }
+    const inheritedEvents = story.events.filter((event) => event.active && event.branchId === branchIdBefore);
+    const eventIdMap = new Map(inheritedEvents.map((event) => [event.id, `event_${randomUUID().slice(0, 10)}`]));
+    const clonedEvents = inheritedEvents.map((event) => ({
+      ...structuredClone(event),
+      id: eventIdMap.get(event.id)!,
+      originEventId: event.originEventId ?? event.id,
+      branchId,
+      dependsOn: event.dependsOn.map((dependencyId) => eventIdMap.get(dependencyId) ?? dependencyId),
+    }));
+    story.events.push(...clonedEvents);
+    const clonedDeathId = eventIdMap.get(deathEvent.id);
+    deathEvent = clonedEvents.find((event) => event.id === clonedDeathId) ?? deathEvent;
+    proposal.targetEventId = deathEvent.id;
+  }
   const deathParent = currentRevision(deathChapter);
   if (!deathParent) throw new Error("死亡章节缺少可回溯 Revision。");
-  const setupChapter = [...story.chapters]
+  const strategy = deathRepairStrategy(deathEvent);
+  const supportExists = story.chapters
+    .filter((chapter) => chapter.number < deathChapter.number)
+    .some((chapter) => strategy.supportPattern.test(currentRevision(chapter)?.paragraphs.join("\n") ?? ""));
+  const setupChapter = supportExists ? undefined : [...story.chapters]
     .filter((chapter) => chapter.number < deathChapter.number)
     .sort((a, b) => Math.abs(a.number - Math.max(1, deathChapter.number - 6)) - Math.abs(b.number - Math.max(1, deathChapter.number - 6)))[0];
   const deathRevisionId = createRevisionId(story, deathChapter.number, deathChapter.revisions.length);
   const changes: RetconChange[] = [];
+  const eventSnapshots: NonNullable<RetconTransaction["eventSnapshots"]> = [];
 
+  const repairedDeathParagraphs = repairDeathChapter(deathParent.paragraphs, character, strategy, story.characters.map((item) => item.name));
+  assertRetconRevisionComplies(story, deathParent.paragraphs, repairedDeathParagraphs, character, strategy);
   deathChapter.revisions.push({
     id: deathRevisionId,
     parentRevisionId: deathParent.id,
     title: deathParent.title,
-    paragraphs: [
-      deathParent.paragraphs[0] ?? `${character.name}倒在冲突发生的地点，所有人都以为结局已经确定。`,
-      `监测结果归零时，在场者把${character.name}判定为死亡；但一处来自前文的身体异常让这个结论留下了极窄的误差。`,
-      `${character.name}没有毫发无损地回来。那次异常只延缓了致命结果，也让继续使用原有身份成为不可能。`,
-      `为了活着离开，${character.name}必须接受被官方宣告死亡。最亲近的同伴选择配合这个谎言，并承担从此无法公开相认的代价。`,
-      `${character.name}仍然活着，却永久失去原来的身份、位置与一部分信任。这份损失替代了死亡原本承担的叙事代价。`,
-      `事件结束后，众人没有走向复仇，而是开始处理“一个被世界认定已经死去的人该如何继续行动”这个更危险的问题。`,
-    ],
+    paragraphs: repairedDeathParagraphs,
     reason: `读者否决${character.name}在第 ${deathChapter.number} 章的死亡；以身份、位置与关系损失替代死亡代价`,
     createdAt,
     modelName: "retcon-reasoner",
     promptVersion: "retcon-v5",
     changeSummary: `${character.name}存活，但被官方宣告死亡并永久失去原有身份。`,
+    branchId: story.activeBranchId,
   });
   deathChapter.currentRevisionId = deathRevisionId;
+  recordBranchRevision(story, deathChapter.id, deathRevisionId);
   deathChapter.hasUnreadRevision = true;
   changes.push({
     chapterNumber: deathChapter.number,
@@ -188,36 +468,80 @@ function applyDeathVeto(
         title: setupParent.title,
         paragraphs: [
           ...setupParent.paragraphs,
-          `${character.name}曾被提醒：一次未记录在案的旧伤会在极端状态下造成近似死亡的低耗反应，但这种侥幸不会出现第二次。`,
+          `${character.name}的旧记录曾提到：${strategy.setup}；这种条件只在本次事件成立，不会成为可重复使用的免死规则。`,
         ],
         reason: `为第 ${deathChapter.number} 章存活补入最小前置依据`,
         createdAt,
         modelName: "retcon-reasoner",
         promptVersion: "retcon-v5",
-        changeSummary: "补入可被误判死亡的前置依据，并明确不可重复使用。",
+        changeSummary: `补入“${strategy.setup}”的前置依据，并明确不可重复使用。`,
+        branchId: story.activeBranchId,
       });
       setupChapter.currentRevisionId = setupRevisionId;
+      recordBranchRevision(story, setupChapter.id, setupRevisionId);
       setupChapter.hasUnreadRevision = true;
       changes.push({
         chapterNumber: setupChapter.number,
         chapterTitle: setupChapter.title,
         kind: "supporting",
-        summary: "补入一次性低耗反应的前置依据。",
+        summary: `补入一次性前置依据：${strategy.setup}。`,
         revisionId: setupRevisionId,
         previousRevisionId: setupParent.id,
       });
     }
   }
 
-  const dependentEvents = story.events
-    .filter((event) => event.active && event.dependsOn.includes(deathEvent.id))
-    .sort((a, b) => a.chapterNumber - b.chapterNumber);
-  for (const dependent of dependentEvents.slice(0, 3)) {
+  const impactedIds = new Set([deathEvent.id]);
+  const dependentEvents: StoryEvent[] = [];
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const event of story.events.filter((item) => item.active && item.branchId === story.activeBranchId)) {
+      if (impactedIds.has(event.id) || !event.dependsOn.some((dependencyId) => impactedIds.has(dependencyId))) continue;
+      impactedIds.add(event.id);
+      dependentEvents.push(event);
+      expanded = true;
+    }
+  }
+  dependentEvents.sort((a, b) => a.sequence - b.sequence);
+  for (const dependent of dependentEvents) {
     const chapter = story.chapters.find((item) => item.number === dependent.chapterNumber);
     const parent = chapter ? currentRevision(chapter) : null;
     if (!chapter || !parent) continue;
+    const eventBefore = {
+      active: dependent.active,
+      title: dependent.title,
+      cause: dependent.cause,
+      outcome: dependent.outcome,
+      revisionId: dependent.revisionId,
+      stateEffects: structuredClone(dependent.stateEffects),
+    };
+    dependent.stateEffects = undefined;
+    dependent.title = rewriteDependentParagraphs([dependent.title], character.name)[0];
+    dependent.cause = rewriteDependentParagraphs([dependent.cause], character.name)[0];
+    dependent.outcome = rewriteDependentParagraphs([dependent.outcome], character.name)[0];
     const paragraphs = rewriteDependentParagraphs(parent.paragraphs, character.name);
-    if (paragraphs.every((paragraph, index) => paragraph === parent.paragraphs[index])) continue;
+    if (paragraphs.every((paragraph, index) => paragraph === parent.paragraphs[index])) {
+      eventSnapshots.push({
+        eventId: dependent.id,
+        before: eventBefore,
+        after: {
+          active: dependent.active,
+          title: dependent.title,
+          cause: dependent.cause,
+          outcome: dependent.outcome,
+          revisionId: dependent.revisionId,
+          stateEffects: dependent.stateEffects,
+        },
+      });
+      changes.push({
+        chapterNumber: chapter.number,
+        chapterTitle: chapter.title,
+        kind: "supporting",
+        summary: `依赖闭包命中事件 ${dependent.id}；旧后果状态已失效，正文无需改写。`,
+      });
+      continue;
+    }
     const revisionId = createRevisionId(story, chapter.number, chapter.revisions.length);
     chapter.revisions.push({
       ...parent,
@@ -229,10 +553,24 @@ function applyDeathVeto(
       modelName: "retcon-reasoner",
       promptVersion: "retcon-v5",
       changeSummary: "保留独立场景，只替换依赖死亡的动机与表达。",
+      branchId: story.activeBranchId,
     });
     chapter.currentRevisionId = revisionId;
+    recordBranchRevision(story, chapter.id, revisionId);
     chapter.hasUnreadRevision = true;
-    dependent.outcome = rewriteDependentParagraphs([dependent.outcome], character.name)[0];
+    dependent.revisionId = revisionId;
+    eventSnapshots.push({
+      eventId: dependent.id,
+      before: eventBefore,
+      after: {
+        active: dependent.active,
+        title: dependent.title,
+        cause: dependent.cause,
+        outcome: dependent.outcome,
+        revisionId: dependent.revisionId,
+        stateEffects: dependent.stateEffects,
+      },
+    });
     changes.push({
       chapterNumber: chapter.number,
       chapterTitle: chapter.title,
@@ -250,16 +588,48 @@ function applyDeathVeto(
       summary: `保留${character.name}支线，把复仇或悼念功能替换为护送、隐匿与身份代价。`,
     });
   }
+  const changedChapterNumbers = new Set(changes.filter((change) => change.revisionId).map((change) => change.chapterNumber));
+  const unaffected = story.chapters.find((chapter) => chapter.number !== deathChapter.number && !changedChapterNumbers.has(chapter.number));
+  if (unaffected) {
+    changes.push({
+      chapterNumber: unaffected.number,
+      chapterTitle: unaffected.title,
+      kind: "unchanged",
+      summary: "依赖图未连接到本次死亡事件，正文与状态均保持不变。",
+    });
+  }
 
-  const before = { status: character.status, lifecycle: character.lifecycle, location: character.location, role: character.role };
+  const before = { status: character.status, lifecycle: character.lifecycle, location: character.location, role: character.role, relationship: character.relationship };
   const after = {
     status: "存活 · 官方死亡",
     lifecycle: "alive" as const,
     location: `${deathEvent.location}附近的隐匿地点`,
     role: character.role.includes("前") ? character.role : `${character.role} · 身份已注销`,
+    relationship: `${character.relationship}；公开关系因官方死亡而中断`,
   };
   Object.assign(character, after);
+  const deathEventBefore = {
+    active: deathEvent.active,
+    title: deathEvent.title,
+    cause: deathEvent.cause,
+    outcome: deathEvent.outcome,
+    revisionId: deathEvent.revisionId,
+    stateEffects: structuredClone(deathEvent.stateEffects),
+  };
   deathEvent.active = false;
+  deathEvent.revisionId = deathRevisionId;
+  eventSnapshots.push({
+    eventId: deathEvent.id,
+    before: deathEventBefore,
+    after: {
+      active: deathEvent.active,
+      title: deathEvent.title,
+      cause: deathEvent.cause,
+      outcome: deathEvent.outcome,
+      revisionId: deathEvent.revisionId,
+      stateEffects: structuredClone(deathEvent.stateEffects),
+    },
+  });
   const survivalEventId = `event_${randomUUID().slice(0, 10)}`;
   story.events.push({
     id: survivalEventId,
@@ -273,21 +643,48 @@ function applyDeathVeto(
     location: after.location,
     dependsOn: deathEvent.dependsOn,
     active: true,
+    sequence: deathEvent.sequence,
+    storyTime: deathEvent.storyTime,
+    branchId: story.activeBranchId,
+    stateEffects: {
+      characters: [{
+        characterId: character.id,
+        status: after.status,
+        lifecycle: after.lifecycle,
+        location: after.location,
+        relationship: after.relationship,
+        role: after.role,
+      }],
+    },
   });
+  for (const event of story.events.filter((item) => item.active && item.branchId === story.activeBranchId && item.id !== survivalEventId)) {
+    if (event.dependsOn.includes(deathEvent.id)) {
+      event.dependsOn = event.dependsOn.map((dependencyId) => dependencyId === deathEvent.id ? survivalEventId : dependencyId);
+    }
+  }
+
+  const replayBranch = story.branches.find((branch) => branch.id === story.activeBranchId);
+  if (!replayBranch?.baseStateSnapshot || deathEvent.sequence <= replayBranch.baseEventSequence) {
+    throw new Error("活动分支缺少死亡事件前的可信回放边界，已拒绝提交修史。");
+  }
+  replayBranchState(story, story.activeBranchId);
 
   story.canonVersion += 1;
+  const activeBranch = story.branches.find((branch) => branch.id === story.activeBranchId);
+  if (activeBranch) activeBranch.headCanonVersion = story.canonVersion;
   story.unreadCanonChanges += changes.filter((change) => Boolean(change.revisionId)).length;
   story.latestExcerpt = `${character.name}仍然活着，却永久失去原来的身份、位置与一部分信任。`;
   story.endingContract.version += 1;
   story.endingContract.status = "reframed";
   story.endingContract.lastEvaluatedAt = createdAt;
+  rebuildBranchSummaries(story);
   const retconId = `retcon_${randomUUID().slice(0, 8)}`;
   const retcon: RetconTransaction = {
     id: retconId,
     kind: "intervention",
     title: `撤销${character.name}在第 ${deathChapter.number} 章的死亡`,
     sourceText,
-    summary: `${character.name}因前文可追溯的一次性异常而被误判死亡；存活的代价是永久失去原有身份与公开关系。`,
+    summary: `${character.name}因“${strategy.mechanism}”被误判死亡；存活代价为“${strategy.cost}”。${supportExists ? "既有正史已提供前置依据，无需补写。" : "仅补入一个最近前置依据。"}`,
     createdAt,
     canonVersionBefore: canonBefore,
     canonVersionAfter: story.canonVersion,
@@ -296,6 +693,9 @@ function applyDeathVeto(
     status: "committed",
     targetEventId: deathEvent.id,
     characterSnapshots: [{ characterId: character.id, before, after }],
+    eventSnapshots,
+    branchIdBefore,
+    branchIdAfter: story.activeBranchId,
   };
   story.retcons.unshift(retcon);
   proposal.status = "committed";
@@ -314,11 +714,15 @@ function applyDeathVeto(
     connectionId: story.modelConnectionId ?? "conn_platform",
     promptVersion: "retcon-v5",
     status: "completed",
-    tokens: 3910,
-    latencyMs: 12840,
-    cost: 0.29,
+    tokens: 0,
+    usageEstimated: false,
+    latencyMs: 0,
+    cost: 0,
+    costEstimated: false,
     createdAt,
-    filterSummary: `事件锚定 ${deathEvent.id}；影响分析命中 ${changes.length} 个节点。`,
+    filterSummary: `本地确定性修史；事件锚定 ${deathEvent.id}；影响分析命中 ${changes.length} 个节点。`,
+    retconId,
+    targetEventId: deathEvent.id,
   });
   return {
     id: `msg_${randomUUID().slice(0, 8)}`,
@@ -357,17 +761,65 @@ function applyLocalIntervention(
   const createdAt = new Date().toISOString();
   const canonBefore = story.canonVersion;
   const anchor =
-    (context?.eventId && story.events.find((event) => event.id === context.eventId && event.active)) ||
-    story.events.filter((event) => event.active && event.chapterNumber === chapter.number).at(-1);
+    (context?.eventId && story.events.find((event) => event.id === context.eventId && event.active && event.branchId === story.activeBranchId)) ||
+    story.events.filter((event) => event.active && event.branchId === story.activeBranchId && event.chapterNumber === chapter.number).at(-1);
   let paragraphs = [...parent.paragraphs];
   let summary: string;
   let preferenceLabel: string;
   let preferenceKind: "hard" | "soft";
+  const relationshipAnchor = mode === "relationship"
+    ? (anchor?.type === "relationship"
+        ? anchor
+        : story.events.filter((event) => event.active && event.branchId === story.activeBranchId && event.type === "relationship" && event.chapterNumber <= chapter.number).at(-1))
+    : undefined;
+  const relationshipCharacters = relationshipAnchor
+    ? relationshipAnchor.participantIds
+        .map((id) => story.characters.find((character) => character.id === id))
+        .filter((character): character is CharacterProfile => Boolean(character))
+    : [];
+  const characterSnapshots: NonNullable<RetconTransaction["characterSnapshots"]> = [];
+  const snapshotAnchor = mode === "relationship" ? relationshipAnchor : anchor;
+  const eventSnapshotBefore = snapshotAnchor ? {
+    active: snapshotAnchor.active,
+    title: snapshotAnchor.title,
+    cause: snapshotAnchor.cause,
+    outcome: snapshotAnchor.outcome,
+    revisionId: snapshotAnchor.revisionId,
+    stateEffects: structuredClone(snapshotAnchor.stateEffects),
+  } : undefined;
   if (mode === "relationship") {
+    if (!relationshipAnchor || relationshipCharacters.length < 2) {
+      proposal.status = "rejected";
+      return {
+        id: `msg_${randomUUID().slice(0, 8)}`,
+        role: "system",
+        type: "answer",
+        content: "当前分支没有可验证的关系事件与双方参与者，因此没有改动正文或人物状态。",
+        createdAt,
+        observedCanonVersion: story.canonVersion,
+      };
+    }
     paragraphs.push("他们没有在这一刻确认关系。共同经历只带来更多需要验证的信任，任何亲近都必须经过后续选择与代价，而不是被一次危机直接兑换。");
     summary = "放慢当前关系确认，把亲近改为仍需验证的信任。";
     preferenceLabel = "关系推进需要选择与代价";
     preferenceKind = "soft";
+    for (const character of relationshipCharacters) {
+      const before = { status: character.status, lifecycle: character.lifecycle, location: character.location, role: character.role, relationship: character.relationship };
+      character.relationship = "关系退回待验证的同盟；亲近需要后续选择与代价";
+      characterSnapshots.push({
+        characterId: character.id,
+        before,
+        after: { status: character.status, lifecycle: character.lifecycle, location: character.location, role: character.role, relationship: character.relationship },
+      });
+    }
+    if (relationshipAnchor) {
+      relationshipAnchor.stateEffects ??= {};
+      const existing = relationshipAnchor.stateEffects.characters ?? [];
+      relationshipAnchor.stateEffects.characters = [
+        ...existing.filter((effect) => !relationshipCharacters.some((character) => character.id === effect.characterId)),
+        ...relationshipCharacters.map((character) => ({ characterId: character.id, relationship: character.relationship })),
+      ];
+    }
   } else if (mode === "accountability") {
     paragraphs.push("理解他的动机没有抵消已经造成的伤害。人物可以复杂，也必须继续承担责任；这一章不把解释写成原谅。");
     summary = "保留反派动机的复杂性，但撤销把解释等同于免责的表达。";
@@ -419,8 +871,10 @@ function applyLocalIntervention(
     modelName: "intervention-rewriter",
     promptVersion: "intervention-v2",
     changeSummary: summary,
+    branchId: story.activeBranchId,
   });
   chapter.currentRevisionId = revisionId;
+  recordBranchRevision(story, chapter.id, revisionId);
   chapter.hasUnreadRevision = true;
   const preference = {
     id: `pref_${randomUUID().slice(0, 8)}`,
@@ -451,21 +905,40 @@ function applyLocalIntervention(
     }],
     cost: "L1 · 1 个章节 Revision",
     status: "committed",
-    targetEventId: anchor?.id,
+    targetEventId: (mode === "relationship" ? relationshipAnchor : anchor)?.id,
     preferenceIds: [preference.id],
+    characterSnapshots: characterSnapshots.length ? characterSnapshots : undefined,
+    eventSnapshots: snapshotAnchor && eventSnapshotBefore ? [{
+      eventId: snapshotAnchor.id,
+      before: eventSnapshotBefore,
+      after: {
+        active: snapshotAnchor.active,
+        title: snapshotAnchor.title,
+        cause: snapshotAnchor.cause,
+        outcome: snapshotAnchor.outcome,
+        revisionId,
+        stateEffects: structuredClone(snapshotAnchor.stateEffects),
+      },
+    }] : undefined,
+    branchIdBefore: story.activeBranchId,
+    branchIdAfter: story.activeBranchId,
   };
   story.retcons.unshift(retcon);
   story.canonVersion += 1;
+  const activeBranch = story.branches.find((branch) => branch.id === story.activeBranchId);
+  if (activeBranch) activeBranch.headCanonVersion = story.canonVersion;
   story.unreadCanonChanges += 1;
   story.updatedAt = createdAt;
   story.endingContract.version += 1;
   story.endingContract.status = "needs_review";
   story.endingContract.lastEvaluatedAt = createdAt;
-  if (anchor) anchor.revisionId = revisionId;
+  const revisionAnchor = mode === "relationship" ? relationshipAnchor : anchor;
+  if (revisionAnchor) revisionAnchor.revisionId = revisionId;
+  rebuildBranchSummaries(story);
   story.conversation.forEach((message) => {
     if (message.observedCanonVersion < story.canonVersion) message.oldCanon = true;
   });
-  proposal.targetEventId = anchor?.id;
+  proposal.targetEventId = (mode === "relationship" ? relationshipAnchor : anchor)?.id;
   proposal.chapterId = chapter.id;
   proposal.revisionId = parent.id;
   proposal.status = "committed";
@@ -481,11 +954,15 @@ function applyLocalIntervention(
     connectionId: story.modelConnectionId ?? "conn_platform",
     promptVersion: "intervention-v2",
     status: "completed",
-    tokens: 960,
-    latencyMs: 420,
-    cost: 0.05,
+    tokens: 0,
+    usageEstimated: false,
+    latencyMs: 0,
+    cost: 0,
+    costEstimated: false,
     createdAt,
-    filterSummary: `介入分类=${proposal.classification}；事件锚点=${anchor?.id ?? "chapter-only"}；范围=current_chapter。`,
+    filterSummary: `本地确定性介入；分类=${proposal.classification}；事件锚点=${(mode === "relationship" ? relationshipAnchor : anchor)?.id ?? "chapter-only"}；范围=current_chapter。`,
+    retconId,
+    targetEventId: (mode === "relationship" ? relationshipAnchor : anchor)?.id,
   });
   return {
     id: `msg_${randomUUID().slice(0, 8)}`,
@@ -496,6 +973,34 @@ function applyLocalIntervention(
     observedCanonVersion: story.canonVersion,
     retconId,
   };
+}
+
+function answerCanonQuestion(story: Story, text: string) {
+  const named = story.characters.find((character) => text.includes(character.name));
+  if (named) {
+    if (/在哪|位置|哪里/.test(text)) {
+      const source = story.events.filter((event) => event.active && event.participantIds.includes(named.id)).at(-1);
+      return `按当前正史 v${story.canonVersion}，${named.name}位于“${named.location}”。来源：${source?.id ?? named.knowledgeSources.at(-1)?.sourceRevisionId ?? "人物状态账本"}。`;
+    }
+    if (/目标|想要|要做什么/.test(text)) {
+      return `按当前正史 v${story.canonVersion}，${named.name}的目标是“${named.goal}”。来源：人物状态账本及其最近事件。`;
+    }
+    if (/知道|得知|了解/.test(text)) {
+      const facts = named.knowledgeSources.slice(-4);
+      if (!facts.length) return `当前正史没有可追溯来源证明${named.name}知道相关事实，我不会把猜测当成答案。`;
+      return `${named.name}当前有来源的已知事实包括：${facts.map((fact) => `${fact.fact}[${fact.sourceRevisionId}]`).join("；")}。`;
+    }
+    if (/死|存活|状态/.test(text)) {
+      const source = story.events.filter((event) => event.participantIds.includes(named.id)).at(-1);
+      return `按当前正史 v${story.canonVersion}，${named.name}的状态是“${named.status}”。来源：${source?.id ?? "人物状态账本"}。`;
+    }
+  }
+  const terms = text.split(/[，。；：、\s？?]/).filter((term) => term.length >= 2 && !/为什么|怎么会|是谁|什么|是否/.test(term));
+  const event = [...story.events].reverse().find((item) => item.active && terms.some((term) => `${item.title}${item.cause}${item.outcome}`.includes(term)));
+  if (event) return `依据事件 ${event.id}（${event.storyTime}）：${event.title}。原因是${event.cause}，结果是${event.outcome}。这条回答不会改变正史。`;
+  const clue = story.clues.find((item) => terms.some((term) => `${item.title}${item.description}`.includes(term)));
+  if (clue) return `依据第 ${clue.sourceChapter} 章的伏笔“${clue.title}”：${clue.description}。当前状态为 ${clue.status}。`;
+  return "当前分支的事件、人物知识与原文来源不足以回答这个问题；我不会把猜测写成事实。";
 }
 
 export function handleReaderMessage(
@@ -583,14 +1088,11 @@ export function handleReaderMessage(
     };
   } else if (isQuestion) {
     proposal.status = "recorded";
-    const lead = story.characters[0];
     response = {
       id: `msg_${randomUUID().slice(0, 8)}`,
       role: "system",
       type: "answer",
-      content: lead
-        ? `按当前正史 v${story.canonVersion}，${lead.name}的核心目标是“${lead.goal}”。依据来自人物状态与事件图；这条回答不会改变故事。`
-        : "当前正史中还没有足够依据回答这个问题，我不会把猜测写成事实。",
+      content: answerCanonQuestion(story, text),
       createdAt: new Date().toISOString(),
       observedCanonVersion: story.canonVersion,
     };
@@ -624,6 +1126,18 @@ export function rollbackRetcon(story: Story, retconId: string) {
   const createdAt = new Date().toISOString();
   const canonBefore = story.canonVersion;
   const rollbackChanges: RetconChange[] = [];
+  const restoringBranchId = original.branchIdBefore && original.branchIdAfter && original.branchIdBefore !== original.branchIdAfter
+    ? original.branchIdBefore
+    : null;
+  const restoresDifferentBranch = restoringBranchId !== null;
+  if (restoringBranchId) {
+    const abandoned = story.branches.find((branch) => branch.id === original.branchIdAfter);
+    const restored = story.branches.find((branch) => branch.id === original.branchIdBefore);
+    if (abandoned) abandoned.status = "superseded";
+    if (restored) restored.status = "active";
+    story.activeBranchId = restoringBranchId;
+    if (restored?.stateSnapshot) restoreCanonState(story, restored.stateSnapshot);
+  }
 
   for (const change of original.changes) {
     if (!change.revisionId || !change.previousRevisionId) continue;
@@ -641,8 +1155,10 @@ export function rollbackRetcon(story: Story, retconId: string) {
       modelName: "canon-rollback",
       promptVersion: "rollback-v2",
       changeSummary: `恢复 ${previous.id} 的内容；历史 Revision 未删除。`,
+      branchId: story.activeBranchId,
     });
     chapter.currentRevisionId = revisionId;
+    recordBranchRevision(story, chapter.id, revisionId);
     chapter.hasUnreadRevision = true;
     rollbackChanges.push({
       chapterNumber: chapter.number,
@@ -658,25 +1174,43 @@ export function rollbackRetcon(story: Story, retconId: string) {
     const character = story.characters.find((item) => item.id === snapshot.characterId);
     if (character) Object.assign(character, snapshot.before);
   }
-  const target = original.targetEventId ? story.events.find((event) => event.id === original.targetEventId) : null;
+  for (const snapshot of original.eventSnapshots ?? []) {
+    const event = story.events.find((item) => item.id === snapshot.eventId);
+    if (!event || (restoresDifferentBranch && event.branchId !== story.activeBranchId)) continue;
+    Object.assign(event, snapshot.before);
+    const restored = rollbackChanges.find((change) => change.chapterNumber === event.chapterNumber);
+    if (restored?.revisionId) event.revisionId = restored.revisionId;
+  }
+  const target = original.targetEventId ? story.events.find((event) => event.id === original.targetEventId && (!restoresDifferentBranch || event.branchId === story.activeBranchId)) : null;
   if (target) {
     target.active = true;
     const restoredAnchor = rollbackChanges.find((change) => change.chapterNumber === target.chapterNumber);
     if (restoredAnchor?.revisionId) target.revisionId = restoredAnchor.revisionId;
   }
-  story.events
-    .filter((event) => event.type === "survival" && event.chapterNumber === target?.chapterNumber)
-    .forEach((event) => { event.active = false; });
+  const restoredSurvivalEvents = story.events.filter((event) => event.branchId === story.activeBranchId && event.type === "survival" && event.chapterNumber === target?.chapterNumber);
+  if (target) {
+    const survivalIds = new Set(restoredSurvivalEvents.map((event) => event.id));
+    for (const event of story.events.filter((item) => item.active && item.branchId === story.activeBranchId)) {
+      event.dependsOn = event.dependsOn.map((dependencyId) => survivalIds.has(dependencyId) ? target.id : dependencyId);
+    }
+  }
+  restoredSurvivalEvents.forEach((event) => { event.active = false; });
   for (const preferenceId of original.preferenceIds ?? []) {
     const preference = story.preferences.find((item) => item.id === preferenceId);
     if (preference) preference.active = false;
   }
 
   story.canonVersion += 1;
+  const activeBranch = story.branches.find((branch) => branch.id === story.activeBranchId);
+  if (activeBranch) {
+    activeBranch.headCanonVersion = story.canonVersion;
+    activeBranch.stateSnapshot = captureCanonState(story);
+  }
   story.unreadCanonChanges += rollbackChanges.length;
   story.endingContract.version += 1;
   story.endingContract.status = "needs_review";
   story.endingContract.lastEvaluatedAt = createdAt;
+  rebuildBranchSummaries(story);
   const rollbackId = `retcon_${randomUUID().slice(0, 8)}`;
   const rollback: RetconTransaction = {
     id: rollbackId,
@@ -692,6 +1226,8 @@ export function rollbackRetcon(story: Story, retconId: string) {
     status: "committed",
     reversesRetconId: original.id,
     targetEventId: original.targetEventId,
+    branchIdBefore: original.branchIdAfter ?? story.activeBranchId,
+    branchIdAfter: story.activeBranchId,
   };
   original.status = "reversed";
   original.reversedByRetconId = rollbackId;
@@ -702,7 +1238,7 @@ export function rollbackRetcon(story: Story, retconId: string) {
   story.conversation.forEach((message) => {
     if (message.observedCanonVersion < story.canonVersion) message.oldCanon = true;
   });
-  story.conversation.push({
+  addMessage(story, {
     id: `msg_${randomUUID().slice(0, 8)}`,
     role: "system",
     type: "progress",

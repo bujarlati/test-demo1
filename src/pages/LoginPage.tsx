@@ -5,8 +5,8 @@ import { useApp } from "../context/AppContext";
 
 export function LoginPage() {
   const { login } = useApp();
-  const [email, setEmail] = useState("admin@xumo.local");
-  const [password, setPassword] = useState("xumo2026");
+  const [email, setEmail] = useState(import.meta.env.DEV ? "admin@xumo.local" : "");
+  const [password, setPassword] = useState(import.meta.env.DEV ? "xumo2026" : "");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 

@@ -3,12 +3,17 @@ import type {
   AuthPayload,
   BootstrapPayload,
   CreateStoryInput,
+  ContentReport,
   GenerationJob,
   ModelConnection,
   ModelConnectionInput,
   OpsMetrics,
+  OpsQualityBucket,
   RetconTransaction,
   ReaderMessageContext,
+  ReaderPreference,
+  ReadingProgress,
+  SafetyDecision,
   Story,
 } from "./types";
 
@@ -66,6 +71,10 @@ export interface GenerationStreamUpdate {
 async function generateChapterStream(
   story: Story,
   onUpdate?: (update: GenerationStreamUpdate) => void,
+  options?: {
+    chapterLength?: "compact" | "standard" | "immersive";
+    idempotencyKey?: string;
+  },
 ) {
   const response = await fetch(`/api/stories/${story.id}/chapters/generate`, {
     method: "POST",
@@ -75,9 +84,10 @@ async function generateChapterStream(
       Authorization: `Bearer ${authStore.get() ?? ""}`,
     },
     body: JSON.stringify({
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: options?.idempotencyKey ?? crypto.randomUUID(),
       branchId: story.activeBranchId,
       baseCanonVersion: story.canonVersion,
+      chapterLength: options?.chapterLength ?? "standard",
     }),
   });
   if (!response.ok || !response.body) {
@@ -127,8 +137,8 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   bootstrap: () => request<BootstrapPayload>("/api/bootstrap"),
   story: (storyId: string) => request<Story>(`/api/stories/${storyId}`),
-  createStory: (input: CreateStoryInput) =>
-    request<Story>("/api/stories", { method: "POST", body: JSON.stringify(input) }),
+  createStory: (input: CreateStoryInput, idempotencyKey = crypto.randomUUID()) =>
+    request<Story>("/api/stories", { method: "POST", body: JSON.stringify({ ...input, idempotencyKey }) }),
   generateChapter: generateChapterStream,
   sendMessage: (story: Story, message: string, clientContext?: ReaderMessageContext) =>
     request<{ story: Story; duplicate: boolean }>(`/api/stories/${story.id}/messages`, {
@@ -141,10 +151,21 @@ export const api = {
         clientContext,
       }),
     }),
-  saveProgress: (storyId: string, chapterId: string, scrollProgress: number) =>
-    request<void>(`/api/stories/${storyId}/reading-progress`, {
+  saveProgress: (story: Story, chapterId: string, scrollProgress: number, progressVersion: number) =>
+    request<ReadingProgress>(`/api/stories/${story.id}/reading-progress`, {
       method: "PUT",
-      body: JSON.stringify({ chapterId, scrollProgress }),
+      body: JSON.stringify({
+        chapterId,
+        scrollProgress,
+        progressVersion,
+        activeBranchId: story.activeBranchId,
+        canonVersion: story.canonVersion,
+      }),
+    }),
+  setStoryStatus: (storyId: string, status: "active" | "paused" | "archived") =>
+    request<Story>(`/api/stories/${storyId}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
     }),
   toggleProtection: (storyId: string, characterId: string) =>
     request(`/api/stories/${storyId}/characters/${characterId}/protection`, {
@@ -161,6 +182,27 @@ export const api = {
     }),
   markCanonChangesRead: (storyId: string) =>
     request<void>(`/api/stories/${storyId}/canon-changes/read`, { method: "POST" }),
+  setPreferenceActive: (storyId: string, preferenceId: string, active: boolean) =>
+    request<ReaderPreference>(`/api/stories/${storyId}/preferences/${preferenceId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ active }),
+    }),
+  deletePreference: (storyId: string, preferenceId: string) =>
+    request<void>(`/api/stories/${storyId}/preferences/${preferenceId}`, { method: "DELETE" }),
+  reports: (storyId?: string) =>
+    request<ContentReport[]>(`/api/reports${storyId ? `?storyId=${encodeURIComponent(storyId)}` : ""}`),
+  reportChapter: (storyId: string, chapterId: string, reason: string) =>
+    request<ContentReport>(`/api/stories/${storyId}/reports`, {
+      method: "POST",
+      body: JSON.stringify({ chapterId, reason }),
+    }),
+  appealReport: (reportId: string) =>
+    request<ContentReport>(`/api/reports/${reportId}/appeal`, { method: "POST" }),
+  reviewReport: (reportId: string, status: "reviewing" | "resolved", resolutionNote?: string) =>
+    request<ContentReport>(`/api/reports/${reportId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status, resolutionNote }),
+    }),
   connections: () =>
     request<{ connections: ModelConnection[]; defaultConnectionId: string }>(
       "/api/model-connections",
@@ -170,11 +212,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  updateConnection: (connectionId: string, input: Partial<ModelConnectionInput>) =>
+    request<ModelConnection>(`/api/model-connections/${connectionId}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  deleteConnection: (connectionId: string) =>
+    request<void>(`/api/model-connections/${connectionId}`, { method: "DELETE" }),
   testConnection: (connectionId: string) =>
     request<ModelConnection>(`/api/model-connections/${connectionId}/test`, { method: "POST" }),
   setDefaultConnection: (connectionId: string) =>
     request<{ defaultConnectionId: string }>(`/api/model-connections/${connectionId}/default`, {
       method: "POST",
     }),
-  ops: () => request<{ metrics: OpsMetrics; jobs: GenerationJob[]; auditEvents: AuditEvent[] }>("/api/ops"),
+  ops: () => request<{
+    metrics: OpsMetrics;
+    qualityBreakdown: OpsQualityBucket[];
+    jobs: GenerationJob[];
+    auditEvents: AuditEvent[];
+    reports: ContentReport[];
+    safetyDecisions: SafetyDecision[];
+  }>("/api/ops"),
 };

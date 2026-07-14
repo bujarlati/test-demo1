@@ -3,17 +3,138 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AppStore } from "../src/types";
 import { createSeedStore } from "./seed";
+import { captureCanonState } from "./canonState";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const dataDirectory = path.join(currentDirectory, "data");
 const storePath = path.join(dataDirectory, "store.json");
 let saveQueue = Promise.resolve();
 
+function normalizeStore(store: AppStore): AppStore {
+  store.safetyDecisions ??= [];
+  store.contentReports ??= [];
+  store.idempotencyKeys ??= [];
+  store.storyCreationRequests ??= [];
+  store.jobs ??= [];
+  for (const story of store.stories ?? []) {
+    story.proposals ??= [];
+    story.items ??= [];
+    story.worldBible ??= {
+      version: 1,
+      organizations: [],
+      locations: [...new Set((story.characters ?? []).map((character) => character.location).filter(Boolean))],
+      abilityBoundaries: (story.rules ?? []).filter((rule) => rule.hardness === "hard").map((rule) => rule.description),
+      pointOfView: "近距离第三人称",
+      styleParameters: [story.tone],
+      sourceRevisionIds: story.chapters.slice(0, 3).map((chapter) => chapter.currentRevisionId),
+    };
+    story.summaries ??= [
+      ...story.chapters.map((chapter) => ({
+        id: `summary_${story.id}_chapter_${chapter.number}`,
+        branchId: story.activeBranchId,
+        layer: "chapter" as const,
+        text: `${chapter.title}：${chapter.revisions.find((revision) => revision.id === chapter.currentRevisionId)?.paragraphs.at(-1) ?? ""}`.slice(0, 420),
+        fromChapter: chapter.number,
+        toChapter: chapter.number,
+        sourceRevisionIds: [chapter.currentRevisionId],
+        updatedAt: story.updatedAt,
+      })),
+      { id: `summary_${story.id}_book`, branchId: story.activeBranchId, layer: "book" as const, text: story.summary, fromChapter: 1, toChapter: story.chapters.length, sourceRevisionIds: story.chapters.slice(-12).map((chapter) => chapter.currentRevisionId), updatedAt: story.updatedAt },
+    ];
+    for (const summary of story.summaries) summary.branchId ??= story.activeBranchId;
+    story.branches ??= [{
+      id: story.activeBranchId,
+      name: "迁移后的主线",
+      basedOnBranchId: null,
+      baseCanonVersion: 1,
+      headCanonVersion: story.canonVersion,
+      createdAt: story.updatedAt,
+      status: "active",
+      chapterRevisionIds: Object.fromEntries(story.chapters.map((chapter) => [chapter.id, chapter.currentRevisionId])),
+      baseEventSequence: story.events?.length ?? 0,
+    }];
+    for (const branch of story.branches) {
+      branch.chapterRevisionIds ??= Object.fromEntries(story.chapters.map((chapter) => [chapter.id, chapter.currentRevisionId]));
+      branch.baseEventSequence ??= Math.max(0, ...(story.events ?? []).filter((event) => event.branchId === branch.id).map((event) => event.sequence ?? 0));
+    }
+    story.readingProgress.progressVersion ??= 1;
+    story.readingProgress.activeBranchId ??= story.activeBranchId;
+    story.readingProgress.canonVersion ??= story.canonVersion;
+    story.conversationThreads ??= [{ id: `thread_${story.id}_main`, branchId: story.activeBranchId, summary: null, summaries: [], parentThreadId: null }];
+    if (story.conversationThreads.length === 0) story.conversationThreads.push({ id: `thread_${story.id}_main`, branchId: story.activeBranchId, summary: null, summaries: [], parentThreadId: null });
+    for (const thread of story.conversationThreads) {
+      thread.summaries ??= thread.summary ? [thread.summary] : [];
+      thread.parentThreadId ??= null;
+      for (const [index, summary] of thread.summaries.entries()) {
+        summary.version ??= index + 1;
+        summary.parentSummaryId ??= index > 0 ? thread.summaries[index - 1].id : null;
+        summary.sourceThreadId ??= thread.id;
+      }
+      if (thread.summary) {
+        thread.summary.version ??= thread.summaries.length || 1;
+        thread.summary.parentSummaryId ??= thread.summaries.length > 1 ? thread.summaries.at(-2)?.id ?? null : null;
+        thread.summary.sourceThreadId ??= thread.id;
+      }
+    }
+    const defaultThread = story.conversationThreads.find((thread) => thread.branchId === story.activeBranchId) ?? story.conversationThreads[0];
+    for (const message of story.conversation ?? []) {
+      message.branchId ??= story.activeBranchId;
+      message.threadId ??= defaultThread.id;
+    }
+    for (const character of story.characters ?? []) {
+      character.lifecycle ??= /死亡|死去/.test(character.status)
+        ? "dead"
+        : /失踪/.test(character.status)
+          ? "missing"
+          : "alive";
+      character.knowledgeSources ??= character.knowledge.map((fact) => ({
+        fact,
+        sourceChapter: 1,
+        sourceRevisionId: story.chapters[0]?.currentRevisionId ?? "migration_unknown",
+      }));
+      character.inventoryItemIds ??= [];
+    }
+    for (const [index, event] of (story.events ?? []).entries()) {
+      event.sequence ??= index + 1;
+      event.storyTime ??= `第${event.chapterNumber}章·场景1`;
+      event.branchId ??= story.activeBranchId;
+    }
+    for (const chapter of story.chapters ?? []) {
+      for (const revision of chapter.revisions ?? []) revision.branchId ??= story.activeBranchId;
+    }
+    const migratedState = captureCanonState(story);
+    for (const branch of story.branches) {
+      branch.stateSnapshot ??= structuredClone(migratedState);
+      branch.baseStateSnapshot ??= structuredClone(migratedState);
+    }
+    for (const retcon of story.retcons ?? []) {
+      for (const snapshot of retcon.characterSnapshots ?? []) {
+        const relationship = story.characters.find((character) => character.id === snapshot.characterId)?.relationship ?? "未记录";
+        snapshot.before.relationship ??= relationship;
+        snapshot.after.relationship ??= relationship;
+      }
+    }
+  }
+  for (const job of store.jobs) {
+    const story = store.stories.find((item) => item.id === job.storyId) ?? store.stories.find((item) => item.title === job.storyTitle);
+    job.storyId ??= story?.id ?? "story_unknown";
+    job.ownerId ??= story?.ownerId ?? "system";
+  }
+  for (const connection of store.connections ?? []) {
+    connection.secretVersion ??= connection.secretRef.startsWith("platform://") ? 0 : 1;
+    if (connection.capabilities) {
+      connection.capabilities.toolCalling ??= false;
+      connection.capabilities.maxContextTokens ??= null;
+    }
+  }
+  return store;
+}
+
 export async function loadStore(): Promise<AppStore> {
   await mkdir(dataDirectory, { recursive: true });
   try {
     const contents = await readFile(storePath, "utf8");
-    return JSON.parse(contents) as AppStore;
+    return normalizeStore(JSON.parse(contents) as AppStore);
   } catch (error) {
     const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
     if (!missing) {

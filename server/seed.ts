@@ -6,6 +6,7 @@ import type {
   CoverTheme,
   Story,
 } from "../src/types";
+import { captureCanonState } from "./canonState";
 
 const now = "2026-07-14T10:12:00+08:00";
 const demoOwnerId = "user_demo";
@@ -75,6 +76,25 @@ function chapter(
     revisions: [currentRevision],
     estimatedMinutes,
   };
+}
+
+function layeredSummaries(id: string, branchId: string, chapters: Chapter[], bookText: string) {
+  const chapterSummaries = chapters.map((item) => ({
+    id: `summary_${id}_chapter_${item.number}`,
+    branchId,
+    layer: "chapter" as const,
+    text: `${item.title}：${item.revisions[0]?.paragraphs.at(-1) ?? ""}`.slice(0, 420),
+    fromChapter: item.number,
+    toChapter: item.number,
+    sourceRevisionIds: [item.currentRevisionId],
+    updatedAt: now,
+  }));
+  return [
+    ...chapterSummaries,
+    { id: `summary_${id}_scene_latest`, branchId, layer: "scene" as const, text: chapterSummaries.at(-1)?.text ?? bookText, fromChapter: chapters.at(-1)?.number ?? 1, toChapter: chapters.at(-1)?.number ?? 1, sourceRevisionIds: chapters.at(-1) ? [chapters.at(-1)!.currentRevisionId] : [], updatedAt: now },
+    { id: `summary_${id}_arc`, branchId, layer: "arc" as const, text: chapterSummaries.slice(-5).map((item) => item.text).join(" ").slice(-900), fromChapter: Math.max(1, chapters.length - 4), toChapter: chapters.length, sourceRevisionIds: chapters.slice(-5).map((item) => item.currentRevisionId), updatedAt: now },
+    { id: `summary_${id}_book`, branchId, layer: "book" as const, text: bookText, fromChapter: 1, toChapter: chapters.length, sourceRevisionIds: chapters.slice(-12).map((item) => item.currentRevisionId), updatedAt: now },
+  ];
 }
 
 const blackTideTitles = [
@@ -167,6 +187,7 @@ function compactStory(
         excerpt,
       ],
     );
+    currentRevision.branchId = `branch_${id}_main`;
     return {
       id: `chapter_${id}_${number}`,
       number,
@@ -190,6 +211,7 @@ function compactStory(
     coverTheme,
     status,
     activeBranchId: `branch_${id}_main`,
+    branches: [{ id: `branch_${id}_main`, name: "主线", basedOnBranchId: null, baseCanonVersion: 1, headCanonVersion: chapterTitles.length, createdAt: now, status: "active", chapterRevisionIds: Object.fromEntries(chapters.map((item) => [item.id, item.currentRevisionId])), baseEventSequence: chapterTitles.length }],
     canonVersion: chapterTitles.length,
     summary: subtitle,
     latestExcerpt: excerpt,
@@ -199,8 +221,21 @@ function compactStory(
       chapterId: chapters.at(-1)?.id ?? "",
       scrollProgress: status === "paused" ? 0.18 : 0.76,
       updatedAt: now,
+      progressVersion: 1,
+      activeBranchId: `branch_${id}_main`,
+      canonVersion: chapterTitles.length,
     },
     ...storyMemory(title, genre),
+    worldBible: {
+      version: 1,
+      organizations: ["故事中的本地秩序机构"],
+      locations: ["故事当前场景"],
+      abilityBoundaries: ["异常必须留下可追溯代价"],
+      pointOfView: "近距离第三人称",
+      styleParameters: [tone],
+      sourceRevisionIds: chapters.slice(0, 1).map((item) => item.currentRevisionId),
+    },
+    summaries: layeredSummaries(id, `branch_${id}_main`, chapters, subtitle),
     events: chapters.map((item) => ({
       id: `event_${id}_${item.number}`,
       chapterNumber: item.number,
@@ -213,13 +248,18 @@ function compactStory(
       location: "故事当前场景",
       dependsOn: item.number === 1 ? [] : [`event_${id}_${item.number - 1}`],
       active: true,
+      sequence: item.number,
+      storyTime: `第${item.number}章·场景1`,
+      branchId: `branch_${id}_main`,
     })),
     chapters,
     characters: [],
+    items: [],
     rules: [],
     clues: [],
     preferences: [],
     conversation: [],
+    conversationThreads: [{ id: `thread_${id}_main`, branchId: `branch_${id}_main`, summary: null, summaries: [], parentThreadId: null }],
     proposals: [],
     retcons: [],
     modelConnectionId: null,
@@ -227,6 +267,12 @@ function compactStory(
 }
 
 export function createSeedStore(): AppStore {
+  const isProduction = process.env.NODE_ENV === "production";
+  const adminPassword = process.env.BOOTSTRAP_ADMIN_PASSWORD?.trim() || (isProduction ? "" : "xumo2026");
+  if (!adminPassword) {
+    throw new Error("生产环境首次启动必须设置 BOOTSTRAP_ADMIN_PASSWORD，拒绝创建带公开默认密码的管理员。");
+  }
+  const readerPassword = process.env.BOOTSTRAP_READER_PASSWORD?.trim() || (isProduction ? randomBytes(24).toString("base64url") : "read2026");
   const blackTide: Story = {
     id: "story_black_tide",
     ownerId: demoOwnerId,
@@ -240,6 +286,7 @@ export function createSeedStore(): AppStore {
     coverTheme: "tide",
     status: "active",
     activeBranchId: "branch_black_main",
+    branches: [{ id: "branch_black_main", name: "主线", basedOnBranchId: null, baseCanonVersion: 1, headCanonVersion: 24, createdAt: now, status: "active", chapterRevisionIds: Object.fromEntries(blackTideChapters.map((item) => [item.id, item.currentRevisionId])), baseEventSequence: 17 }],
     canonVersion: 24,
     summary:
       "海底城执法官林夏追查一宗被王室删除的旧案，却发现自己的身世与城市赖以生存的潮门相连。",
@@ -251,6 +298,9 @@ export function createSeedStore(): AppStore {
       chapterId: "chapter_black_18",
       scrollProgress: 0.42,
       updatedAt: "2026-07-14T09:42:00+08:00",
+      progressVersion: 1,
+      activeBranchId: "branch_black_main",
+      canonVersion: 24,
     },
     storyGene: {
       version: 3,
@@ -271,18 +321,31 @@ export function createSeedStore(): AppStore {
       status: "viable",
       lastEvaluatedAt: now,
     },
+    worldBible: {
+      version: 3,
+      organizations: ["海底城执法局", "王室审判庭"],
+      locations: ["海底城", "第七码头潮门", "上层穹顶", "禁区"],
+      abilityBoundaries: ["潮门开启必须由有效王室徽章承担能量代价", "不存在死者复生"],
+      pointOfView: "近距离第三人称",
+      styleParameters: ["冷冽", "克制", "不以旁白直接宣布善恶"],
+      sourceRevisionIds: ["rev_black_5_1", "rev_black_14_1", "rev_black_18_1"],
+    },
+    summaries: layeredSummaries("story_black_tide", "branch_black_main", blackTideChapters, "林夏追查王室旧案，身份与潮门生存代价逐步绑定。"),
     events: blackTideChapters.map((item) => ({
       id: item.number === 18 ? "event_black_lin_death" : `event_black_${item.number}`,
       chapterNumber: item.number,
       revisionId: item.currentRevisionId,
-      type: item.number === 18 ? "death" : item.number === 17 ? "choice" : "discovery",
-      title: item.number === 18 ? "林夏在潮门前死亡" : item.title,
+      type: item.number === 18 ? "death" : item.number === 17 ? "relationship" : "discovery",
+      title: item.number === 18 ? "林夏在潮门前死亡" : item.number === 17 ? "林夏与周砚在危机中仓促确认关系" : item.title,
       cause: item.number === 18 ? "毒素与潮门能量同时作用" : "旧案线索继续推进",
-      outcome: item.number === 18 ? "林夏被确认死亡，周砚转向复仇" : "获得新的可追溯事实",
-      participantIds: item.number === 18 ? ["char_lin_xia", "char_zhou_yan"] : ["char_lin_xia"],
+      outcome: item.number === 18 ? "林夏被确认死亡，周砚转向复仇" : item.number === 17 ? "两人在一次危机后直接确认亲密关系" : "获得新的可追溯事实",
+      participantIds: item.number >= 17 ? ["char_lin_xia", "char_zhou_yan"] : ["char_lin_xia"],
       location: item.number === 18 ? "第七码头潮门" : "海底城",
       dependsOn: item.number === 1 ? [] : [item.number === 18 ? "event_black_17" : `event_black_${item.number - 1}`],
       active: true,
+      sequence: item.number,
+      storyTime: `第${item.number}章·场景1`,
+      branchId: "branch_black_main",
     })),
     chapters: blackTideChapters,
     characters: [
@@ -296,6 +359,12 @@ export function createSeedStore(): AppStore {
         location: "第七码头潮门",
         goal: "查明母亲失踪与王室旧案的关系",
         knowledge: ["潮门换气图", "王室旧徽章", "禁区入口"],
+        knowledgeSources: [
+          { fact: "潮门换气图", sourceChapter: 17, sourceRevisionId: "rev_black_17_1" },
+          { fact: "王室旧徽章", sourceChapter: 17, sourceRevisionId: "rev_black_17_1" },
+          { fact: "禁区入口", sourceChapter: 16, sourceRevisionId: "rev_black_16_1" },
+        ],
+        inventoryItemIds: ["item_royal_badge"],
         relationship: "与周砚互相信任，但仍隐瞒自己的治疗史",
         protected: false,
         accent: "jade",
@@ -310,6 +379,11 @@ export function createSeedStore(): AppStore {
         location: "旧执法局",
         goal: "公开王室对旧城灾难的掩盖",
         knowledge: ["林夏的王室血统", "潮门将在三日后失效"],
+        knowledgeSources: [
+          { fact: "林夏的王室血统", sourceChapter: 17, sourceRevisionId: "rev_black_17_1" },
+          { fact: "潮门将在三日后失效", sourceChapter: 16, sourceRevisionId: "rev_black_16_1" },
+        ],
+        inventoryItemIds: [],
         relationship: "把林夏视为唯一仍可信任的人",
         protected: false,
         accent: "blue",
@@ -324,11 +398,25 @@ export function createSeedStore(): AppStore {
         location: "上层穹顶",
         goal: "维持城市秩序，阻止旧案公开",
         knowledge: ["旧城真实死亡人数", "林夏母亲的去向"],
+        knowledgeSources: [
+          { fact: "旧城真实死亡人数", sourceChapter: 5, sourceRevisionId: "rev_black_5_1" },
+          { fact: "林夏母亲的去向", sourceChapter: 16, sourceRevisionId: "rev_black_16_1" },
+        ],
+        inventoryItemIds: [],
         relationship: "对林夏既警惕又抱有补偿心理",
         protected: false,
         accent: "rust",
       },
     ],
+    items: [{
+      id: "item_royal_badge",
+      name: "王室旧徽章",
+      status: "held",
+      holderCharacterId: "char_lin_xia",
+      location: "第七码头潮门",
+      sourceChapter: 18,
+      sourceRevisionId: "rev_black_18_1",
+    }],
     rules: [
       {
         id: "rule_tide_gate",
@@ -404,8 +492,11 @@ export function createSeedStore(): AppStore {
         content: "已恢复到第 18 章，上次正史版本为 v24。",
         createdAt: "2026-07-14T09:42:00+08:00",
         observedCanonVersion: 24,
+        branchId: "branch_black_main",
+        threadId: "thread_black_main",
       },
     ],
+    conversationThreads: [{ id: "thread_black_main", branchId: "branch_black_main", summary: null, summaries: [], parentThreadId: null }],
     proposals: [],
     retcons: [],
     modelConnectionId: null,
@@ -435,6 +526,25 @@ export function createSeedStore(): AppStore {
     "监护仪上没有异常，只有所有人的梦在同一秒翻了个身。",
   );
 
+  // Demo snapshots deliberately stop before the only state-changing event so
+  // delayed retcons can replay from a trustworthy boundary without old-branch residue.
+  const blackCurrentState = captureCanonState(blackTide);
+  const blackBaseState = structuredClone(blackCurrentState);
+  const linBase = blackBaseState.characters.find((character) => character.id === "char_lin_xia");
+  if (linBase) {
+    linBase.status = "存活 · 中毒";
+    linBase.lifecycle = "alive";
+  }
+  blackTide.branches[0].baseStateSnapshot = blackBaseState;
+  blackTide.branches[0].stateSnapshot = blackCurrentState;
+  const seededDeath = blackTide.events.find((event) => event.id === "event_black_lin_death");
+  if (seededDeath) seededDeath.stateEffects = { characters: [{ characterId: "char_lin_xia", status: "确认死亡", lifecycle: "dead", location: "第七码头潮门" }] };
+  for (const story of [fogLetters, paperMoon]) {
+    const snapshot = captureCanonState(story);
+    story.branches[0].baseStateSnapshot = structuredClone(snapshot);
+    story.branches[0].stateSnapshot = snapshot;
+  }
+
   return {
     users: [
       {
@@ -445,7 +555,7 @@ export function createSeedStore(): AppStore {
         role: "admin",
         activeStoryId: blackTide.id,
         defaultConnectionId: "conn_platform",
-        ...passwordRecord("xumo2026"),
+        ...passwordRecord(adminPassword),
       },
       {
         id: "user_reader",
@@ -455,7 +565,7 @@ export function createSeedStore(): AppStore {
         role: "reader",
         activeStoryId: null,
         defaultConnectionId: "conn_platform",
-        ...passwordRecord("read2026"),
+        ...passwordRecord(readerPassword),
       },
     ],
     sessions: [],
@@ -470,6 +580,7 @@ export function createSeedStore(): AppStore {
         baseUrl: "平台安全网关",
         maskedKey: "由平台托管",
         secretRef: "platform://managed/default",
+        secretVersion: 0,
         status: "active",
         routes: {
           planner: "reasoning-small",
@@ -483,6 +594,8 @@ export function createSeedStore(): AppStore {
           jsonSchema: true,
           embedding: true,
           promptCache: true,
+          toolCalling: true,
+          maxContextTokens: 128000,
           testedAt: "2026-07-14T08:00:00+08:00",
           latencyMs: 382,
         },
@@ -502,8 +615,10 @@ export function createSeedStore(): AppStore {
         promptVersion: "story-v7",
         status: "completed",
         tokens: 6840,
+        usageEstimated: true,
         latencyMs: 18420,
         cost: 0.42,
+        costEstimated: true,
         createdAt: "2026-07-14T09:36:00+08:00",
       },
         {
@@ -518,8 +633,10 @@ export function createSeedStore(): AppStore {
         promptVersion: "story-v7",
         status: "completed",
         tokens: 5710,
+        usageEstimated: true,
         latencyMs: 14980,
         cost: 0.35,
+        costEstimated: true,
         createdAt: "2026-07-13T22:18:00+08:00",
       },
         {
@@ -534,20 +651,17 @@ export function createSeedStore(): AppStore {
         promptVersion: "extract-v3",
         status: "completed",
         tokens: 1280,
+        usageEstimated: true,
         latencyMs: 2840,
         cost: 0.03,
+        costEstimated: true,
         createdAt: "2026-07-13T17:05:00+08:00",
       },
     ],
-    auditEvents: [],
-    metrics: {
-      acceptedChapterRate: 0.76,
-      retconSuccessRate: 0.68,
-      canonConflictRate: 0.006,
-      firstTokenP95: 5.8,
-      acceptedChapterCost: 0.48,
-      activeStories: 1284,
-    },
+      auditEvents: [],
+      safetyDecisions: [],
+      contentReports: [],
     idempotencyKeys: [],
+    storyCreationRequests: [],
   };
 }

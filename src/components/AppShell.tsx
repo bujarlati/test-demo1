@@ -49,6 +49,13 @@ export function AppShell() {
           </div>
         )}
 
+        {Boolean(data?.recoverableJobs.length) && !data?.pendingJobs.length && (
+          <NavLink className="sidebar__jobs sidebar__jobs--failed" to={`/story/${data?.recoverableJobs[0]?.storyId}`}>
+            <LoaderCircle size={16} />
+            <span><strong>上次续写被中断</strong><small>{data?.recoverableJobs[0]?.storyTitle} · 可安全重试</small></span>
+          </NavLink>
+        )}
+
         {activeStory && (
           <div className="sidebar__continue">
             <span className="eyebrow">正在阅读</span>

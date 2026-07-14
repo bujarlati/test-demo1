@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleAlert,
   Clock3,
+  Flag,
   History,
   Library,
   List,
@@ -42,7 +43,7 @@ import { Logo } from "../components/Logo";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
 import { currentRevision } from "../storyDomain";
-import type { Chapter, ConversationMessage, Story } from "../types";
+import type { Chapter, ContentReport, ConversationMessage, Story } from "../types";
 import { formatDateTime } from "../utils";
 
 type ReaderTheme = "paper" | "mist" | "night";
@@ -53,9 +54,10 @@ interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
   width: number;
+  chapterLength: "compact" | "standard" | "immersive";
 }
 
-const defaultSettings: ReaderSettings = { theme: "paper", fontSize: 20, lineHeight: 1.95, width: 720 };
+const defaultSettings: ReaderSettings = { theme: "paper", fontSize: 20, lineHeight: 1.95, width: 720, chapterLength: "standard" };
 
 function loadSettings(): ReaderSettings {
   try {
@@ -73,7 +75,7 @@ function ConversationCard({ message, story }: { message: ConversationMessage; st
         <div className="chat-retcon-card__status"><Check size={14} /> 修史已提交 · v{retcon.canonVersionAfter}</div>
         <h4>{retcon.title}</h4>
         <p>{retcon.summary}</p>
-        <ul>{retcon.changes.slice(0, 3).map((change) => <li key={`${change.chapterNumber}-${change.kind}`}><span>{change.kind === "required" ? "必须" : change.kind === "supporting" ? "补丁" : "规划"}</span><div><strong>{change.chapterNumber <= story.chapters.length ? `第 ${change.chapterNumber} 章` : "后续"}</strong><small>{change.summary}</small></div></li>)}</ul>
+        <ul>{retcon.changes.slice(0, 3).map((change) => <li key={`${change.chapterNumber}-${change.kind}`}><span>{change.kind === "required" ? "必须" : change.kind === "supporting" ? "建议" : change.kind === "unchanged" ? "不改" : "规划"}</span><div><strong>{change.chapterNumber <= story.chapters.length ? `第 ${change.chapterNumber} 章` : "后续"}</strong><small>{change.summary}</small></div></li>)}</ul>
         <div><Link to={`/story/${story.id}/history`}>查看全部修改 <ArrowRight size={14} /></Link></div>
       </article>
     );
@@ -105,14 +107,19 @@ export function ReaderPage() {
   const [generationFailure, setGenerationFailure] = useState<string | null>(null);
   const [selection, setSelection] = useState("");
   const [feedbackContext, setFeedbackContext] = useState("");
+  const [reports, setReports] = useState<ContentReport[]>([]);
   const progressTimer = useRef<number | null>(null);
+  const progressVersion = useRef(1);
   const chatEnd = useRef<HTMLDivElement>(null);
   const restorePosition = useRef(true);
+  const generationIdempotencyKey = useRef(crypto.randomUUID());
 
   const load = async () => {
     try {
-      const value = await api.story(storyId);
+      const [value, reportValues] = await Promise.all([api.story(storyId), api.reports(storyId)]);
       setStory(value);
+      progressVersion.current = value.readingProgress.progressVersion;
+      setReports(reportValues);
       setChapterId((current) => current ?? value.readingProgress.chapterId ?? value.chapters.at(-1)?.id ?? null);
       setError(null);
     } catch (requestError) {
@@ -128,6 +135,28 @@ export function ReaderPage() {
   const currentIndex = story?.chapters.findIndex((chapter) => chapter.id === chapterId) ?? -1;
   const chapter = currentIndex >= 0 ? story?.chapters[currentIndex] ?? null : story?.chapters.at(-1) ?? null;
   const revision = chapter ? currentRevision(chapter) : null;
+  const branchConversation = story?.conversation.filter((message) => message.branchId === story.activeBranchId) ?? [];
+
+  const reportCurrentChapter = async () => {
+    if (!story || !chapter) return;
+    try {
+      const report = await api.reportChapter(story.id, chapter.id, "读者请求对当前 Revision 进行内容安全与合规复核");
+      setReports((current) => [report, ...current]);
+      toast("举报已提交。审核记录与正文生成解耦，不会静默修改正史。");
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "举报提交失败。", "error");
+    }
+  };
+
+  const appeal = async (reportId: string) => {
+    try {
+      const updated = await api.appealReport(reportId);
+      setReports((current) => current.map((report) => report.id === updated.id ? updated : report));
+      toast("申诉已进入复核队列。");
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "申诉提交失败。", "error");
+    }
+  };
 
   useEffect(() => {
     if (!story || !chapter) return;
@@ -149,7 +178,9 @@ export function ReaderPage() {
       const progress = Math.min(1, Math.max(0, window.scrollY / scrollable));
       if (progressTimer.current) window.clearTimeout(progressTimer.current);
       progressTimer.current = window.setTimeout(() => {
-        void api.saveProgress(story.id, chapter.id, progress);
+        void api.saveProgress(story, chapter.id, progress, progressVersion.current)
+          .then((saved) => { progressVersion.current = saved.progressVersion; })
+          .catch(() => { void load(); });
       }, 900);
     };
     window.addEventListener("scroll", save, { passive: true });
@@ -185,7 +216,7 @@ export function ReaderPage() {
   };
 
   const generateNext = async () => {
-    if (!story || generating) return;
+    if (!story || generating || story.status !== "active") return;
     setGenerating(true); setGenerationStage(0); setStreamedTitle(""); setStreamedParagraphs([]); setGenerationFailure(null);
     try {
       const result = await api.generateChapter(story, (update) => {
@@ -195,8 +226,9 @@ export function ReaderPage() {
           if (update.title) setStreamedTitle(update.title);
           setStreamedParagraphs((paragraphs) => [...paragraphs, update.paragraph!]);
         }
-      });
+      }, { chapterLength: settings.chapterLength, idempotencyKey: generationIdempotencyKey.current });
       setStory(result.story);
+      generationIdempotencyKey.current = crypto.randomUUID();
       const next = result.story.chapters.at(-1);
       if (next) { restorePosition.current = false; setChapterId(next.id); }
       await refresh();
@@ -277,8 +309,9 @@ export function ReaderPage() {
         <nav className="reader-header__actions" aria-label="阅读工具">
           <Link to={`/story/${story.id}/archive`} aria-label="故事档案"><BookMarked size={18} /><span>档案</span></Link>
           <Link to={`/story/${story.id}/history`} aria-label="版本历史"><History size={18} /><span>版本</span></Link>
+          <button type="button" onClick={() => void reportCurrentChapter()} aria-label="举报当前章节"><Flag size={18} /><span>举报</span></button>
           <button type="button" onClick={() => setPanel(panel === "settings" ? null : "settings")} aria-label="阅读设置"><Settings2 size={18} /><span>阅读</span></button>
-          <button type="button" className={panel === "chat" ? "active" : ""} onClick={() => setPanel(panel === "chat" ? null : "chat")} aria-label="读者对话"><MessageCircle size={18} /><span>对话</span>{story.conversation.length > 1 && <i />}</button>
+          <button type="button" className={panel === "chat" ? "active" : ""} onClick={() => setPanel(panel === "chat" ? null : "chat")} aria-label="读者对话"><MessageCircle size={18} /><span>对话</span>{branchConversation.length > 1 && <i />}</button>
         </nav>
       </header>
 
@@ -316,7 +349,7 @@ export function ReaderPage() {
             <div className="chapter-actions">
               <button type="button" className="button button--secondary" disabled={!hasPrevious} onClick={() => hasPrevious && changeChapter(story.chapters[currentIndex - 1])}><ChevronLeft size={17} /> 上一章</button>
               <button type="button" className="button button--soft" onClick={() => setPanel("chat")}><MessageCircle size={17} /> 对本章说一句</button>
-              {hasNext ? <button type="button" className="button button--primary" onClick={() => changeChapter(story.chapters[currentIndex + 1])}>下一章 <ChevronRight size={17} /></button> : <button type="button" className="button button--primary" disabled={generating} onClick={() => void generateNext()}>{generating ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}{generating ? "正在生成" : "生成下一章"}</button>}
+              {hasNext ? <button type="button" className="button button--primary" onClick={() => changeChapter(story.chapters[currentIndex + 1])}>下一章 <ChevronRight size={17} /></button> : <button type="button" className="button button--primary" disabled={generating || story.status !== "active"} onClick={() => void generateNext()}>{generating ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}{generating ? "正在生成" : story.status === "paused" ? "故事已暂停" : story.status === "active" ? "生成下一章" : "故事已完结"}</button>}
             </div>
           </footer>
         </article>
@@ -340,6 +373,8 @@ export function ReaderPage() {
           <section><label>正文字号 <strong>{settings.fontSize}px</strong></label><div className="stepper"><button type="button" aria-label="减小字号" onClick={() => setSettings({ ...settings, fontSize: Math.max(16, settings.fontSize - 1) })}><Minus size={16} /></button><span style={{ fontSize: `${settings.fontSize}px` }}>读</span><button type="button" aria-label="增大字号" onClick={() => setSettings({ ...settings, fontSize: Math.min(26, settings.fontSize + 1) })}><Plus size={16} /></button></div></section>
           <section><label htmlFor="line-height">行间距 <strong>{settings.lineHeight.toFixed(2)}</strong></label><input id="line-height" type="range" min="1.6" max="2.3" step="0.05" value={settings.lineHeight} onChange={(event) => setSettings({ ...settings, lineHeight: Number(event.target.value) })} /></section>
           <section><label htmlFor="text-width">正文宽度 <strong>{settings.width}px</strong></label><input id="text-width" type="range" min="600" max="820" step="20" value={settings.width} onChange={(event) => setSettings({ ...settings, width: Number(event.target.value) })} /></section>
+          <section><label>下一章长度</label><div className="theme-options"><button type="button" className={settings.chapterLength === "compact" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "compact" })}><span>精简</span></button><button type="button" className={settings.chapterLength === "standard" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "standard" })}><span>标准</span></button><button type="button" className={settings.chapterLength === "immersive" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "immersive" })}><span>沉浸</span></button></div></section>
+          {reports.length > 0 && <section className="reader-reports"><label>我的内容复核</label>{reports.slice(0, 4).map((report) => <article key={report.id}><span><strong>第 {story.chapters.find((item) => item.id === report.chapterId)?.number ?? "?"} 章</strong><small>{report.status === "submitted" ? "已提交" : report.status === "reviewing" ? "审核中" : report.status === "resolved" ? "已处理" : "申诉复核中"}</small></span>{report.status === "resolved" && <button type="button" className="text-link" onClick={() => void appeal(report.id)}>申诉</button>}</article>)}</section>}
           <button type="button" className="text-link reset-settings" onClick={() => setSettings(defaultSettings)}>恢复默认阅读设置</button>
         </div>
       </aside>
@@ -349,7 +384,7 @@ export function ReaderPage() {
         <div className="chat-context"><ShieldCheck size={15} /><span>当前分支 · 正史 v{story.canonVersion}</span><small>对话可恢复，但正史仍以 Revision 为准</small></div>
         <div className="chat-scroll">
           <div className="chat-intro"><MessageCircle size={20} /><p>你不需要给出替代情节。告诉我哪里不舒服，系统会自行完成修改与代价。</p></div>
-          {story.conversation.map((message) => <ConversationCard key={message.id} message={message} story={story} />)}
+          {branchConversation.map((message) => <ConversationCard key={message.id} message={message} story={story} />)}
           <div ref={chatEnd} />
         </div>
         <div className="quick-prompts"><button type="button" onClick={() => { setFeedbackContext(""); setDraft(`不，我不希望${story.characters[0]?.name ?? "她"}死。`); }}>不希望主角死</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft("这段关系发展太快了。"); }}>关系太快</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft("不要把这个反派洗白。"); }}>不要洗白反派</button><button type="button" onClick={() => { setFeedbackContext(""); setDraft(`${story.characters[0]?.name ?? "主角"}为什么会这样选择？`); }}>问一个事实</button></div>

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  CanonSummary,
   Chapter,
   CreateStoryInput,
   Story,
@@ -7,6 +8,8 @@ import type {
 } from "../src/types";
 import {
   applyExtractedCharacterState,
+  applyPlannedItemTransitions,
+  assertStoryStateIntegrity,
   eventFromChapter,
   generateLocalChapter,
   type GeneratedChapter,
@@ -14,6 +17,7 @@ import {
   type GenerationPlan,
   validateGeneratedChapter,
 } from "./narrativeEngine";
+import { captureCanonState, deriveStateEffects } from "./canonState";
 
 export function summarizeStory(story: Story): StorySummary {
   const activeChapter =
@@ -39,6 +43,77 @@ export function summarizeStory(story: Story): StorySummary {
     chapterCount: story.chapters.length,
     progress: Math.min(1, (latest?.number ?? 1) / story.targetChapterCount),
   };
+}
+
+export function rebuildBranchSummaries(story: Story): void {
+  const branch = story.branches.find((item) => item.id === story.activeBranchId);
+  if (!branch) throw new Error("活动分支不存在，无法重建分层摘要。");
+  const updatedAt = new Date().toISOString();
+  const rows = story.chapters
+    .map((chapter) => {
+      const revisionId = branch.chapterRevisionIds[chapter.id] ?? chapter.currentRevisionId;
+      const revision = chapter.revisions.find((item) => item.id === revisionId);
+      return revision ? { chapter, revision } : null;
+    })
+    .filter((row): row is NonNullable<typeof row> => Boolean(row))
+    .sort((left, right) => left.chapter.number - right.chapter.number);
+  const summaries: CanonSummary[] = [];
+  for (const { chapter, revision } of rows) {
+    const sceneText = `${revision.title}：${revision.paragraphs.at(-1) ?? revision.paragraphs[0] ?? ""}`.slice(0, 420);
+    const chapterText = `${revision.title}：${revision.paragraphs[0] ?? ""} ${revision.paragraphs.at(-1) ?? ""}`.slice(0, 560);
+    summaries.push(
+      {
+        id: `summary_${story.id}_${branch.id}_scene_${chapter.number}`,
+        branchId: branch.id,
+        layer: "scene",
+        text: sceneText,
+        fromChapter: chapter.number,
+        toChapter: chapter.number,
+        sourceRevisionIds: [revision.id],
+        updatedAt,
+      },
+      {
+        id: `summary_${story.id}_${branch.id}_chapter_${chapter.number}`,
+        branchId: branch.id,
+        layer: "chapter",
+        text: chapterText,
+        fromChapter: chapter.number,
+        toChapter: chapter.number,
+        sourceRevisionIds: [revision.id],
+        updatedAt,
+      },
+    );
+  }
+  for (let index = 0; index < rows.length; index += 5) {
+    const group = rows.slice(index, index + 5);
+    if (!group.length) continue;
+    summaries.push({
+      id: `summary_${story.id}_${branch.id}_arc_${group[0].chapter.number}`,
+      branchId: branch.id,
+      layer: "arc",
+      text: group.map(({ chapter, revision }) => `${chapter.number}.${revision.title}：${revision.paragraphs.at(-1) ?? ""}`).join(" ").slice(-1_000),
+      fromChapter: group[0].chapter.number,
+      toChapter: group.at(-1)!.chapter.number,
+      sourceRevisionIds: group.map(({ revision }) => revision.id),
+      updatedAt,
+    });
+  }
+  if (rows.length) {
+    summaries.push({
+      id: `summary_${story.id}_${branch.id}_book`,
+      branchId: branch.id,
+      layer: "book",
+      text: rows.map(({ chapter, revision }) => `${chapter.number}.${revision.title}：${revision.paragraphs.at(-1) ?? ""}`).join(" ").slice(-1_400),
+      fromChapter: rows[0].chapter.number,
+      toChapter: rows.at(-1)!.chapter.number,
+      sourceRevisionIds: rows.slice(-12).map(({ revision }) => revision.id),
+      updatedAt,
+    });
+  }
+  story.summaries = [
+    ...story.summaries.filter((summary) => summary.branchId !== branch.id),
+    ...summaries,
+  ];
 }
 
 interface StoryTemplate {
@@ -230,9 +305,11 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
   const revisionId = `rev_${id}_1_1`;
   const chapterId = `chapter_${id}_1`;
   const characterId = `char_${id}_lead`;
+  const branchId = `branch_${id}_main`;
+  const threadId = `thread_${id}_main`;
   const length = input.length || "中篇 · 预计 24 章";
   const blueprint = personalizedBlueprint(template, input, id);
-  return {
+  const story: Story = {
     id,
     ownerId,
     title: blueprint.title,
@@ -244,13 +321,24 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     inspiration: input.inspiration?.trim() || "",
     coverTheme: template.coverTheme,
     status: "active",
-    activeBranchId: `branch_${id}_main`,
+    activeBranchId: branchId,
+    branches: [{
+      id: branchId,
+      name: "主线",
+      basedOnBranchId: null,
+      baseCanonVersion: 1,
+      headCanonVersion: 1,
+      createdAt,
+      status: "active",
+      chapterRevisionIds: { [chapterId]: revisionId },
+      baseEventSequence: 1,
+    }],
     canonVersion: 1,
     summary: `${blueprint.subtitle}。${blueprint.gene.conflictEngine}`,
     latestExcerpt: blueprint.paragraphs.at(-1) ?? "故事已经开始。",
     updatedAt: createdAt,
     unreadCanonChanges: 0,
-    readingProgress: { chapterId, scrollProgress: 0, updatedAt: createdAt },
+    readingProgress: { chapterId, scrollProgress: 0, updatedAt: createdAt, progressVersion: 1, activeBranchId: branchId, canonVersion: 1 },
     storyGene: { ...blueprint.gene, version: 1, createdAt },
     endingContract: {
       ...blueprint.ending,
@@ -258,6 +346,25 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
       status: "viable",
       lastEvaluatedAt: createdAt,
     },
+    worldBible: {
+      version: 1,
+      organizations: ["开篇出现的本地秩序机构"],
+      locations: ["故事起点"],
+      abilityBoundaries: ["异常必须留下可追溯因果，不能无代价改写既有事实"],
+      pointOfView: "近距离第三人称",
+      styleParameters: [blueprint.gene.conflictEngine, input.tone || "克制而有余韵"],
+      sourceRevisionIds: [revisionId],
+    },
+    summaries: (["scene", "chapter", "arc", "book"] as const).map((layer) => ({
+      id: `summary_${id}_${layer}_1`,
+      branchId,
+      layer,
+      text: `${blueprint.firstTitle}：${blueprint.paragraphs[0]} ${blueprint.paragraphs.at(-1) ?? ""}`.slice(0, 420),
+      fromChapter: 1,
+      toChapter: 1,
+      sourceRevisionIds: [revisionId],
+      updatedAt: createdAt,
+    })),
     events: [
       {
         id: `event_${id}_1`,
@@ -271,6 +378,9 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         location: "故事起点",
         dependsOn: [],
         active: true,
+        sequence: 1,
+        storyTime: "第1章·场景1",
+        branchId,
       },
     ],
     chapters: [
@@ -289,6 +399,7 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
             createdAt,
             modelName: "platform-writer",
             promptVersion: "story-v8",
+            branchId,
           },
         ],
         estimatedMinutes: 6,
@@ -305,11 +416,21 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         location: "故事起点",
         goal: blueprint.gene.visibleGoal,
         knowledge: ["第一章中亲眼看到的异常"],
+        knowledgeSources: [{ fact: "第一章中亲眼看到的异常", sourceChapter: 1, sourceRevisionId: revisionId }],
+        inventoryItemIds: [],
         relationship: "尚未建立稳定同盟",
         protected: false,
         accent: "jade",
       },
     ],
+    items: [{
+      id: `item_${id}_anomaly`,
+      name: "第一章的异常物",
+      status: "available",
+      location: "故事起点",
+      sourceChapter: 1,
+      sourceRevisionId: revisionId,
+    }],
     rules: [
       {
         id: `rule_${id}_1`,
@@ -338,12 +459,19 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         content: "故事基因、暂定结局契约与第一章已生成。你只需要阅读，故事会自行继续。",
         createdAt,
         observedCanonVersion: 1,
+        branchId,
+        threadId,
       },
     ],
+    conversationThreads: [{ id: threadId, branchId, summary: null, summaries: [], parentThreadId: null }],
     proposals: [],
     retcons: [],
     modelConnectionId: null,
   };
+  const initialState = captureCanonState(story);
+  story.branches[0].baseStateSnapshot = structuredClone(initialState);
+  story.branches[0].stateSnapshot = initialState;
+  return story;
 }
 
 export function commitNextChapter(
@@ -373,18 +501,40 @@ export function commitNextChapter(
         createdAt,
         modelName: result.model,
         promptVersion: "story-v8",
+        branchId: story.activeBranchId,
       },
     ],
     estimatedMinutes: Math.max(5, Math.round(result.paragraphs.join("").length / 160)),
   };
   story.chapters.push(nextChapter);
-  story.events.push(eventFromChapter(story, number, revisionId, plan, extracted?.events[0], result));
-  applyExtractedCharacterState(story, extracted, result);
+  const activeBranchBeforeCommit = story.branches.find((item) => item.id === story.activeBranchId);
+  if (activeBranchBeforeCommit) activeBranchBeforeCommit.chapterRevisionIds[chapterId] = revisionId;
+  const stateBefore = captureCanonState(story);
+  const event = eventFromChapter(story, number, revisionId, plan, extracted?.events[0], result);
+  story.events.push(event);
+  applyPlannedItemTransitions(story, plan, result, { chapterNumber: number, revisionId });
+  applyExtractedCharacterState(story, extracted, result, { chapterNumber: number, revisionId });
+  event.stateEffects = deriveStateEffects(stateBefore, captureCanonState(story));
   story.canonVersion += 1;
+  const branch = story.branches.find((item) => item.id === story.activeBranchId);
+  if (branch) branch.headCanonVersion = story.canonVersion;
   story.updatedAt = createdAt;
   story.latestExcerpt = result.paragraphs.at(-1) ?? "";
-  story.readingProgress = { chapterId, scrollProgress: 0, updatedAt: createdAt };
+  story.readingProgress = {
+    chapterId,
+    scrollProgress: 0,
+    updatedAt: createdAt,
+    progressVersion: story.readingProgress.progressVersion + 1,
+    activeBranchId: story.activeBranchId,
+    canonVersion: story.canonVersion,
+  };
   story.endingContract.lastEvaluatedAt = createdAt;
+  rebuildBranchSummaries(story);
+  let thread = story.conversationThreads.find((item) => item.branchId === story.activeBranchId);
+  if (!thread) {
+    thread = { id: `thread_${randomUUID().slice(0, 8)}`, branchId: story.activeBranchId, summary: null, summaries: [], parentThreadId: null };
+    story.conversationThreads.push(thread);
+  }
   story.conversation.push({
     id: `msg_${randomUUID().slice(0, 8)}`,
     role: "system",
@@ -392,7 +542,15 @@ export function commitNextChapter(
     content: `第 ${number} 章《${result.title}》已通过 ${plan.candidates.length} 个短候选的正史门禁，并提交为正史 v${story.canonVersion}。`,
     createdAt,
     observedCanonVersion: story.canonVersion,
+    branchId: story.activeBranchId,
+    threadId: thread.id,
   });
+  assertStoryStateIntegrity(story);
+  const committedBranch = story.branches.find((item) => item.id === story.activeBranchId);
+  if (committedBranch) {
+    committedBranch.stateSnapshot = captureCanonState(story);
+    committedBranch.baseStateSnapshot ??= structuredClone(committedBranch.stateSnapshot);
+  }
   return nextChapter;
 }
 

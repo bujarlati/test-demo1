@@ -1,5 +1,8 @@
 import { lookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { Readable } from "node:stream";
 import type { CapabilitySnapshot, ModelConnection, Story } from "../src/types";
 import type {
   CandidateDraft,
@@ -8,6 +11,8 @@ import type {
   GeneratedChapter,
 } from "./narrativeEngine";
 import { readSecret } from "./vault";
+
+const itemStatuses = new Set(["available", "held", "lost", "destroyed", "consumed"] as const);
 
 function isPrivateIpv4(address: string): boolean {
   const parts = address.split(".").map(Number);
@@ -27,6 +32,14 @@ function isPrivateIpv4(address: string): boolean {
 function isPrivateAddress(address: string): boolean {
   if (address.includes(":")) {
     const normalized = address.toLowerCase();
+    const mappedIpv4 = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+    if (mappedIpv4) return isPrivateIpv4(mappedIpv4);
+    const mappedHex = normalized.match(/::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (mappedHex) {
+      const high = Number.parseInt(mappedHex[1], 16);
+      const low = Number.parseInt(mappedHex[2], 16);
+      return isPrivateIpv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+    }
     return (
       normalized === "::1" ||
       normalized === "::" ||
@@ -35,13 +48,16 @@ function isPrivateAddress(address: string): boolean {
       normalized.startsWith("fe8") ||
       normalized.startsWith("fe9") ||
       normalized.startsWith("fea") ||
-      normalized.startsWith("feb")
+      normalized.startsWith("feb") ||
+      normalized.startsWith("ff") ||
+      normalized.startsWith("2001:db8:") ||
+      normalized.startsWith("2001:10:")
     );
   }
   return isPrivateIpv4(address);
 }
 
-export async function assertSafeEndpoint(rawUrl: string): Promise<URL> {
+async function resolveSafeEndpoint(rawUrl: string): Promise<{ url: URL; address: string; family: 4 | 6 }> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -68,7 +84,13 @@ export async function assertSafeEndpoint(rawUrl: string): Promise<URL> {
   if (!allowPrivate && addresses.some(({ address }) => isPrivateAddress(address))) {
     throw new Error("该域名解析到私有或保留地址，已阻止连接以避免 SSRF。");
   }
-  return url;
+  const selected = addresses[0];
+  if (!selected) throw new Error("模型域名没有可用的 DNS 解析结果。");
+  return { url, address: selected.address, family: isIP(selected.address) === 6 ? 6 : 4 };
+}
+
+export async function assertSafeEndpoint(rawUrl: string): Promise<URL> {
+  return (await resolveSafeEndpoint(rawUrl)).url;
 }
 
 function endpoint(baseUrl: string, pathname: string): string {
@@ -82,16 +104,43 @@ async function modelFetch(
   init: RequestInit,
   timeout = 12_000,
 ) {
-  await assertSafeEndpoint(connection.baseUrl);
-  return fetch(endpoint(connection.baseUrl, pathname), {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...init.headers,
-    },
-    signal: AbortSignal.timeout(timeout),
-    redirect: "error",
+  const resolved = await resolveSafeEndpoint(connection.baseUrl);
+  const url = new URL(endpoint(resolved.url.toString(), pathname));
+  const headers = new Headers({
+    Authorization: `Bearer ${apiKey}`,
+    "Accept-Encoding": "identity",
+    ...(init.body ? { "Content-Type": "application/json" } : {}),
+    ...init.headers,
+  });
+  return new Promise<Response>((resolve, reject) => {
+    const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, {
+      method: init.method ?? "GET",
+      headers: Object.fromEntries(headers.entries()),
+      servername: url.hostname,
+      lookup: (_hostname, _options, callback) => callback(null, resolved.address, resolved.family),
+    }, (incoming) => {
+      const responseHeaders = new Headers();
+      for (const [name, value] of Object.entries(incoming.headers)) {
+        if (Array.isArray(value)) value.forEach((item) => responseHeaders.append(name, item));
+        else if (value !== undefined) responseHeaders.set(name, value);
+      }
+      const status = incoming.statusCode ?? 502;
+      const body = status === 204 || status === 304 ? null : Readable.toWeb(incoming) as ReadableStream;
+      resolve(new Response(body, { status, statusText: incoming.statusMessage, headers: responseHeaders }));
+    });
+    const timer = setTimeout(() => request.destroy(new Error("模型连接超时。")), timeout);
+    request.once("close", () => clearTimeout(timer));
+    request.once("error", reject);
+    if (init.signal) {
+      if (init.signal.aborted) request.destroy(new Error("模型请求已取消。"));
+      else init.signal.addEventListener("abort", () => request.destroy(new Error("模型请求已取消。")), { once: true });
+    }
+    if (typeof init.body === "string" || init.body instanceof Uint8Array) request.write(init.body);
+    else if (init.body) {
+      request.destroy(new Error("模型网关只接受已序列化的请求正文。"));
+      return;
+    }
+    request.end();
   });
 }
 
@@ -113,6 +162,25 @@ async function probeJson(connection: ModelConnection, apiKey: string) {
     if (!content) return false;
     JSON.parse(content);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+async function probeTextCompletion(connection: ModelConnection, apiKey: string) {
+  try {
+    const response = await modelFetch(connection, apiKey, "/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: connection.routes.writer,
+        messages: [{ role: "user", content: "回复：好" }],
+        max_tokens: 4,
+        stream: false,
+      }),
+    });
+    if (!response.ok) return false;
+    const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    return typeof payload.choices?.[0]?.message?.content === "string";
   } catch {
     return false;
   }
@@ -153,29 +221,75 @@ async function probeEmbedding(connection: ModelConnection, apiKey: string) {
   }
 }
 
+async function probeToolCalling(connection: ModelConnection, apiKey: string) {
+  try {
+    const response = await modelFetch(connection, apiKey, "/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: connection.routes.planner,
+        messages: [{ role: "user", content: "调用 ping 工具" }],
+        tools: [{ type: "function", function: { name: "ping", description: "能力探测", parameters: { type: "object", properties: {} } } }],
+        tool_choice: { type: "function", function: { name: "ping" } },
+        max_tokens: 24,
+      }),
+    });
+    if (!response.ok) return false;
+    const payload = (await response.json()) as { choices?: Array<{ message?: { tool_calls?: unknown[] } }> };
+    return Array.isArray(payload.choices?.[0]?.message?.tool_calls);
+  } catch {
+    return false;
+  }
+}
+
+async function probePromptCache(connection: ModelConnection, apiKey: string) {
+  const body = JSON.stringify({
+    model: connection.routes.planner,
+    messages: [{ role: "user", content: `提示词缓存能力探测：${"固定上下文".repeat(180)}` }],
+    max_tokens: 2,
+    temperature: 0,
+  });
+  try {
+    const warmup = await modelFetch(connection, apiKey, "/chat/completions", { method: "POST", body });
+    await warmup.arrayBuffer();
+    const response = await modelFetch(connection, apiKey, "/chat/completions", { method: "POST", body });
+    if (!response.ok) return false;
+    const payload = (await response.json()) as { usage?: { prompt_tokens_details?: { cached_tokens?: number }; cached_tokens?: number } };
+    return (payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function testConnection(connection: ModelConnection): Promise<CapabilitySnapshot> {
   await assertSafeEndpoint(connection.baseUrl);
-  const apiKey = await readSecret(connection.id);
+  const apiKey = await readSecret(connection.id, connection.secretVersion);
   const startedAt = performance.now();
   const response = await modelFetch(connection, apiKey, "/models", { method: "GET" }, 10_000);
   if (!response.ok) {
     throw new Error(`连接返回 ${response.status}，请检查地址、Key 与访问权限。`);
   }
-  const payload = (await response.json()) as { data?: Array<{ id?: string }> };
+  const payload = (await response.json()) as { data?: Array<{ id?: string; context_window?: number; max_context_length?: number }> };
   const models = (payload.data ?? [])
     .map((item) => item.id)
     .filter((item): item is string => Boolean(item))
     .slice(0, 20);
-  const [jsonSchema, streaming, embedding] = await Promise.all([
+  const maxContextTokens = Math.max(0, ...(payload.data ?? []).map((item) => item.context_window ?? item.max_context_length ?? 0)) || null;
+  const [textCompletion, jsonSchema, streaming, embedding, toolCalling, promptCache] = await Promise.all([
+    probeTextCompletion(connection, apiKey),
     probeJson(connection, apiKey),
     probeStreaming(connection, apiKey),
     probeEmbedding(connection, apiKey),
+    probeToolCalling(connection, apiKey),
+    probePromptCache(connection, apiKey),
   ]);
+  if (!textCompletion) throw new Error("连接能列出模型，但最小正文请求失败；请检查 writer 路由与调用权限。");
   return {
     streaming,
     jsonSchema,
     embedding,
-    promptCache: false,
+    promptCache,
+    toolCalling,
+    maxContextTokens,
     testedAt: new Date().toISOString(),
     latencyMs: Math.round(performance.now() - startedAt),
     models,
@@ -188,8 +302,9 @@ async function completeJson<T>(
   system: string,
   prompt: string,
   timeout = 120_000,
-): Promise<T> {
-  const apiKey = await readSecret(connection.id);
+  maxTokens = 2_000,
+): Promise<{ value: T; usageTokens: number; usageEstimated: boolean }> {
+  const apiKey = await readSecret(connection.id, connection.secretVersion);
   const body: Record<string, unknown> = {
     model,
     messages: [
@@ -198,6 +313,7 @@ async function completeJson<T>(
     ],
     temperature: 0.7,
     stream: false,
+    max_tokens: maxTokens,
   };
   if (connection.capabilities?.jsonSchema) body.response_format = { type: "json_object" };
   const response = await modelFetch(
@@ -208,33 +324,64 @@ async function completeJson<T>(
     timeout,
   );
   if (!response.ok) throw new Error(`模型 ${model} 返回 ${response.status}；未启用静默回退。`);
-  const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const payload = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { total_tokens?: number };
+  };
   const content = payload.choices?.[0]?.message?.content;
   if (!content) throw new Error(`模型 ${model} 没有返回可用内容。`);
+  let value: T;
   try {
-    return JSON.parse(content) as T;
+    value = JSON.parse(content) as T;
   } catch {
     const match = content.match(/\{[\s\S]*\}/);
     if (!match) throw new Error(`模型 ${model} 输出不是可修复的 JSON。`);
-    return JSON.parse(match[0]) as T;
+    value = JSON.parse(match[0]) as T;
   }
+  const reportedTokens = payload.usage?.total_tokens;
+  return {
+    value,
+    usageTokens: reportedTokens ?? Math.ceil((system.length + prompt.length + content.length) / 2),
+    usageEstimated: !reportedTokens,
+  };
 }
 
 export async function generateCandidateDraftsWithConnection(
   connection: ModelConnection,
   story: Story,
-): Promise<CandidateDraft[]> {
-  const payload = await completeJson<{ candidates?: CandidateDraft[] }>(
+): Promise<{ candidates: CandidateDraft[]; usageTokens: number; usageEstimated: boolean }> {
+  const activeKnowledgeLedger = story.characters.map((character) => ({
+    characterName: character.name,
+    facts: character.knowledgeSources.slice(-12).map((fact) => ({ fact: fact.fact, sourceRevisionId: fact.sourceRevisionId })),
+  }));
+  const activeEventIds = story.events
+    .filter((event) => event.active && event.branchId === story.activeBranchId)
+    .slice(-12)
+    .map((event) => ({ id: event.id, title: event.title, storyTime: event.storyTime }));
+  const completion = await completeJson<{ candidates?: CandidateDraft[] }>(
     connection,
     connection.routes.planner,
-    "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty。只给短剧情胶囊，不写正文。",
-    `故事：${story.title}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；下一章编号：${story.chapters.length + 1}。生成 5 个结构不同的候选。`,
+    "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty,participantNames,storyTime,dependsOnEventIds,knowledgeClaims,itemTransitions。knowledgeClaims 每项含 characterName/fact/sourceRevisionId；itemTransitions 每项含 itemName/actorName/fromStatus/toStatus。只给短剧情胶囊，不写正文。",
+    `故事：${story.title}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；下一章编号：${story.chapters.length + 1}。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 5 个结构不同的候选。`,
     40_000,
+    1_800,
   );
+  const payload = completion.value;
   const candidates = (payload.candidates ?? [])
     .filter((item) =>
       item && [item.creativeAxis, item.event, item.cause, item.cost, item.impact, item.novelty]
-        .every((value) => typeof value === "string" && value.trim().length > 0),
+        .every((value) => typeof value === "string" && value.trim().length > 0) &&
+      Array.isArray(item.participantNames) && item.participantNames.every((value) => typeof value === "string") &&
+      typeof item.storyTime === "string" && item.storyTime.trim().length > 0 &&
+      Array.isArray(item.dependsOnEventIds) && item.dependsOnEventIds.every((value) => typeof value === "string") &&
+      Array.isArray(item.knowledgeClaims) && item.knowledgeClaims.every((claim) =>
+        claim && typeof claim.characterName === "string" && typeof claim.fact === "string" &&
+        typeof claim.sourceRevisionId === "string" && claim.sourceRevisionId.trim().length > 0,
+      ) &&
+      Array.isArray(item.itemTransitions) && item.itemTransitions.every((transition) =>
+        transition && typeof transition.itemName === "string" && typeof transition.actorName === "string" &&
+        itemStatuses.has(transition.fromStatus) && itemStatuses.has(transition.toStatus),
+      ),
     )
     .map((item) => ({
       creativeAxis: item.creativeAxis.slice(0, 80),
@@ -243,21 +390,57 @@ export async function generateCandidateDraftsWithConnection(
       cost: item.cost.slice(0, 180),
       impact: item.impact.slice(0, 220),
       novelty: item.novelty.slice(0, 180),
+      participantNames: Array.isArray(item.participantNames) ? item.participantNames.filter((value): value is string => typeof value === "string").slice(0, 12) : [],
+      storyTime: typeof item.storyTime === "string" ? item.storyTime.slice(0, 80) : undefined,
+      dependsOnEventIds: Array.isArray(item.dependsOnEventIds) ? item.dependsOnEventIds.filter((value): value is string => typeof value === "string").slice(0, 12) : [],
+      knowledgeClaims: Array.isArray(item.knowledgeClaims) ? item.knowledgeClaims.filter((claim) => claim && typeof claim.characterName === "string" && typeof claim.fact === "string").slice(0, 12).map((claim) => ({ characterName: claim.characterName.slice(0, 80), fact: claim.fact.slice(0, 180), sourceRevisionId: typeof claim.sourceRevisionId === "string" ? claim.sourceRevisionId.slice(0, 120) : undefined })) : [],
+      itemTransitions: Array.isArray(item.itemTransitions) ? item.itemTransitions.filter((transition) => transition && typeof transition.itemName === "string" && typeof transition.actorName === "string" && itemStatuses.has(transition.fromStatus) && itemStatuses.has(transition.toStatus)).slice(0, 12).map((transition) => ({ itemName: transition.itemName.slice(0, 120), actorName: transition.actorName.slice(0, 80), fromStatus: transition.fromStatus, toStatus: transition.toStatus })) : [],
     }));
   if (candidates.length < 3) throw new Error("规划模型未返回至少 3 个有效剧情胶囊。");
-  return candidates.slice(0, 5);
+  const selectedCandidates = candidates.slice(0, 5);
+  const auditCompletion = await completeJson<{
+    audits?: Array<{ candidateIndex?: number; complete?: boolean; dependencies?: Array<{ characterName?: string; fact?: string }> }>;
+  }>(
+    connection,
+    connection.routes.extractor,
+    "你是独立的剧情知识依赖审计器。只返回 JSON：{audits:[{candidateIndex,complete,dependencies:[{characterName,fact}]}]}。逐个候选穷尽提取角色行动所依赖的所有既有信息、解读材料、秘密、凭据、记录和推理前提；不要依赖固定动词或名词表，要理解同义表达、语序和隐含信息依赖。dependencies 只记录行动前必须已知的事实，不记录本章新发生的物理动作。只有确认穷尽时 complete 才为 true。",
+    `活动人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；候选：${JSON.stringify(selectedCandidates.map((candidate, candidateIndex) => ({ candidateIndex, event: candidate.event, cause: candidate.cause, cost: candidate.cost, impact: candidate.impact, novelty: candidate.novelty, participantNames: candidate.participantNames })))}。`,
+    40_000,
+    1_800,
+  );
+  const audits = auditCompletion.value.audits ?? [];
+  const auditedCandidates = selectedCandidates.map((candidate, candidateIndex) => {
+    const audit = audits.find((item) => item.candidateIndex === candidateIndex);
+    if (!audit?.complete || !Array.isArray(audit.dependencies)) {
+      throw new Error(`候选 ${candidateIndex + 1} 缺少完整的独立知识依赖审计。`);
+    }
+    const dependencies = audit.dependencies
+      .filter((dependency) => dependency && typeof dependency.characterName === "string" && typeof dependency.fact === "string" && dependency.fact.trim().length >= 2)
+      .map((dependency) => ({ characterName: dependency.characterName!.slice(0, 80), fact: dependency.fact!.slice(0, 180) }));
+    if (dependencies.length !== audit.dependencies.length) throw new Error(`候选 ${candidateIndex + 1} 的知识依赖审计 Schema 无效。`);
+    return { ...candidate, knowledgeAudit: { complete: true, dependencies } };
+  });
+  return {
+    candidates: auditedCandidates,
+    usageTokens: completion.usageTokens + auditCompletion.usageTokens,
+    usageEstimated: completion.usageEstimated || auditCompletion.usageEstimated,
+  };
 }
 
 export async function generateChapterWithConnection(
   connection: ModelConnection,
   prompt: string,
+  maxTokens = 6_500,
 ): Promise<GeneratedChapter> {
-  const parsed = await completeJson<{ title?: string; paragraphs?: string[] }>(
+  const completion = await completeJson<{ title?: string; paragraphs?: string[] }>(
     connection,
     connection.routes.writer,
-    "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。生成 5 至 8 个完整段落，保持因果与克制。",
+    "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。严格按用户提示中的目标段落数生成，保持因果与克制。",
     prompt,
+    120_000,
+    maxTokens,
   );
+  const parsed = completion.value;
   if (
     typeof parsed.title !== "string" ||
     !Array.isArray(parsed.paragraphs) ||
@@ -270,6 +453,8 @@ export async function generateChapterWithConnection(
     title: parsed.title,
     paragraphs: parsed.paragraphs.map((paragraph) => paragraph.slice(0, 4_000)),
     model: connection.routes.writer,
+    usageTokens: completion.usageTokens,
+    usageEstimated: completion.usageEstimated,
   };
 }
 
@@ -302,28 +487,30 @@ function completedChapterFields(content: string) {
       cursor += 1;
     }
     if (!completed) break;
-    try { paragraphs.push(JSON.parse(content.slice(start, cursor)) as string); } catch { break; }
+    try { paragraphs.push((JSON.parse(content.slice(start, cursor)) as string).slice(0, 4_000)); } catch { break; }
   }
-  return { title, paragraphs };
+  return { title: title.slice(0, 200), paragraphs };
 }
 
 export async function streamChapterWithConnection(
   connection: ModelConnection,
   prompt: string,
   onParagraph: (paragraph: string, index: number, title: string) => void,
+  maxTokens = 6_500,
 ): Promise<GeneratedChapter> {
-  const apiKey = await readSecret(connection.id);
+  const apiKey = await readSecret(connection.id, connection.secretVersion);
   const body: Record<string, unknown> = {
     model: connection.routes.writer,
     messages: [
       {
         role: "system",
-        content: "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。生成 5 至 8 个完整段落。先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。",
+        content: "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。严格按用户提示中的目标段落数生成。先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。",
       },
       { role: "user", content: prompt },
     ],
     temperature: 0.7,
     stream: true,
+    max_tokens: maxTokens,
   };
   if (connection.capabilities?.jsonSchema) body.response_format = { type: "json_object" };
   const response = await modelFetch(
@@ -341,47 +528,66 @@ export async function streamChapterWithConnection(
   let eventBuffer = "";
   let content = "";
   let emitted = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    eventBuffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
-    const frames = eventBuffer.split("\n\n");
-    eventBuffer = frames.pop() ?? "";
-    for (const frame of frames) {
-      for (const line of frame.split("\n")) {
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-        const payload = JSON.parse(data) as {
-          choices?: Array<{ delta?: { content?: string } }>;
-        };
-        content += payload.choices?.[0]?.delta?.content ?? "";
+  let reportedTokens: number | undefined;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      eventBuffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+      const frames = eventBuffer.split("\n\n");
+      eventBuffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          const payload = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+            usage?: { total_tokens?: number };
+          };
+          content += payload.choices?.[0]?.delta?.content ?? "";
+          reportedTokens = payload.usage?.total_tokens ?? reportedTokens;
+          if (content.length > 1_000_000) {
+            throw new Error("流式正文超过 1 MB 安全上限，已中止且不会提交正史。");
+          }
+        }
+        const fields = completedChapterFields(content);
+        while (emitted < fields.paragraphs.length) {
+          onParagraph(fields.paragraphs[emitted], emitted, fields.title);
+          emitted += 1;
+        }
       }
-      const fields = completedChapterFields(content);
-      while (emitted < fields.paragraphs.length) {
-        onParagraph(fields.paragraphs[emitted], emitted, fields.title);
-        emitted += 1;
-      }
+      if (done) break;
     }
-    if (done) break;
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
   }
   const fields = completedChapterFields(content);
   if (!fields.title || fields.paragraphs.length < 4) {
     throw new Error("流式正文在完成前中断或未通过章节 Schema 校验。");
   }
-  return { title: fields.title, paragraphs: fields.paragraphs, model: connection.routes.writer };
+  return {
+    title: fields.title,
+    paragraphs: fields.paragraphs,
+    model: connection.routes.writer,
+    usageTokens: reportedTokens ?? Math.ceil((prompt.length + content.length) / 2),
+    usageEstimated: !reportedTokens,
+  };
 }
 
 export async function extractChapterStateWithConnection(
   connection: ModelConnection,
   chapter: GeneratedChapter,
 ): Promise<ExtractedChapterState> {
-  const parsed = await completeJson<Partial<ExtractedChapterState>>(
+  const completion = await completeJson<Partial<ExtractedChapterState>>(
     connection,
     connection.routes.extractor,
-    "你是正史状态抽取器。只返回 JSON：{\"events\":[{\"type\":\"choice\",\"title\":\"\",\"cause\":\"\",\"outcome\":\"\",\"participantNames\":[],\"location\":\"\"}],\"characterUpdates\":[{\"name\":\"\",\"status\":\"\",\"location\":\"\",\"goal\":\"\",\"knowledgeGained\":[]}]}; 不得新增正文没有的事实。",
+    "你是正史状态抽取器。只返回 JSON：{\"events\":[{\"type\":\"choice\",\"title\":\"\",\"cause\":\"\",\"outcome\":\"\",\"participantNames\":[],\"location\":\"\"}],\"characterUpdates\":[{\"name\":\"\",\"status\":\"\",\"location\":\"\",\"goal\":\"\",\"knowledgeGained\":[]}],\"itemUpdates\":[{\"name\":\"\",\"status\":\"held\",\"holderName\":\"\",\"location\":\"\"}]}; 不得新增正文没有的事实。",
     `${chapter.title}\n${chapter.paragraphs.join("\n")}`,
     30_000,
+    1_500,
   );
+  const parsed = completion.value;
   if (!Array.isArray(parsed.events) || !Array.isArray(parsed.characterUpdates)) {
     throw new Error("抽取模型输出未通过状态 Schema 校验。");
   }
@@ -416,5 +622,19 @@ export async function extractChapterStateWithConnection(
         ? item.knowledgeGained.filter((value): value is string => typeof value === "string").slice(0, 12)
         : [],
     }));
-  return { events, characterUpdates };
+  const itemUpdates = (parsed.itemUpdates ?? [])
+    .filter((item) => item && typeof item.name === "string" && item.name.length > 0 && itemStatuses.has(item.status))
+    .map((item) => ({
+      name: item.name.slice(0, 120),
+      status: item.status,
+      holderName: typeof item.holderName === "string" ? item.holderName.slice(0, 80) : undefined,
+      location: typeof item.location === "string" ? item.location.slice(0, 120) : undefined,
+    }));
+  return {
+    events,
+    characterUpdates,
+    itemUpdates,
+    usageTokens: completion.usageTokens,
+    usageEstimated: completion.usageEstimated,
+  };
 }

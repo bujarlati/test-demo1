@@ -15,6 +15,7 @@ export interface ChapterRevision {
   modelName: string;
   promptVersion: string;
   changeSummary?: string;
+  branchId?: string;
 }
 
 export interface Chapter {
@@ -37,9 +38,27 @@ export interface CharacterProfile {
   location: string;
   goal: string;
   knowledge: string[];
+  knowledgeSources: KnowledgeFact[];
+  inventoryItemIds: string[];
   relationship: string;
   protected: boolean;
   accent: "jade" | "rust" | "gold" | "blue";
+}
+
+export interface KnowledgeFact {
+  fact: string;
+  sourceChapter: number;
+  sourceRevisionId: string;
+}
+
+export interface StoryItem {
+  id: string;
+  name: string;
+  status: "available" | "held" | "lost" | "destroyed" | "consumed";
+  holderCharacterId?: string;
+  location: string;
+  sourceChapter: number;
+  sourceRevisionId: string;
 }
 
 export interface StoryRule {
@@ -71,7 +90,7 @@ export interface ReaderPreference {
 export interface RetconChange {
   chapterNumber: number;
   chapterTitle: string;
-  kind: "required" | "supporting" | "outline";
+  kind: "required" | "supporting" | "outline" | "unchanged";
   summary: string;
   revisionId?: string;
   previousRevisionId?: string;
@@ -79,8 +98,14 @@ export interface RetconChange {
 
 export interface CharacterStateSnapshot {
   characterId: string;
-  before: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role">;
-  after: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role">;
+  before: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role" | "relationship">;
+  after: Pick<CharacterProfile, "status" | "lifecycle" | "location" | "role" | "relationship">;
+}
+
+export interface EventStateSnapshot {
+  eventId: string;
+  before: Pick<StoryEvent, "active" | "title" | "cause" | "outcome" | "revisionId" | "stateEffects">;
+  after: Pick<StoryEvent, "active" | "title" | "cause" | "outcome" | "revisionId" | "stateEffects">;
 }
 
 export interface RetconTransaction {
@@ -99,7 +124,10 @@ export interface RetconTransaction {
   reversesRetconId?: string;
   reversedByRetconId?: string;
   characterSnapshots?: CharacterStateSnapshot[];
+  eventSnapshots?: EventStateSnapshot[];
   preferenceIds?: string[];
+  branchIdBefore?: string;
+  branchIdAfter?: string;
 }
 
 export type ConversationMessageType =
@@ -118,6 +146,29 @@ export interface ConversationMessage {
   observedCanonVersion: number;
   oldCanon?: boolean;
   retconId?: string;
+  branchId?: string;
+  threadId?: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  branchId: string;
+  content: string;
+  sourceMessageIds: string[];
+  fromMessageId: string;
+  toMessageId: string;
+  updatedAt: string;
+  version: number;
+  parentSummaryId: string | null;
+  sourceThreadId: string;
+}
+
+export interface ConversationThread {
+  id: string;
+  branchId: string;
+  summary: ConversationSummary | null;
+  summaries: ConversationSummary[];
+  parentThreadId: string | null;
 }
 
 export interface ReaderMessageContext {
@@ -147,6 +198,30 @@ export interface ReadingProgress {
   chapterId: string;
   scrollProgress: number;
   updatedAt: string;
+  progressVersion: number;
+  activeBranchId: string;
+  canonVersion: number;
+}
+
+export interface StoryBranch {
+  id: string;
+  name: string;
+  basedOnBranchId: string | null;
+  baseCanonVersion: number;
+  headCanonVersion: number;
+  createdAt: string;
+  status: "active" | "superseded";
+  chapterRevisionIds: Record<string, string>;
+  /** Events at or below this sequence are already represented by baseStateSnapshot. */
+  baseEventSequence: number;
+  baseStateSnapshot?: CanonStateSnapshot;
+  stateSnapshot?: CanonStateSnapshot;
+}
+
+export interface CanonStateSnapshot {
+  characters: Array<Pick<CharacterProfile, "id" | "status" | "lifecycle" | "location" | "goal" | "knowledge" | "knowledgeSources" | "relationship" | "role" | "inventoryItemIds">>;
+  items: StoryItem[];
+  clues: StoryClue[];
 }
 
 export interface StoryGene {
@@ -170,6 +245,27 @@ export interface EndingContract {
   lastEvaluatedAt: string;
 }
 
+export interface WorldBible {
+  version: number;
+  organizations: string[];
+  locations: string[];
+  abilityBoundaries: string[];
+  pointOfView: string;
+  styleParameters: string[];
+  sourceRevisionIds: string[];
+}
+
+export interface CanonSummary {
+  id: string;
+  branchId: string;
+  layer: "scene" | "chapter" | "arc" | "book";
+  text: string;
+  fromChapter: number;
+  toChapter: number;
+  sourceRevisionIds: string[];
+  updatedAt: string;
+}
+
 export type StoryEventType =
   | "discovery"
   | "choice"
@@ -191,6 +287,24 @@ export interface StoryEvent {
   dependsOn: string[];
   active: boolean;
   creativeAxis?: string;
+  sequence: number;
+  storyTime: string;
+  branchId: string;
+  originEventId?: string;
+  stateEffects?: {
+    characters?: Array<{
+      characterId: string;
+      status?: string;
+      lifecycle?: CharacterLifecycle;
+      location?: string;
+      goal?: string;
+      relationship?: string;
+      role?: string;
+      knowledgeGained?: KnowledgeFact[];
+    }>;
+    items?: Array<{ itemId: string; status: StoryItem["status"]; holderCharacterId?: string; location: string }>;
+    clues?: Array<{ clueId: string; status: StoryClue["status"] }>;
+  };
 }
 
 export interface Story {
@@ -206,6 +320,7 @@ export interface Story {
   coverTheme: CoverTheme;
   status: StoryStatus;
   activeBranchId: string;
+  branches: StoryBranch[];
   canonVersion: number;
   summary: string;
   latestExcerpt: string;
@@ -214,13 +329,17 @@ export interface Story {
   readingProgress: ReadingProgress;
   storyGene: StoryGene;
   endingContract: EndingContract;
+  worldBible: WorldBible;
+  summaries: CanonSummary[];
   events: StoryEvent[];
   chapters: Chapter[];
   characters: CharacterProfile[];
+  items: StoryItem[];
   rules: StoryRule[];
   clues: StoryClue[];
   preferences: ReaderPreference[];
   conversation: ConversationMessage[];
+  conversationThreads: ConversationThread[];
   proposals: InterventionProposal[];
   retcons: RetconTransaction[];
   modelConnectionId: string | null;
@@ -258,6 +377,8 @@ export interface CapabilitySnapshot {
   jsonSchema: boolean;
   embedding: boolean;
   promptCache: boolean;
+  toolCalling: boolean;
+  maxContextTokens: number | null;
   testedAt: string;
   latencyMs: number;
   models?: string[];
@@ -280,6 +401,7 @@ export interface ModelConnection {
   baseUrl: string;
   maskedKey: string;
   secretRef: string;
+  secretVersion: number;
   status: ModelConnectionStatus;
   routes: ModelRoutes;
   fallbackPolicy: "none" | "same_connection" | "platform_managed";
@@ -301,11 +423,53 @@ export interface GenerationJob {
   promptVersion: string;
   status: "completed" | "running" | "failed";
   tokens: number;
+  tokenBudget?: number;
+  usageEstimated?: boolean;
+  budgetDegraded?: boolean;
   latencyMs: number;
+  firstTokenMs?: number;
   cost: number;
+  costEstimated?: boolean;
   createdAt: string;
   candidateTrace?: NarrativeCandidate[];
   filterSummary?: string;
+  contextTrace?: Array<{
+    component: "canon" | "hard_constraints" | "recent_chapter" | "conversation_summary" | "relevant_messages" | "recent_messages";
+    sourceIds: string[];
+    estimatedTokens: number;
+  }>;
+  acceptedAt?: string;
+  rejectedAt?: string;
+  acceptanceSignal?: "read_through" | "continued_generation" | "reader_intervention";
+  retconId?: string;
+  targetEventId?: string;
+}
+
+export type SafetySurface = "story_input" | "reader_message" | "candidate" | "chapter_output";
+
+export interface SafetyDecision {
+  id: string;
+  actorUserId: string;
+  storyId?: string;
+  surface: SafetySurface;
+  decision: "allowed" | "blocked";
+  categories: string[];
+  contentHash: string;
+  createdAt: string;
+}
+
+export interface ContentReport {
+  id: string;
+  reporterUserId: string;
+  storyId?: string;
+  chapterId?: string;
+  revisionId?: string;
+  safetyDecisionId?: string;
+  reason: string;
+  status: "submitted" | "reviewing" | "resolved" | "appealed";
+  createdAt: string;
+  updatedAt: string;
+  resolutionNote?: string;
 }
 
 export interface NarrativeCandidate {
@@ -320,6 +484,20 @@ export interface NarrativeCandidate {
   score: number;
   status: "selected" | "rejected";
   reasons: string[];
+  participantNames?: string[];
+  storyTime?: string;
+  dependsOnEventIds?: string[];
+  knowledgeClaims?: Array<{ characterName: string; fact: string; sourceRevisionId?: string }>;
+  knowledgeAudit?: {
+    complete: boolean;
+    dependencies: Array<{ characterName: string; fact: string }>;
+  };
+  itemTransitions?: Array<{
+    itemName: string;
+    actorName: string;
+    fromStatus: StoryItem["status"];
+    toStatus: StoryItem["status"];
+  }>;
 }
 
 export interface OpsMetrics {
@@ -327,8 +505,21 @@ export interface OpsMetrics {
   retconSuccessRate: number;
   canonConflictRate: number;
   firstTokenP95: number;
+  firstTokenSampleCount: number;
   acceptedChapterCost: number;
+  acceptedChapterCostEstimated: boolean;
   activeStories: number;
+}
+
+export interface OpsQualityBucket {
+  key: string;
+  model: string;
+  promptVersion: string;
+  genre: string;
+  jobs: number;
+  completed: number;
+  blockedCandidates: number;
+  reports: number;
 }
 
 export interface UserAccount {
@@ -378,8 +569,10 @@ export interface AppStore {
   connections: ModelConnection[];
   jobs: GenerationJob[];
   auditEvents: AuditEvent[];
-  metrics: OpsMetrics;
+  safetyDecisions: SafetyDecision[];
+  contentReports: ContentReport[];
   idempotencyKeys: string[];
+  storyCreationRequests: Array<{ userId: string; idempotencyKey: string; storyId: string; createdAt: string }>;
 }
 
 export interface BootstrapPayload {
@@ -387,6 +580,7 @@ export interface BootstrapPayload {
   stories: StorySummary[];
   activeStoryId: string | null;
   pendingJobs: GenerationJob[];
+  recoverableJobs: GenerationJob[];
 }
 
 export interface AuthPayload {

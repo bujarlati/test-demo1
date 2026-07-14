@@ -13,6 +13,7 @@ export function HistoryPage() {
   const [story, setStory] = useState<Story | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [previewRevisionId, setPreviewRevisionId] = useState<string | null>(null);
   const [rollingBack, setRollingBack] = useState(false);
 
   const load = async () => {
@@ -35,13 +36,25 @@ export function HistoryPage() {
   if (error) return <ErrorState message={error} onRetry={() => void load()} />;
   if (!story) return <LoadingState label="正在读取不可变 Revision 历史…" />;
 
-  const latestRevisions = story.chapters
+  const revisionEntries = story.chapters
     .filter((chapter) => chapter.revisions.length > 1)
-    .flatMap((chapter) => chapter.revisions.slice(1).map((revision) => ({ chapter, revision })))
-    .reverse();
+    .flatMap((chapter) => chapter.revisions.map((revision) => ({ chapter, revision })))
+    .sort((a, b) => Date.parse(b.revision.createdAt) - Date.parse(a.revision.createdAt));
+  const previewEntry = previewRevisionId
+    ? revisionEntries.find(({ revision }) => revision.id === previewRevisionId) ?? null
+    : null;
+  const previewParent = previewEntry?.revision.parentRevisionId
+    ? previewEntry.chapter.revisions.find((revision) => revision.id === previewEntry.revision.parentRevisionId) ?? null
+    : null;
+  const canRollback = Boolean(
+    selected &&
+    selected.kind === "intervention" &&
+    selected.status === "committed" &&
+    selected.canonVersionAfter === story.canonVersion,
+  );
 
   const rollback = async () => {
-    if (!selected || selected.kind !== "intervention" || selected.status !== "committed") return;
+    if (!selected || !canRollback) return;
     setRollingBack(true);
     try {
       const result = await api.rollbackRetcon(story, selected.id);
@@ -80,22 +93,30 @@ export function HistoryPage() {
           ))}
           {story.retcons.length === 0 && <div className="timeline-empty"><ScrollText size={22} /><p>还没有发生修史事务。当前章节均为初始 Revision。</p></div>}
 
-          {latestRevisions.length > 0 && (
+          {revisionEntries.length > 0 && (
             <div className="revision-index">
               <span className="eyebrow">章节 Revision</span>
-              {latestRevisions.map(({ chapter, revision }) => (
-                <div key={revision.id}><small>第 {chapter.number} 章</small><strong>{revision.changeSummary ?? revision.reason}</strong></div>
+              {revisionEntries.map(({ chapter, revision }) => (
+                <button type="button" className={previewRevisionId === revision.id ? "active" : ""} key={revision.id} onClick={() => setPreviewRevisionId(revision.id)}><small>第 {chapter.number} 章 · {revision.id === chapter.currentRevisionId ? "当前" : "历史"}</small><strong>{revision.changeSummary ?? revision.reason}</strong></button>
               ))}
             </div>
           )}
         </aside>
 
         <section className="history-detail">
+          {previewEntry && <section className="revision-reader" aria-label="Revision 正文查看器">
+            <header><div><span className="eyebrow">可读历史版本</span><h2>第 {previewEntry.chapter.number} 章 · {previewEntry.revision.title}</h2><p>{previewEntry.revision.id} · {formatDateTime(previewEntry.revision.createdAt)} · {previewEntry.revision.reason}</p></div><button type="button" className="text-link" onClick={() => setPreviewRevisionId(null)}>关闭正文</button></header>
+            <div className="revision-reader__columns">
+              {previewParent && <article><strong>父 Revision · {previewParent.id}</strong>{previewParent.paragraphs.map((paragraph, index) => <p className={paragraph !== previewEntry.revision.paragraphs[index] ? "changed" : ""} key={`${previewParent.id}-${index}`}>{paragraph}</p>)}</article>}
+              <article><strong>{previewEntry.revision.id === previewEntry.chapter.currentRevisionId ? "当前正史" : "历史 Revision"} · {previewEntry.revision.id}</strong>{previewEntry.revision.paragraphs.map((paragraph, index) => <p className={paragraph !== previewParent?.paragraphs[index] ? "changed" : ""} key={`${previewEntry.revision.id}-${index}`}>{paragraph}</p>)}</article>
+            </div>
+          </section>}
           {selected ? (
             <>
               <div className="history-detail__top">
                 <div><span className={`transaction-status transaction-status--${selected.status}`}><CheckCircle2 size={15} />{selected.kind === "rollback" ? "独立回滚事务" : selected.status === "committed" ? "已提交正史" : "已由回滚事务反转"}</span><h2>{selected.title}</h2><p>{selected.kind === "rollback" ? selected.sourceText : `读者原话：“${selected.sourceText}”`}</p></div>
-                {selected.kind === "intervention" && selected.status === "committed" && <button className="button button--secondary" type="button" onClick={() => void rollback()} disabled={rollingBack}><RotateCcw size={16} />{rollingBack ? "正在回滚" : "恢复旧正史"}</button>}
+                {canRollback && <button className="button button--secondary" type="button" onClick={() => void rollback()} disabled={rollingBack}><RotateCcw size={16} />{rollingBack ? "正在回滚" : "恢复旧正史"}</button>}
+                {selected.kind === "intervention" && selected.status === "committed" && !canRollback && <span className="rollback-lock-note">已有后续正史，不能直接回滚</span>}
               </div>
 
               <div className="impact-summary">
@@ -105,7 +126,7 @@ export function HistoryPage() {
               <div className="change-list">
                 {selected.changes.map((change) => (
                   <article key={`${change.chapterNumber}-${change.kind}`}>
-                    <span className={`change-kind change-kind--${change.kind}`}>{change.kind === "required" ? "必须修改" : change.kind === "supporting" ? "前置补丁" : "后续重规划"}</span>
+                    <span className={`change-kind change-kind--${change.kind}`}>{change.kind === "required" ? "必须修改" : change.kind === "supporting" ? "建议调整" : change.kind === "unchanged" ? "无需修改" : "后续重规划"}</span>
                     <div><small>{change.chapterNumber <= story.chapters.length ? `第 ${change.chapterNumber} 章` : "未来"}</small><h3>{change.chapterTitle}</h3><p>{change.summary}</p></div>
                     {change.revisionId && <span className="revision-id">{change.revisionId}</span>}
                   </article>
@@ -115,8 +136,8 @@ export function HistoryPage() {
               {selected.characterSnapshots && selected.characterSnapshots.length > 0 && <div className="diff-preview">
                 <div className="section-heading"><div><span className="eyebrow">事实差异</span><h3>正史发生了什么变化</h3></div></div>
                 <div className="diff-columns">
-                  <div className="diff-old"><span>v{selected.canonVersionBefore} · 旧正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><del>{character?.name ?? "角色"}：{snapshot.before.status}</del></p><p><del>位置：{snapshot.before.location}</del></p></div>; })}</div>
-                  <div className="diff-new"><span>v{selected.canonVersionAfter} · 新正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><ins>{character?.name ?? "角色"}：{snapshot.after.status}</ins></p><p><ins>位置：{snapshot.after.location}</ins></p></div>; })}</div>
+                  <div className="diff-old"><span>v{selected.canonVersionBefore} · 旧正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><del>{character?.name ?? "角色"}：{snapshot.before.status}</del></p><p><del>位置：{snapshot.before.location}</del></p><p><del>关系：{snapshot.before.relationship}</del></p></div>; })}</div>
+                  <div className="diff-new"><span>v{selected.canonVersionAfter} · 新正史</span>{selected.characterSnapshots.map((snapshot) => { const character = story.characters.find((item) => item.id === snapshot.characterId); return <div key={snapshot.characterId}><p><ins>{character?.name ?? "角色"}：{snapshot.after.status}</ins></p><p><ins>位置：{snapshot.after.location}</ins></p><p><ins>关系：{snapshot.after.relationship}</ins></p></div>; })}</div>
                 </div>
               </div>}
             </>

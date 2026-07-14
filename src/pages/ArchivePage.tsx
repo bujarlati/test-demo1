@@ -1,8 +1,9 @@
-import { ArrowLeft, BookMarked, Eye, EyeOff, Heart, ShieldCheck, Sparkles, UsersRound } from "lucide-react";
+import { Archive, ArrowLeft, BookMarked, Eye, EyeOff, Heart, Pause, Play, ShieldCheck, Sparkles, Trash2, UsersRound } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { ErrorState, LoadingState } from "../components/States";
+import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
 import type { Story } from "../types";
 
@@ -11,6 +12,8 @@ type ArchiveTab = "characters" | "world" | "clues" | "preferences";
 export function ArchivePage() {
   const { storyId = "" } = useParams();
   const toast = useToast();
+  const navigate = useNavigate();
+  const { refresh } = useApp();
   const [story, setStory] = useState<Story | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<ArchiveTab>("characters");
@@ -39,6 +42,41 @@ export function ArchivePage() {
     }
   };
 
+  const togglePreference = async (preferenceId: string, active: boolean) => {
+    try {
+      await api.setPreferenceActive(story.id, preferenceId, active);
+      await load();
+      toast(active ? "约束已恢复，只影响当前故事。" : "约束已暂停，历史记录仍保留。");
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "约束更新失败。", "error");
+    }
+  };
+
+  const deletePreference = async (preferenceId: string) => {
+    try {
+      await api.deletePreference(story.id, preferenceId);
+      await load();
+      toast("约束已从当前故事删除，审计记录仍保留。");
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "约束删除失败。", "error");
+    }
+  };
+
+  const setStoryStatus = async (status: "active" | "paused" | "archived") => {
+    if (status === "archived" && !window.confirm("将这个故事移出书架？正文、正史与版本历史会软归档，不会物理删除。")) return;
+    try {
+      const updated = await api.setStoryStatus(story.id, status);
+      await refresh();
+      if (status === "archived") navigate("/");
+      else {
+        setStory(updated);
+        toast(status === "active" ? "故事已从最新正史恢复连载。" : "故事已暂停；阅读与历史仍可访问。" );
+      }
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "故事状态更新失败。", "error");
+    }
+  };
+
   const tabs: Array<{ id: ArchiveTab; label: string; count: number }> = [
     { id: "characters", label: "人物与关系", count: story.characters.length },
     { id: "world", label: "世界规则", count: story.rules.length },
@@ -55,7 +93,11 @@ export function ArchivePage() {
           <h1>{story.title}</h1>
           <p>{story.summary}</p>
         </div>
-        <Link className="button button--secondary" to={`/story/${story.id}/history`}><BookMarked size={17} /> 版本历史</Link>
+        <div className="archive-heading__actions">
+          <Link className="button button--secondary" to={`/story/${story.id}/history`}><BookMarked size={17} /> 版本历史</Link>
+          {story.status === "paused" ? <button className="button button--secondary" type="button" onClick={() => void setStoryStatus("active")}><Play size={16} /> 恢复连载</button> : <button className="button button--secondary" type="button" onClick={() => void setStoryStatus("paused")}><Pause size={16} /> 暂停连载</button>}
+          <button className="text-link text-link--danger" type="button" onClick={() => void setStoryStatus("archived")}><Archive size={15} /> 移出书架</button>
+        </div>
       </header>
 
       <div className="archive-layout">
@@ -136,6 +178,7 @@ export function ArchivePage() {
                   <article key={preference.id} className={!preference.active ? "inactive" : ""}>
                     <span className={`preference-icon preference-icon--${preference.kind}`}>{preference.kind === "hard" ? <ShieldCheck size={18} /> : <Sparkles size={18} />}</span>
                     <div><div><h3>{preference.label}</h3><span>{preference.kind === "hard" ? "硬约束" : `软偏好 · ${Math.round(preference.confidence * 100)}%`}</span></div><p>{preference.description}</p></div>
+                    <div className="preference-actions"><button type="button" className="text-link" onClick={() => void togglePreference(preference.id, !preference.active)}>{preference.active ? <Pause size={14} /> : <Play size={14} />}{preference.active ? "暂停" : "恢复"}</button><button type="button" className="text-link text-link--danger" onClick={() => void deletePreference(preference.id)}><Trash2 size={14} />删除</button></div>
                   </article>
                 ))}
                 {story.preferences.length === 0 && <div className="inline-empty"><UsersRound size={22} /><p>还没有形成长期偏好。故事会先保持自己的判断。</p></div>}

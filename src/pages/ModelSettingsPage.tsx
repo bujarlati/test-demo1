@@ -9,9 +9,11 @@ import {
   LoaderCircle,
   LockKeyhole,
   Plus,
+  RefreshCw,
   ServerCog,
   ShieldCheck,
   TestTube2,
+  Trash2,
   X,
   Zap,
 } from "lucide-react";
@@ -56,6 +58,7 @@ export function ModelSettingsPage() {
   const [form, setForm] = useState<ModelConnectionInput>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [mutatingId, setMutatingId] = useState<string | null>(null);
 
   const load = async () => {
     try {
@@ -115,6 +118,31 @@ export function ModelSettingsPage() {
     } catch (requestError) { toast(requestError instanceof Error ? requestError.message : "设置失败。", "error"); }
   };
 
+  const rotateSecret = async (connection: ModelConnection) => {
+    const apiKey = window.prompt(`为“${connection.name}”输入新的 API Key。旧版本只供历史审计，不再用于新请求：`);
+    if (!apiKey) return;
+    setMutatingId(connection.id);
+    try {
+      await api.updateConnection(connection.id, { apiKey });
+      toast("密钥已轮换；请重新测试连接后再投入生成。" );
+      await load();
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "密钥轮换失败。", "error");
+    } finally { setMutatingId(null); }
+  };
+
+  const removeConnection = async (connection: ModelConnection) => {
+    if (!window.confirm(`删除“${connection.name}”？引用它的故事会解除绑定，历史作业仍保留连接 ID。`)) return;
+    setMutatingId(connection.id);
+    try {
+      await api.deleteConnection(connection.id);
+      await Promise.all([load(), refreshBootstrap()]);
+      toast("连接与全部密钥版本已删除；历史作业引用已保留。" );
+    } catch (requestError) {
+      toast(requestError instanceof Error ? requestError.message : "连接删除失败。", "error");
+    } finally { setMutatingId(null); }
+  };
+
   if (loading) return <LoadingState label="正在读取模型路由与能力快照…" />;
   if (error) return <ErrorState message={error} onRetry={() => void load()} />;
 
@@ -147,12 +175,15 @@ export function ModelSettingsPage() {
                 <div className="connection-row__capabilities">
                   <span className={capabilities?.streaming ? "supported" : ""}><Zap size={14} /> 流式</span>
                   <span className={capabilities?.jsonSchema ? "supported" : ""}><Activity size={14} /> Schema</span>
+                  <span className={capabilities?.toolCalling ? "supported" : ""}><ServerCog size={14} /> Tool</span>
                   <span className={capabilities?.embedding ? "supported" : ""}><CloudCog size={14} /> Embedding</span>
-                  <small>{capabilities ? `${capabilities.latencyMs}ms · ${formatDateTime(capabilities.testedAt)}` : "尚无能力快照"}</small>
+                  <small>{capabilities ? `${capabilities.latencyMs}ms · ${capabilities.maxContextTokens ? `${Math.round(capabilities.maxContextTokens / 1000)}K 上下文` : "上下文上限未知"} · ${capabilities.promptCache ? "缓存命中" : "未确认缓存"} · ${formatDateTime(capabilities.testedAt)}` : "尚无能力快照"}</small>
                 </div>
                 <div className="connection-row__actions">
                   {!connection.secretRef.startsWith("platform://managed") && <button className="button button--secondary" type="button" onClick={() => void test(connection.id)} disabled={testingId === connection.id}>{testingId === connection.id ? <LoaderCircle className="spin" size={16} /> : <TestTube2 size={16} />}{testingId === connection.id ? "测试中" : "测试连接"}</button>}
+                  {!connection.secretRef.startsWith("platform://managed") && <button className="text-link" type="button" onClick={() => void rotateSecret(connection)} disabled={mutatingId === connection.id}><RefreshCw size={14} /> 轮换密钥</button>}
                   {!isDefault && connection.status === "active" && <button className="text-link" type="button" onClick={() => void setDefault(connection.id)}>设为默认</button>}
+                  {!connection.secretRef.startsWith("platform://managed") && <button className="text-link text-link--danger" type="button" onClick={() => void removeConnection(connection)} disabled={mutatingId === connection.id}><Trash2 size={14} /> 删除连接</button>}
                 </div>
               </article>
             );

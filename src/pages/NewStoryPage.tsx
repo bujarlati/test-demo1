@@ -1,5 +1,5 @@
 import { ArrowLeft, ArrowRight, Check, Dices, LoaderCircle, Sparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { BookCover } from "../components/BookCover";
@@ -38,6 +38,7 @@ export function NewStoryPage() {
   const [inspiration, setInspiration] = useState("");
   const [creating, setCreating] = useState(false);
   const [stage, setStage] = useState(0);
+  const creationIdempotencyKey = useRef(crypto.randomUUID());
 
   const preview = useMemo(
     () => ({ title: titleByGenre[genre], theme: themeByGenre[genre] }),
@@ -56,7 +57,7 @@ export function NewStoryPage() {
     setStage(0);
     const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 420);
     try {
-      const story = await api.createStory({ genre, tone, length, inspiration });
+      const story = await api.createStory({ genre, tone, length, inspiration }, creationIdempotencyKey.current);
       await refresh();
       toast("第一章已经写好，故事开始了。");
       navigate(`/story/${story.id}`);
