@@ -72,6 +72,9 @@ export function ModelSettingsPage() {
       setLoading(false);
     }
   };
+  const refreshConnections = async () => {
+    await Promise.all([load(), refreshBootstrap()]);
+  };
   useEffect(() => { void load(); }, []);
 
   const submit = async (event: FormEvent) => {
@@ -92,7 +95,7 @@ export function ModelSettingsPage() {
     try {
       const connection = await api.createConnection(form);
       toast("连接已安全保存。通过测试后才能用于生成。" );
-      setForm(emptyForm); setShowForm(false); await load();
+      setForm(emptyForm); setShowForm(false); await refreshConnections();
       window.setTimeout(() => document.getElementById(`connection-${connection.id}`)?.focus(), 0);
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "保存失败。", "error");
@@ -106,7 +109,7 @@ export function ModelSettingsPage() {
       toast("连接与认证测试通过，能力快照已更新。" );
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "连接测试失败。", "error");
-    } finally { setTestingId(null); await load(); }
+    } finally { setTestingId(null); await refreshConnections(); }
   };
 
   const setDefault = async (connectionId: string) => {
@@ -125,7 +128,7 @@ export function ModelSettingsPage() {
     try {
       await api.updateConnection(connection.id, { apiKey });
       toast("密钥已轮换；请重新测试连接后再投入生成。" );
-      await load();
+      await refreshConnections();
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "密钥轮换失败。", "error");
     } finally { setMutatingId(null); }
@@ -136,7 +139,7 @@ export function ModelSettingsPage() {
     setMutatingId(connection.id);
     try {
       await api.deleteConnection(connection.id);
-      await Promise.all([load(), refreshBootstrap()]);
+      await refreshConnections();
       toast("连接与全部密钥版本已删除；历史作业引用已保留。" );
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "连接删除失败。", "error");

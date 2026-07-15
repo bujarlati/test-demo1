@@ -120,8 +120,8 @@ const profiles: Record<StoryGenre, NarrativeGenreProfile> = {
   },
   系统流: {
     mode: "speculative",
-    titles: ["系统拒绝结算", "任务栏之外", "奖励已撤回", "权限不足的人生"], names: ["陈序", "唐未", "陆衡", "苏简"],
-    protagonistPosition: "绑定了故障成长系统、却拒绝按标准答案生活的普通青年", visibleGoal: "完成必要任务并查清系统选择宿主的真实目的", hiddenNeed: "摆脱用奖励衡量自我价值的习惯", conflictEngine: "系统任务、奖励与隐藏权限会随宿主选择发生可追溯变化", recurringCost: "领取越高等级奖励，自主选择权与现实关系越受系统干预", endingShape: "主角夺回最高权限，关闭强制任务并保留真正学会的能力", creativeAxes: ["系统任务", "奖励陷阱", "属性成长", "权限反制", "宿主选择"],
+    titles: ["系统已连接", "任务栏之外", "奖励到账", "权限开启时"], names: ["陈序", "唐未", "陆衡", "苏简"],
+    protagonistPosition: "意外绑定成长系统、能够主动选择任务方向的普通青年", visibleGoal: "利用系统能力改变处境，并逐步理解能力能够影响的世界范围", hiddenNeed: "建立由自己选择的长期目标，而不是只追逐眼前数值", conflictEngine: "触发条件、系统反馈、即时奖励与权限解锁持续改变主角行动和世界反应", recurringCost: "能力与影响范围越大，需要处理的目标、关系和秩序选择越复杂，但已获得能力不会被随意收回", endingShape: "主角掌握最高权限，让系统成为实现自我目标的稳定工具", creativeAxes: ["系统任务", "即时奖励", "属性成长", "权限解锁", "世界反馈"],
   },
   宫斗宅斗: {
     mode: "historical",

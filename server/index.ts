@@ -11,6 +11,8 @@ import {
   extractChapterStateWithConnection,
   generateCandidateDraftsWithConnection,
   generateChapterWithConnection,
+  generateStoryOpeningWithConnection,
+  estimateChapterWriterInputTokenBudget,
   streamChapterWithConnection,
   testConnection,
 } from "./modelGateway";
@@ -27,11 +29,19 @@ import { handleReaderMessage, rollbackRetcon } from "./retconService";
 import { loadStore, saveStore } from "./storage";
 import {
   commitNextChapter,
-  createStory,
   finalizeStoryIfTargetReached,
   summarizeStory,
   toggleCharacterProtection,
 } from "./storyService";
+import { createStoryWithOpening, storyOpeningPublicationText } from "./openingService";
+import { accessibleConnectionOrThrow, isManagedLocalConnection, listGenerationModelOptions } from "./modelConnectionAccess";
+import {
+  assertGenerationTokenBudget,
+  CHAPTER_EXTRACTION_ADMISSION_RESERVE,
+  CONTINUATION_JOB_TOKEN_BUDGET as JOB_TOKEN_BUDGET,
+  OPENING_JOB_TOKEN_BUDGET,
+} from "./generationBudget";
+import { accumulateModelUsage, recordFailedJobUsage } from "./modelUsage";
 import { deleteSecrets, storeSecret } from "./vault";
 import { assertSafetyAllowed, recordSafetyDecision, safetyCategories } from "./safetyService";
 
@@ -54,7 +64,6 @@ const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(currentDirectory, "..");
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const JOB_TOKEN_BUDGET = 12_000;
 const USER_DAILY_TOKEN_BUDGET = 120_000;
 const STORY_DAILY_TOKEN_BUDGET = 60_000;
 
@@ -94,15 +103,7 @@ function storyIndexOrThrow(id: string) {
 }
 
 function connectionOrThrow(id: string, user: UserAccount) {
-  const connection = store.connections.find(
-    (item) => item.id === id && (item.ownerScope === "platform" || item.ownerId === user.id),
-  );
-  if (!connection) {
-    const error = new Error("模型连接不存在或无权访问。");
-    Object.assign(error, { status: 404 });
-    throw error;
-  }
-  return connection;
+  return accessibleConnectionOrThrow(store, id, user);
 }
 
 function assertCanonCommand(
@@ -155,17 +156,16 @@ function mergeConcurrentReaderState(next: Story, baseline: Story, current: Story
   }
 }
 
-function assertTokenBudget(userId: string, storyId: string) {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1_000;
-  const recent = store.jobs.filter((job) => Date.parse(job.createdAt) >= cutoff);
-  const reserved = (job: GenerationJob) => job.status === "running" ? (job.tokenBudget ?? JOB_TOKEN_BUDGET) : job.tokens;
-  const userTokens = recent.filter((job) => job.ownerId === userId).reduce((total, job) => total + reserved(job), 0);
-  const storyTokens = recent.filter((job) => job.storyId === storyId).reduce((total, job) => total + reserved(job), 0);
-  if (userTokens + JOB_TOKEN_BUDGET > USER_DAILY_TOKEN_BUDGET || storyTokens + JOB_TOKEN_BUDGET > STORY_DAILY_TOKEN_BUDGET) {
-    const error = new Error("已达到 24 小时生成预算上限。正史不受影响，请稍后再试。");
-    Object.assign(error, { status: 429 });
-    throw error;
-  }
+function assertTokenBudget(userId: string, storyId: string, requestedBudget = JOB_TOKEN_BUDGET) {
+  assertGenerationTokenBudget({
+    jobs: store.jobs,
+    userId,
+    storyId,
+    requestedBudget,
+    defaultRunningBudget: JOB_TOKEN_BUDGET,
+    userLimit: USER_DAILY_TOKEN_BUDGET,
+    storyLimit: STORY_DAILY_TOKEN_BUDGET,
+  });
 }
 
 function calculateOpsMetrics(): OpsMetrics {
@@ -246,6 +246,7 @@ const createStorySchema = z.object({
   tone: z.string().max(40).refine(isStoryTone, { message: "阅读基调需要由两个简短词语组成。" }).optional(),
   lengthPlan: z.enum(storyLengthPlanValues).optional(),
   inspiration: z.string().max(180).optional(),
+  modelConnectionId: z.string().min(1).max(120).optional(),
   idempotencyKey: z.string().min(8).max(120).optional(),
 });
 
@@ -311,6 +312,7 @@ app.get("/api/bootstrap", (_request, response) => {
       .filter((story) => story.ownerId === user.id && story.status !== "archived")
       .map(summarizeStory)
       .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    modelConnections: listGenerationModelOptions(store, user),
     activeStoryId: user.activeStoryId,
     pendingJobs: store.jobs.filter((job) => job.ownerId === user.id && job.status === "running"),
     recoverableJobs: store.jobs.filter(
@@ -348,6 +350,19 @@ app.post("/api/stories", async (request, response) => {
   audit(store, user.id, `safety.${safety.decision}`, "story", "new-story", { surface: safety.surface });
   await persist();
   assertSafetyAllowed(safety);
+  const connectionId = input.modelConnectionId ?? user.defaultConnectionId;
+  const connection = connectionOrThrow(connectionId, user);
+  if (connection.status !== "active") {
+    const error = new Error(`模型连接当前为 ${connection.status}，请先完成连接测试；不会静默切换模型。`);
+    Object.assign(error, { status: 409 });
+    throw error;
+  }
+  if (isManagedLocalConnection(connection)) {
+    const error = new Error("平台托管连接尚未配置真实生成模型，请选择一个已测试的自定义模型连接。");
+    Object.assign(error, { status: 409 });
+    throw error;
+  }
+  assertTokenBudget(user.id, `opening_${user.id}`, OPENING_JOB_TOKEN_BUDGET);
   const reservation = reserveIdempotencyKey(user.id, idempotencyKey);
   if (reservation.duplicate) {
     const duplicateRequest = store.storyCreationRequests.find((item) => item.userId === user.id && item.idempotencyKey === idempotencyKey);
@@ -359,15 +374,112 @@ app.post("/api/stories", async (request, response) => {
     response.status(409).json({ message: "相同开书请求正在提交，请安全重试同一幂等键。" });
     return;
   }
-  const story = createStory(input, user.id);
-  story.modelConnectionId = user.defaultConnectionId;
-  store.stories.unshift(story);
-  user.activeStoryId = story.id;
-  store.storyCreationRequests.push({ userId: user.id, idempotencyKey, storyId: story.id, createdAt: new Date().toISOString() });
-  store.storyCreationRequests = store.storyCreationRequests.slice(-500);
-  audit(store, user.id, "story.create", "story", story.id, { genre: story.genre });
+  const startedAt = performance.now();
+  const job: GenerationJob = {
+    id: `job_${randomUUID().slice(0, 8)}`,
+    ownerId: user.id,
+    storyId: `opening_pending_${randomUUID().slice(0, 8)}`,
+    idempotencyKey,
+    storyTitle: "正在生成新故事",
+    chapterNumber: 1,
+    task: "opening",
+    model: connection.routes.writer,
+    connectionId: connection.id,
+    promptVersion: "opening-v1",
+    status: "running",
+    tokens: 0,
+    tokenBudget: OPENING_JOB_TOKEN_BUDGET,
+    usageEstimated: true,
+    latencyMs: 0,
+    cost: 0,
+    costEstimated: true,
+    createdAt: new Date().toISOString(),
+    filterSummary: "规划两个阅读体验并生成第一章。",
+  };
+  store.jobs.unshift(job);
   await persist();
-  response.status(201).json(story);
+  let openingUsageTokens = 0;
+  let openingUsageEstimated = false;
+  try {
+    const story = await createStoryWithOpening(
+      input,
+      user.id,
+      connection,
+      (context, selectedConnection) => generateStoryOpeningWithConnection(
+        context,
+        selectedConnection,
+        undefined,
+        OPENING_JOB_TOKEN_BUDGET,
+      ),
+      (generated) => {
+        openingUsageTokens = generated.usageTokens;
+        openingUsageEstimated = generated.usageEstimated;
+        if (openingUsageTokens > OPENING_JOB_TOKEN_BUDGET) {
+          throw new Error(`开篇生成使用 ${openingUsageTokens} Token，超过 ${OPENING_JOB_TOKEN_BUDGET} Token 作业上限，故事未创建。`);
+        }
+      },
+      (candidateStory) => {
+        const outputSafety = recordSafetyDecision(
+          store,
+          user.id,
+          "chapter_output",
+          storyOpeningPublicationText(candidateStory),
+          candidateStory.id,
+        );
+        assertSafetyAllowed(outputSafety);
+      },
+    );
+    const estimatedTokens = Math.ceil(story.chapters[0].revisions[0].paragraphs.join("\n").length / 2);
+    const billedTokens = openingUsageTokens || estimatedTokens;
+    Object.assign(job, {
+      storyId: story.id,
+      storyTitle: story.title,
+      status: "completed" as const,
+      tokens: billedTokens,
+      usageEstimated: openingUsageTokens ? openingUsageEstimated : true,
+      latencyMs: Math.round(performance.now() - startedAt),
+      firstTokenMs: Math.round(performance.now() - startedAt),
+      cost: Number(((billedTokens / 1_000_000) * 1.2).toFixed(4)),
+      filterSummary: "规划、正文与双体验证据检查均已通过。",
+    });
+    const previousActiveStoryId = user.activeStoryId;
+    store.stories.unshift(story);
+    user.activeStoryId = story.id;
+    store.storyCreationRequests.push({ userId: user.id, idempotencyKey, storyId: story.id, createdAt: new Date().toISOString() });
+    store.storyCreationRequests = store.storyCreationRequests.slice(-500);
+    audit(store, user.id, "story.create", "story", story.id, {
+      genre: story.genre,
+      connectionId: connection.id,
+      planner: connection.routes.planner,
+      writer: connection.routes.writer,
+    });
+    try {
+      await persist();
+    } catch (persistError) {
+      store.stories = store.stories.filter((item) => item.id !== story.id);
+      store.storyCreationRequests = store.storyCreationRequests.filter((item) => !(item.userId === user.id && item.idempotencyKey === idempotencyKey));
+      user.activeStoryId = previousActiveStoryId;
+      throw persistError;
+    }
+    response.status(201).json(story);
+  } catch (error) {
+    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    recordFailedJobUsage(job, error, {
+      tokens: openingUsageTokens,
+      estimated: openingUsageEstimated,
+      costPerMillion: 1.2,
+    });
+    Object.assign(job, {
+      status: "failed" as const,
+      latencyMs: Math.round(performance.now() - startedAt),
+      filterSummary: `${error instanceof Error ? error.message : "开篇生成失败"}；故事未创建，可以安全重试。`,
+    });
+    await persist();
+    if (error instanceof Error && !("status" in error)) {
+      Object.assign(error, { status: /体验|沉浸|Schema|第一章|开篇/.test(error.message) ? 422 : 502 });
+    }
+    throw error;
+  }
 });
 
 interface GenerationResult {
@@ -475,7 +587,7 @@ async function generateChapter(
   let streamedParagraphCount = 0;
   let firstTokenMs: number | undefined;
   let effectiveConnection = connection;
-  let isManagedLocal = connection.secretRef.startsWith("platform://managed");
+  let isManagedLocal = isManagedLocalConnection(connection);
   try {
     await persist();
     emit("stage", { stage: 0, label: "组装当前正史与相关记忆" });
@@ -483,9 +595,17 @@ async function generateChapter(
       plan = undefined;
       generated = undefined;
       extracted = undefined;
+      if (usedTokens >= JOB_TOKEN_BUDGET) {
+        throw new Error("前序模型调用已耗尽本次 Token 预算，未继续启动回退调用。");
+      }
       const candidateBatch = isManagedLocal
         ? undefined
-        : await generateCandidateDraftsWithConnection(effectiveConnection, story);
+        : await generateCandidateDraftsWithConnection(
+          effectiveConnection,
+          story,
+          undefined,
+          JOB_TOKEN_BUDGET - usedTokens,
+        );
       if (candidateBatch) {
         usedTokens += candidateBatch.usageTokens;
         usageEstimated ||= candidateBatch.usageEstimated;
@@ -511,56 +631,108 @@ async function generateChapter(
       }
       emit("stage", { stage: 1, label: `生成 ${plan.candidates.length} 个短剧情胶囊` });
       emit("stage", { stage: 2, label: plan.filterSummary });
-      const prompt = buildChapterPrompt(story, plan);
-      const promptTokenEstimate = Math.ceil(prompt.length / 2);
-      const writerTokenBudget = Math.min(6_500, JOB_TOKEN_BUDGET - usedTokens - promptTokenEstimate - 1_500);
-      if (!isManagedLocal && writerTokenBudget < 2_000) {
-        throw new Error("候选与上下文已接近 Token 上限，未启动正文调用；可以缩短章节后重试。");
-      }
-      if (isManagedLocal) {
-        generated = generateLocalChapter(story, plan);
-      } else if (effectiveConnection.capabilities?.streaming) {
-        generated = await streamChapterWithConnection(
-          effectiveConnection,
-          prompt,
-          (paragraph, index, title) => {
-            if (safetyCategories(paragraph).length > 0) {
-              const decision = recordSafetyDecision(store, user.id, "chapter_output", paragraph, story.id);
-              streamedParagraphCount = 0;
-              emit("reset_draft", { reason: "流式正文触发安全策略，草稿已撤回且不会提交正史。" });
-              assertSafetyAllowed(decision);
-            }
-            streamedParagraphCount = index + 1;
-            firstTokenMs ??= Math.round(performance.now() - startedAt);
-            emit("paragraph", { index, title, paragraph });
-          },
-          writerTokenBudget,
-        );
-      } else {
-        generated = await generateChapterWithConnection(effectiveConnection, prompt, writerTokenBudget);
-      }
-      if (isManagedLocal) {
-        usedTokens += Math.ceil(generated.paragraphs.join("\n").length / 2);
-        usageEstimated = true;
-      } else {
-        usedTokens += generated.usageTokens ?? 0;
-        usageEstimated ||= generated.usageEstimated ?? true;
-      }
-      const extractionInputEstimate = Math.ceil((generated.title.length + generated.paragraphs.join("\n").length) / 2);
-      const isTerminalPlannedChapter = story.chapters.length + 1 >= story.targetChapterCount;
-      if (!isManagedLocal && (isTerminalPlannedChapter || usedTokens + extractionInputEstimate + 1_500 <= JOB_TOKEN_BUDGET)) {
-        extracted = await extractChapterStateWithConnection(effectiveConnection, generated, isTerminalPlannedChapter ? story.endingContract : undefined);
-        usedTokens += extracted.usageTokens ?? 0;
-        usageEstimated ||= extracted.usageEstimated ?? true;
-      } else if (!isManagedLocal) {
+      const basePrompt = buildChapterPrompt(story, plan);
+      const maxQualityAttempts = isManagedLocal ? 1 : 2;
+      let qualityFailure: unknown;
+      for (let qualityAttempt = 1; qualityAttempt <= maxQualityAttempts; qualityAttempt += 1) {
+        generated = undefined;
         extracted = undefined;
-        budgetDegraded = true;
+        const prompt = qualityAttempt === 1
+          ? basePrompt
+          : `${basePrompt}\n上一次正文没有同时通过双阅读体验证据与沉浸感检查，请彻底重写，不要解释，也不要在正文提到检查过程。失败原因：${qualityFailure instanceof Error ? qualityFailure.message : "质量证据不足"}`;
+        const writerInputBudget = estimateChapterWriterInputTokenBudget(
+          prompt,
+          Boolean(effectiveConnection.capabilities?.streaming),
+        );
+        const writerTokenBudget = Math.min(
+          6_500,
+          Math.floor(JOB_TOKEN_BUDGET - usedTokens - writerInputBudget - CHAPTER_EXTRACTION_ADMISSION_RESERVE),
+        );
+        if (!isManagedLocal && writerTokenBudget < 2_000) {
+          throw new Error("候选与上下文已接近 Token 上限，未启动正文调用；可以缩短章节后重试。");
+        }
+        if (isManagedLocal) {
+          generated = generateLocalChapter(story, plan);
+        } else if (effectiveConnection.capabilities?.streaming) {
+          generated = await streamChapterWithConnection(
+            effectiveConnection,
+            prompt,
+            (paragraph, index, title) => {
+              if (safetyCategories(paragraph).length > 0) {
+                const decision = recordSafetyDecision(store, user.id, "chapter_output", paragraph, story.id);
+                streamedParagraphCount = 0;
+                emit("reset_draft", { reason: "流式正文触发安全策略，草稿已撤回且不会提交正史。" });
+                assertSafetyAllowed(decision);
+              }
+              streamedParagraphCount = index + 1;
+              firstTokenMs ??= Math.round(performance.now() - startedAt);
+              emit("paragraph", { index, title, paragraph });
+            },
+            writerTokenBudget,
+            undefined,
+            JOB_TOKEN_BUDGET - usedTokens,
+          );
+        } else {
+          generated = await generateChapterWithConnection(
+            effectiveConnection,
+            prompt,
+            writerTokenBudget,
+            undefined,
+            JOB_TOKEN_BUDGET - usedTokens,
+          );
+        }
+        if (isManagedLocal) {
+          usedTokens += Math.ceil(generated.paragraphs.join("\n").length / 2);
+          usageEstimated = true;
+        } else {
+          usedTokens += generated.usageTokens ?? 0;
+          usageEstimated ||= generated.usageEstimated ?? true;
+        }
+        const isTerminalPlannedChapter = story.chapters.length + 1 >= story.targetChapterCount;
+        if (!isManagedLocal) {
+          extracted = await extractChapterStateWithConnection(
+            effectiveConnection,
+            generated,
+            isTerminalPlannedChapter ? story.endingContract : undefined,
+            story.readingExperience,
+            undefined,
+            JOB_TOKEN_BUDGET - usedTokens,
+          );
+          usedTokens += extracted.usageTokens ?? 0;
+          usageEstimated ||= extracted.usageEstimated ?? true;
+        }
+        if (usedTokens > JOB_TOKEN_BUDGET) throw new Error(`本次作业超过 ${JOB_TOKEN_BUDGET.toLocaleString("en-US")} Token 上限，未提交正史。`);
+        try {
+          validateGeneratedChapter(story, generated, plan, extracted);
+          qualityFailure = undefined;
+          break;
+        } catch (validationError) {
+          qualityFailure = validationError;
+          if (qualityAttempt >= maxQualityAttempts) throw validationError;
+          if (streamedParagraphCount > 0) {
+            streamedParagraphCount = 0;
+            emit("reset_draft", { reason: "正文未同时兑现两个阅读体验，已自动撤回并重写。" });
+          }
+          audit(store, user.id, "generation.quality-rewrite", "generation", story.id, {
+            attempt: qualityAttempt,
+            reason: validationError instanceof Error ? validationError.message : "quality validation failed",
+          });
+        }
       }
-      if (usedTokens > JOB_TOKEN_BUDGET) throw new Error("本次作业超过 12,000 Token 上限，未提交正史。");
-      validateGeneratedChapter(story, generated, plan, extracted);
+      if (qualityFailure) throw qualityFailure;
+    };
+    const runGenerationPipelineWithUsage = async () => {
+      try {
+        await runGenerationPipeline();
+      } catch (error) {
+        const accumulated = accumulateModelUsage({ tokens: usedTokens, estimated: usageEstimated }, error);
+        usedTokens = accumulated.tokens;
+        usageEstimated = accumulated.estimated;
+        throw error;
+      }
     };
     try {
-      await runGenerationPipeline();
+      await runGenerationPipelineWithUsage();
     } catch (routeError) {
       if (routeError instanceof Error && "status" in routeError && routeError.status === 422) throw routeError;
       if (connection.fallbackPolicy === "none") throw routeError;
@@ -590,7 +762,7 @@ async function generateChapter(
         toConnectionId: effectiveConnection.id,
         policy: connection.fallbackPolicy,
       });
-      await runGenerationPipeline();
+      await runGenerationPipelineWithUsage();
     }
     if (!plan || !generated) throw new Error("生成管线没有产生可提交的章节。");
     const outputSafety = recordSafetyDecision(
@@ -1111,7 +1283,7 @@ app.post("/api/model-connections", requireAdmin, async (request, response) => {
 app.patch("/api/model-connections/:connectionId", requireAdmin, async (request, response) => {
   const user = currentUser(response);
   const connection = connectionOrThrow(String(request.params.connectionId), user);
-  if (connection.secretRef.startsWith("platform://managed")) {
+  if (isManagedLocalConnection(connection)) {
     response.status(409).json({ message: "平台托管连接由部署配置维护，不能在此轮换。" });
     return;
   }
@@ -1147,7 +1319,7 @@ app.patch("/api/model-connections/:connectionId", requireAdmin, async (request, 
 app.delete("/api/model-connections/:connectionId", requireAdmin, async (request, response) => {
   const user = currentUser(response);
   const connection = connectionOrThrow(String(request.params.connectionId), user);
-  if (connection.secretRef.startsWith("platform://managed")) {
+  if (isManagedLocalConnection(connection)) {
     response.status(409).json({ message: "平台托管连接不能删除。" });
     return;
   }
@@ -1164,7 +1336,7 @@ app.delete("/api/model-connections/:connectionId", requireAdmin, async (request,
 app.post("/api/model-connections/:connectionId/test", requireAdmin, async (request, response) => {
   const user = currentUser(response);
   const connection = connectionOrThrow(String(request.params.connectionId), user);
-  if (connection.secretRef.startsWith("platform://managed")) {
+  if (isManagedLocalConnection(connection)) {
     response.json(connection);
     return;
   }

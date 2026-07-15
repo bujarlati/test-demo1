@@ -7,6 +7,7 @@ import type {
   Story,
 } from "../src/types";
 import { captureCanonState } from "./canonState";
+import { createReadingExperienceContract } from "./readingExperience";
 
 const now = "2026-07-14T10:12:00+08:00";
 const demoOwnerId = "user_demo";
@@ -225,6 +226,7 @@ function compactStory(
       activeBranchId: `branch_${id}_main`,
       canonVersion: chapterTitles.length,
     },
+    readingExperience: createReadingExperienceContract({ tone, genre, createdAt: now }),
     ...storyMemory(title, genre),
     worldBible: {
       version: 1,
@@ -242,14 +244,14 @@ function compactStory(
       revisionId: item.currentRevisionId,
       type: "discovery" as const,
       title: item.title,
-      cause: item.number === 1 ? "主角遇见异常" : "上一章留下的未解线索",
-      outcome: `第 ${item.number} 章产生一条可继续追查的事实`,
+      cause: item.number === 1 ? "主角遇见异常" : "尚未查明的异常痕迹仍在现场",
+      outcome: "现场新增一条可继续追查的事实",
       participantIds: [],
       location: "故事当前场景",
       dependsOn: item.number === 1 ? [] : [`event_${id}_${item.number - 1}`],
       active: true,
       sequence: item.number,
-      storyTime: `第${item.number}章·场景1`,
+      storyTime: `事件序列${item.number}·场景1`,
       branchId: `branch_${id}_main`,
     })),
     chapters,
@@ -302,6 +304,7 @@ export function createSeedStore(): AppStore {
       activeBranchId: "branch_black_main",
       canonVersion: 24,
     },
+    readingExperience: createReadingExperienceContract({ tone: "冷冽 · 克制", genre: "悬疑", createdAt: now }),
     storyGene: {
       version: 3,
       protagonistPosition: "被王室抹去血统的海底城执法官",
@@ -344,7 +347,7 @@ export function createSeedStore(): AppStore {
       dependsOn: item.number === 1 ? [] : [item.number === 18 ? "event_black_17" : `event_black_${item.number - 1}`],
       active: true,
       sequence: item.number,
-      storyTime: `第${item.number}章·场景1`,
+      storyTime: `事件序列${item.number}·场景1`,
       branchId: "branch_black_main",
     })),
     chapters: blackTideChapters,

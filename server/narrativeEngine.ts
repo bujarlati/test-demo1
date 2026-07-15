@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   EndingResolution,
   NarrativeCandidate,
+  ReadingExperienceContract,
+  ReadingExperienceEvidence,
+  ReadingExperienceSignal,
   Story,
   StoryEvent,
 } from "../src/types";
@@ -9,14 +12,26 @@ import { CHAPTER_LENGTH_PRESETS, type ChapterLengthMode } from "../src/storyConf
 import { currentRevision } from "../src/storyDomain";
 import { safetyCategories } from "./safetyService";
 import { candidateKitForGenre, sceneKitForGenre } from "./genreProfiles";
+import {
+  deriveSignalEvidenceAnchors,
+  formatReadingExperienceForPrompt,
+  hasIndependentSignalEvidenceAnchors,
+  isSystemInvincibleExperience,
+  usesExperienceWordAsLiteralLabel,
+} from "./readingExperience";
+import { assertImmersiveNarration, immerseAuthorFacingProse } from "./narrationPolicy";
+
+export { assertImmersiveNarration } from "./narrationPolicy";
 
 export interface GeneratedChapter {
   title: string;
   paragraphs: string[];
   model: string;
+  origin?: "local" | "model";
   usageTokens?: number;
   usageEstimated?: boolean;
   endingResolution?: EndingResolution;
+  experienceEvidence?: ReadingExperienceEvidence[];
 }
 
 export interface RetrievedMemory {
@@ -47,6 +62,529 @@ export interface StoryArcPhase {
   chapterInVolume: number;
   volumeChapterCount: number;
   guidance: string;
+}
+
+export interface ReadingExperienceValidationContext {
+  protagonistNames?: string[];
+  opening?: boolean;
+  chapterNumber?: number;
+  priorPersistentFacts?: string[];
+}
+
+function isNegatedPrefix(prefix: string): boolean {
+  return /(?:不|不会|绝不|绝非|绝不会|并非|并未|不是|不存在|绝无|从未|从不|未曾|不曾|永不|无需|避免|没有|无法|未能|没能|无人能|无人能够|没人能|没有人能|没有人能够|谁也不可能|不可能|扬言要|声称要|宣称要|试图|企图|计划|打算|没有被|并未被|未曾被|不曾被)$/.test(prefix.trim());
+}
+
+function hasUnnegatedTerm(content: string, terms: string[]): boolean {
+  return terms.some((term) => {
+    let index = content.indexOf(term);
+    while (index >= 0) {
+      const prefix = content.slice(Math.max(0, index - 24), index);
+      if (!isNegatedPrefix(prefix)) return true;
+      index = content.indexOf(term, index + term.length);
+    }
+    return false;
+  });
+}
+
+function hasUnnegatedCapturedTerm(content: string, pattern: RegExp): boolean {
+  for (const match of content.matchAll(pattern)) {
+    const term = match[1];
+    const matchText = match[0];
+    const termIndex = matchText.lastIndexOf(term);
+    const absoluteTermIndex = (match.index ?? 0) + termIndex;
+    const prefix = content.slice(Math.max(0, absoluteTermIndex - 30), absoluteTermIndex);
+    if (!isNegatedPrefix(prefix)) return true;
+  }
+  return false;
+}
+
+function protagonistSubjectPattern(context: ReadingExperienceValidationContext): string {
+  const names = (context.protagonistNames ?? [])
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const explicitNames = Array.from(new Set(names.flatMap((name) => {
+    if (/^(?:主角|宿主)/.test(name)) return [name];
+    return [name, `主角${name}`, `宿主${name}`];
+  })))
+    .sort((left, right) => right.length - left.length)
+    .map(escapeRegExp);
+  const commonSurname = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜谢邹苏潘葛范彭鲁韦马苗方俞任袁柳鲍史唐费岑薛雷贺倪汤滕殷罗毕郝邬安常乐于傅齐康伍余顾孟平黄穆萧尹姚邵汪毛米贝戴宋庞熊纪舒屈项祝董梁杜阮蓝席季麻强贾路江童颜郭梅盛林钟徐邱骆高夏蔡田樊胡霍万卢莫房裘解丁邓洪包左石崔龚程邢裴陆荣翁羊惠甄曲家封储靳段富巫乌焦巴牧谷车侯全班仰秋仲伊宫宁仇栾甘厉戎祖武符刘景詹龙叶司黎白怀蒲鄂索咸赖卓蔺屠蒙池乔谭姬申冉宰桑桂牛通燕尚农温庄晏柴瞿阎慕连茹习艾鱼容向古易慎廖庾居衡步都耿满弘匡国文寇广欧沃利蔚越隆师巩聂晁勾敖融冷辛阚那简饶曾沙鞠丰巢关查游竺权盖桓公";
+  const compoundSurname = "(?:欧阳|上官|司马|诸葛|东方|皇甫|尉迟|公孙|慕容|宇文|长孙|令狐|轩辕|夏侯|南宫|独孤|百里|东郭|西门)";
+  const inferredNamedLead = `(?:主角|宿主)(?:${compoundSurname}[\\u3400-\\u9fff]{1,2}|[${commonSurname}][\\u3400-\\u9fff]{1,2})`;
+  return `(?:${[...explicitNames, inferredNamedLead, "主角", "宿主"].join("|")})`;
+}
+
+function protagonistActorPattern(context: ReadingExperienceValidationContext): string {
+  const nonProtagonistPossession = "(?:师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡)";
+  return `${protagonistSubjectPattern(context)}(?![\\u3400-\\u9fff]{0,8}的${nonProtagonistPossession})`;
+}
+
+function protagonistIdentityPattern(context: ReadingExperienceValidationContext): string {
+  const subjectParts = ["主角", ...(context.protagonistNames ?? [])]
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .map(escapeRegExp);
+  return `(?:${Array.from(new Set(subjectParts)).join("|")})`;
+}
+
+const systemFailureTermSource = "(?:故障|失灵|离线|休眠|崩溃|宕机|死机|卡死|断开连接|停摆|罢工|损坏|报废|作废|失效|禁用|停用|瘫痪|打不开|点不动|点不了|无法登录|无法启动|不能启动|无法使用|不可使用|停止响应|不再响应|没有响应|毫无响应|不会给出反馈|不再给出反馈|不给出反馈|拒绝结算|拒绝发放|奖励撤回|撤回奖励|收回奖励|长期权限不足|解绑|解除绑定|绑定解除|脱离绑定|自毁|永久关闭|彻底关闭|彻底消失|不复存在)";
+
+function hasUnnegatedSystemFailure(content: string): boolean {
+  const failures = new RegExp(systemFailureTermSource, "g");
+  for (const match of content.matchAll(failures)) {
+    const index = match.index ?? 0;
+    const term = match[0];
+    const before = content.slice(Math.max(0, index - 100), index);
+    const after = content.slice(index + term.length, index + term.length + 24);
+    const sentenceBefore = before.slice(Math.max(before.lastIndexOf("。"), before.lastIndexOf("！"), before.lastIndexOf("？"), before.lastIndexOf("；"), before.lastIndexOf("\n")) + 1);
+    const sentenceAfter = after.split(/[。！？；\n]/, 1)[0];
+    if (!/(?:系统|面板)/.test(sentenceBefore) && !/(?:系统|面板)/.test(sentenceAfter)) continue;
+    const prefix = before.slice(-40);
+    const coordinatedNegationMatch = sentenceBefore.match(/(?:不会|绝不会|永不|从不|免于)([^。！？；\n]{0,60})$/);
+    const coordinatedNegation = Boolean(
+      coordinatedNegationMatch &&
+      !/(?:但|却|然而|最终|随后|反而|转而)/.test(coordinatedNegationMatch[1]),
+    );
+    const recoveredOrHistorical = /^(?:记录|日志|历史|程序|模式|状态|自检)?[^。！？；\n]{0,20}(?:清除|删除|解除|修复|恢复正常|重新上线|苏醒|唤醒|已完成|完成|正常使用|继续生效|保持可用|始终稳定)/.test(sentenceAfter);
+    if (!isNegatedPrefix(prefix) && !coordinatedNegation && !recoveredOrHistorical) return true;
+  }
+  return false;
+}
+
+function hasSystemAvailabilityFailure(content: string): boolean {
+  if (hasUnnegatedSystemFailure(content)) return true;
+  const lockedResourcesWithOwner = /(?:所有|全部|全都|这些|上述|当前|系统(?:的)?|面板(?:的)?)[^。！？\n]{0,6}(?:功能|奖励|权限|能力|任务|可操作项)[^。！？\n]{0,18}(锁死|冻结|禁用|不可用|不可使用|无法使用|不能使用|无法领取|不能领取|不可领取|归零|清零)/g;
+  const lockedResourcesWithQuantity = /(?:功能|奖励|权限|能力|任务|可操作项)[^。！？\n]{0,12}(?:全部|全都|统统|一概|均|皆)[^。！？\n]{0,8}(锁死|冻结|禁用|不可用|不可使用|无法使用|不能使用|无法领取|不能领取|不可领取|归零|清零)/g;
+  const viewOnlySystem = /(只能看不能用)/g;
+  let recentSystemContext = 0;
+  for (const sentence of content.split(/[。！？\n]/).filter(Boolean)) {
+    const explicitlyMentionsSystem = /(?:系统|面板)/.test(sentence);
+    const refersToRecentSystem = recentSystemContext > 0 && /(?:它|其|这些|该)?(?:奖励|权限|功能|任务|能力|响应|操作)|^(?:它|其)/.test(sentence);
+    const failureContext = explicitlyMentionsSystem ? sentence : `系统相关状态：${sentence}`;
+    if (
+      (explicitlyMentionsSystem || refersToRecentSystem) &&
+      (hasUnnegatedCapturedTerm(sentence, lockedResourcesWithOwner) ||
+        hasUnnegatedCapturedTerm(sentence, lockedResourcesWithQuantity) ||
+        hasUnnegatedCapturedTerm(sentence, viewOnlySystem) ||
+        hasUnnegatedSystemFailure(failureContext))
+    ) {
+      return true;
+    }
+    if (explicitlyMentionsSystem) recentSystemContext = 2;
+    else recentSystemContext = Math.max(0, recentSystemContext - 1);
+  }
+  return false;
+}
+
+function hasProtagonistSystemInteraction(
+  content: string,
+  context: ReadingExperienceValidationContext,
+): boolean {
+  const namedProtagonist = protagonistIdentityPattern(context);
+  const protagonist = `(?:${namedProtagonist}|宿主)`;
+  const protagonistOwnerNames = Array.from(new Set([
+    "主角",
+    ...(context.protagonistNames ?? []).flatMap((name) => [name.trim(), name.trim().replace(/^主角/, "")]),
+  ].filter(Boolean)));
+  const normalizedOwnerIsProtagonist = (owner: string) => {
+    const normalized = owner.replace(/^(?:真正的|那名|这名)/, "").replace(/(?:本人|自己)$/, "").trim();
+    return protagonistOwnerNames.some((name) => normalized === name || normalized === `主角${name}`);
+  };
+  const extractDeclaredOwner = (sentence: string): string | undefined => {
+    const ownerBeforeSystem = sentence.match(/^([^，,。！？：:]{1,24}?)(?:当场|随即|已经|成功|正式|终于)?(?:绑定|拥有|打开|点开|开启|唤出|调用|使用|操控|激活|从|通过|按照|遵循)[^，,。！？]{0,12}(?:系统|面板)/);
+    if (ownerBeforeSystem) return ownerBeforeSystem[1].trim();
+    const ownerBecomesHost = sentence.match(/^([^，,。！？：:]{1,24}?)(?:成为|被选为|是)[^，,。！？]{0,14}(?:系统(?:的)?|面板(?:的)?)?宿主/);
+    if (ownerBecomesHost) return ownerBecomesHost[1].trim();
+    const systemSelectsOwner = sentence.match(/(?:系统|面板)[^，,。！？]{0,12}(?:选择|认定|绑定)[^，,。！？]{0,4}([^，,。！？]{1,16}?)(?:作为|成为|为)(?:唯一)?宿主/);
+    return systemSelectsOwner?.[1]?.trim();
+  };
+  const usableSignal = /(?:系统|面板)[^。！？\n]{0,28}(?:绑定|激活|提示|奖励|任务|权限|状态|结算|能力|功能)|(?:奖励|任务|权限|状态|结算|能力|功能)[^。！？\n]{0,18}(?:系统|面板)/;
+  const heroBeforeSystem = new RegExp(`${protagonist}[^。！？\\n]{0,18}(?:的|所绑定的|绑定|拥有|调用|打开|点开|开启|唤出|查看|领取|确认|使用|操控|利用|借助|依据|按照|遵循|通过|从|激活|眼前|识海|体内)[^。！？\\n]{0,12}(?:系统|面板)`);
+  const systemBeforeHero = new RegExp(`(?:系统|面板)[^。！？\\n]{0,18}(?:绑定|选择|认定|给|向|为|替|在|提示|通知|恭喜)[^。！？\\n]{0,12}${protagonist}`);
+  const namedHeroBeforeSystem = new RegExp(`${namedProtagonist}[^。！？\\n]{0,18}(?:的|所绑定的|绑定|拥有|调用|打开|点开|开启|唤出|查看|领取|确认|使用|操控|利用|借助|依据|按照|遵循|通过|从|激活|眼前|识海|体内)[^。！？\\n]{0,12}(?:系统|面板)`);
+  const systemBeforeNamedHero = new RegExp(`(?:系统|面板)[^。！？\\n]{0,18}(?:绑定|选择|认定|给|向|为|替|在|提示|通知|恭喜)[^。！？\\n]{0,12}${namedProtagonist}`);
+  const namedHeroMention = new RegExp(namedProtagonist);
+  const previousSentenceClearlyNamesProtagonist = new RegExp(`^(?:${protagonistOwnerNames.map(escapeRegExp).join("|")})(?!的)`);
+  const implicitViewpointUse = /^(?:(?:他|她|其|当场|随即|立刻|立即|径直|直接)[，,]?)?(?:点开|开启|操控|从|通过|按照|遵循|激活|唤出)[^。！？\n]{0,14}(?:系统|面板)/;
+  let nonProtagonistHostActive = false;
+  let previousSentence = "";
+  for (const sentence of content.split(/[。！？\n]/).filter(Boolean)) {
+    const declaredOwner = extractDeclaredOwner(sentence);
+    let ownerIsProtagonist: boolean | undefined;
+    if (declaredOwner && declaredOwner !== "宿主") {
+      ownerIsProtagonist = /^(?:他|她|其)$/.test(declaredOwner)
+        ? previousSentenceClearlyNamesProtagonist.test(previousSentence)
+        : normalizedOwnerIsProtagonist(declaredOwner);
+      nonProtagonistHostActive = !ownerIsProtagonist;
+    }
+    const explicitlyBoundToNamedHero = namedHeroBeforeSystem.test(sentence) || systemBeforeNamedHero.test(sentence);
+    if (explicitlyBoundToNamedHero && ownerIsProtagonist !== false) nonProtagonistHostActive = false;
+    const candidate = usableSignal.test(sentence) &&
+      (heroBeforeSystem.test(sentence) || systemBeforeHero.test(sentence));
+    const hostOnlyReference = /宿主/.test(sentence) && !namedHeroMention.test(sentence);
+    const implicitCandidate = usableSignal.test(sentence) && implicitViewpointUse.test(sentence);
+    if (
+      (candidate || implicitCandidate) && ownerIsProtagonist !== false &&
+      !(nonProtagonistHostActive && (hostOnlyReference || implicitCandidate))
+    ) return true;
+    previousSentence = sentence;
+  }
+  return false;
+}
+
+function hasDreamOrHypotheticalCue(text: string): boolean {
+  return /(?:在|于)(?:梦中|梦里|梦境中|梦境里|幻觉中|幻觉里|想象中|想象里|幻想中|幻想里|设想中|模拟中|模拟里|推演中|演算中)|(?:只是|仅是|不过是|原来是)(?:一场)?(?:梦|梦境|幻觉|想象|模拟|推演|演算)|假如|如果|若是/.test(text);
+}
+
+function hasDominantProtagonistVictory(
+  content: string,
+  context: ReadingExperienceValidationContext = {},
+): boolean {
+  const subject = protagonistActorPattern(context);
+  const sentence = "[^。！？\\n]";
+  const decisiveAction = "(?:一击|一招|一掌|一拳|一剑|一刀|一脚|一巴掌|一指|一眼|抬手|弹指|挥手|挥袖|屈指|随手|碾压|横推|秒杀)";
+  const decisiveResult = "(?:击败|镇压|轰飞|横飞|斩杀|结束|倒飞|崩碎|崩散|熄灭|跪下|撞碎|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住|认输|爬不起来|无法反抗|毫无还手之力|连第二招都无法抬起)";
+  const opponent = "(?:敌人|对手|反派|强者|魔头|来敌|来援者|施术者|长老|宗主|全场|所有人|那人|对方)";
+  const actionPattern = new RegExp(`(${subject})(${sentence}{0,32}?)(${decisiveAction})(${sentence}{0,36}(?:。${sentence}{0,36})?)(${decisiveResult})`, "g");
+  const directVictoryPattern = new RegExp(`(${subject})(${sentence}{0,28}?)(?:碾压|横推|秒杀|击败|镇压|斩杀|轰飞|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住)(?:了|掉)?${sentence}{0,12}${opponent}`, "g");
+  const causativeVictoryPattern = new RegExp(`(${subject})${sentence}{0,20}(?:让|令|逼得)${sentence}{0,8}${opponent}${sentence}{0,12}(?:无法反抗|毫无还手之力|跪下|认输|倒地不起)`, "g");
+  const unrealizedCue = new RegExp(`(?:扬言|发誓|声称|宣称|自称|说自己|表示自己|认为自己|相信自己|希望|想要|正要|准备|打算|计划|试图|企图|自己会|他会|她会|必会|终会|迟早会|一定会|将会|将要|即将|若|如果|一旦)${sentence}{0,24}(?:${decisiveAction}|${decisiveResult}|碾压|横推|秒杀)`);
+  const unfinishedConflict = /(?:战斗|交手|冲突|对决)[^。！？\n]{0,12}(?:还没|尚未|并未|没有)[^。！？\n]{0,8}(?:开始|发生|结束)/;
+  const opponentTookOver = /(?:看着|看到|目睹|望着|确认|发现|听见|听到)[^，；。！？]{0,14}(?:敌人|对手|反派|强者|长老|宗主)|(?:敌人|对手|反派|强者|长老|宗主)(?:只|便|就|竟|突然|当场|直接|用|以|一招|一击|一掌)/;
+  const conflictTarget = new RegExp(`${opponent}|(?:敌方|敌阵|来袭|攻击|攻势|杀招|杀阵|阵法|威压|法则|剑气|刀光|拳罡|巨印|护体法宝)`);
+  const negatedOrNearMiss = /(?:没能|未能|没有|并未|并没有|未曾|不曾|无法|不能|差点|险些|几乎|本可以|本可|原可以|原可)[^。！？\n]{0,18}(?:一击|一招|一掌|一拳|一剑|一刀|一脚|击败|镇压|轰飞|斩杀|碾压|横推|秒杀)|(?:一击|一招|一掌|一拳|一剑|一刀|一脚)[^。！？\n]{0,8}(?:没能|未能|没有|并未|并没有|未曾|不曾|无法|不能)[^。！？\n]{0,8}(?:击败|镇压|轰飞|斩杀|碾压|横推|秒杀)/;
+  const reversedOrSimulatedOutcome = /(?:但|却|反而|最终|随后|其实)[^。！？\n]{0,24}(?:没有出手|并未出手|未曾出手|只能逃|转身逃|被[^。！？\n]{0,10}逼退|毫发无损|胜负未分|无事发生)|(?:画面|场景|结果|胜利)[^。！？\n]{0,14}(?:只是|仅是|不过是|原来是|属于)(?:系统)?(?:模拟|演算|预测|推演|幻觉|梦境|想象)|(?:只是|仅是|不过是)(?:系统)?(?:模拟|演算|预测|推演)/;
+  const delegatedVictory = new RegExp(`${subject}[^。！？\\n]{0,16}(?:看着|看到|目睹|望着|命令|吩咐|让|请来?|躲在|藏在)[^。！？\\n]{1,24}${decisiveAction}`);
+  const protagonistReclaimsAction = new RegExp(`(?:自己|亲自|本人)[^。！？\\n]{0,6}${decisiveAction}`);
+  const nonProtagonistActorBeforeAction = /(?:的)?(?:师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡)[^。！？\n]{0,10}$/;
+  const validMatch = (match: RegExpMatchArray, preAction = "", requireConflictTarget = false) => {
+    const index = match.index ?? 0;
+    const surrounding = content.slice(Math.max(0, index - 18), index + match[0].length + 40);
+    return !opponentTookOver.test(preAction) && !nonProtagonistActorBeforeAction.test(preAction) && !unrealizedCue.test(match[0]) &&
+      !unfinishedConflict.test(surrounding) && !negatedOrNearMiss.test(surrounding) &&
+      !reversedOrSimulatedOutcome.test(surrounding) && !hasDreamOrHypotheticalCue(surrounding) &&
+      (!delegatedVictory.test(surrounding) || protagonistReclaimsAction.test(surrounding)) &&
+      (!requireConflictTarget || conflictTarget.test(surrounding));
+  };
+  return [...content.matchAll(actionPattern)].some((match) => validMatch(match, match[2] ?? "", true)) ||
+    [...content.matchAll(directVictoryPattern)].some((match) => validMatch(match, match[2] ?? "")) ||
+    [...content.matchAll(causativeVictoryPattern)].some((match) => validMatch(match));
+}
+
+function hasActualHeroReverseDefeat(content: string, pattern: RegExp): boolean {
+  for (const match of content.matchAll(pattern)) {
+    const term = match[1];
+    const termOffset = match[0].lastIndexOf(term);
+    const absoluteTermIndex = (match.index ?? 0) + termOffset;
+    const prefix = content.slice(Math.max(0, absoluteTermIndex - 36), absoluteTermIndex);
+    const after = content.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 36);
+    const unrealizedAfter = /^(?:的)?(?:计划|企图|尝试|预言|说法)[^。！？\n]{0,16}(?:失败|落空|破产|未成|没有成功)|^(?:的)?(?:人|强者|存在)[^。！？\n]{0,16}(?:不存在|绝无|没有)/.test(after);
+    if (!isNegatedPrefix(prefix) && !unrealizedAfter) return true;
+  }
+  return false;
+}
+
+function hasActualHeroPassiveDefeat(content: string, pattern: RegExp, protagonistPattern: string): boolean {
+  const protagonistIsAttacker = new RegExp(`(?:被|遭)[^。！？\\n]{0,14}${protagonistPattern}`);
+  for (const match of content.matchAll(pattern)) {
+    const term = match[1];
+    if (protagonistIsAttacker.test(term)) continue;
+    const termOffset = match[0].lastIndexOf(term);
+    const absoluteTermIndex = (match.index ?? 0) + termOffset;
+    const prefix = content.slice(Math.max(0, absoluteTermIndex - 30), absoluteTermIndex);
+    const after = content.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 56);
+    const unrealizedAfter = /^(?:(?:的)?可能性[^。！？\n]{0,18}(?:不存在|绝无可能|根本没有)|这种事[^。！？\n]{0,18}(?:绝无可能|不可能|不会发生)|只是[^。！？\n]{0,18}(?:妄想|幻想|谎言)|(?:的)?(?:预言|计划|企图|说法)[^。！？\n]{0,20}(?:落空|失败|破产|未成|不成立))/.test(after);
+    if (!isNegatedPrefix(prefix) && !unrealizedAfter) return true;
+  }
+  return false;
+}
+
+export function assertReadingExperienceNegativeInvariants(
+  contract: ReadingExperienceContract,
+  content: string,
+  context: ReadingExperienceValidationContext = {},
+): void {
+  const words = contract.sourceWords.map(escapeRegExp);
+  const combinedWords = `(?:${words[0]}\\s*[·・、,，]\\s*${words[1]}|${words.join("|")})`;
+  const pastedScenery = new RegExp(`${combinedWords}\\s*的?\\s*(?:天光|晨雾|暮色|晨光|月光|阳光)`);
+  if (pastedScenery.test(content)) {
+    throw new Error("正文把阅读感觉词直接拼接到天光等景物，已阻止发布。");
+  }
+
+  if (contract.sourceWords.includes("系统")) {
+    if (hasSystemAvailabilityFailure(content)) {
+      throw new Error("正文违反“系统”体验的稳定结算与持续可用硬承诺，已阻止发布。");
+    }
+    const subject = protagonistActorPattern(context);
+    const unusableSystem = /(?:系统|面板)[^。！？\n]{0,50}((?:没有|毫无|不存在|缺少|找不到|未提供)(?:任何)?(?:奖励|权限|任务|能力|功能|可操作项|反馈|响应)|(?:只是|仅是|只剩|仅剩)(?:一行|一段|一些|几行)?(?:比喻|幻觉|装饰|文字|字样))/g;
+    const noOperation = new RegExp(`${subject}[^。！？\\n]{0,24}((?:(?:找不到|无法找到)(?:任何)?(?:可操作项|功能|任务|奖励|权限|反馈)|没有(?:任何)?(?:可操作项|功能|任务|奖励|权限|反馈)))`, "g");
+    if (hasUnnegatedCapturedTerm(content, unusableSystem) || hasUnnegatedCapturedTerm(content, noOperation)) {
+      throw new Error("正文把系统写成不可操作、无反馈或无奖励的空壳，已阻止发布。");
+    }
+  }
+
+  if (contract.sourceWords.includes("无敌")) {
+    if (hasUnnegatedTerm(content, ["五五开", "势均力敌", "不分胜负", "险胜"])) {
+      throw new Error("正文违反“无敌”体验的压倒性胜利硬承诺，已阻止发布。");
+    }
+    const subject = protagonistActorPattern(context);
+    const defeatAdverb = "(?:竟然|最终|当场|已经|仍然|依旧|彻底|直接|很快|随即|却|也|还|就|被迫|只能|几乎|差点|明显|重重|突然|完全|根本|再也|终究|依然|已|正|竟)";
+    const heroDefeat = new RegExp(`${subject}(?:本人)?(?:[，,\\s]*${defeatAdverb}){0,4}[，,\\s]*(落败|惨败|战败|败下阵来|不敌|输给|苦战|不得不逃跑|被迫逃跑|狼狈逃跑|狼狈逃走|倒地不起|身受重伤|重伤倒地|失去意识|无法再战|无法反抗|毫无还手之力|任人宰割|束手无策|等待救援|被人救下|靠人救场|投降|认输|求饶|臣服)`, "g");
+    const heroPassiveDefeat = new RegExp(`${subject}(?:本人)?(?:[，,\\s]*${defeatAdverb}){0,3}[，,\\s]*((?:被|遭)[^。！？\\n]{0,18}(?:击败|打败|打倒|镇压|轰飞|斩杀|秒杀|重创|废掉|打成重伤|打得半死|拍碎丹田))`, "g");
+    const heroReverseDefeat = new RegExp(`(击败|打倒|镇压|轰飞|斩杀|重创|废掉)(?:了|掉)?(?:眼前的|面前的|那个)?${subject}`, "g");
+    const heroSurrender = new RegExp(`${subject}[^。！？\\n]{0,36}((?:向[^。！？\\n]{0,12}|对(?:敌人|对手|反派|强者|魔头|长老|宗主)[^，,。！？\\n]{0,6})(?:投降|认输|求饶|臣服))`, "g");
+    const heroSevereHarm = new RegExp(`${subject}[^。！？\\n]{0,6}((?:被|遭)[^。！？\\n]{0,36}(?:连打|打得|逼得|迫使)[^。！？\\n]{0,28}(?:口吐鲜血|吐血|狼狈逃走|狼狈逃离|只能逃走|险些丧命|好友[^。！？\\n]{0,12}救走|同伴[^。！？\\n]{0,12}救走))`, "g");
+    const heroBegsForMercy = new RegExp(`${subject}[^。！？\\n]{0,30}((?:跪在|跪倒|跪向)[^。！？\\n]{0,24}(?:请求|哀求|恳求|求)[^。！？\\n]{0,16}(?:放过|饶命|放[^。！？\\n]{0,6}生路))`, "g");
+    const heroHidesFromOpponent = new RegExp(`${subject}[^。！？\\n]{0,36}((?:毫无办法|束手无策|无能为力)[^。！？\\n]{0,20}(?:躲在|藏在)[^。！？\\n]{0,12}(?:同伴|队友|好友)[^。！？\\n]{0,6}身后)`, "g");
+    const prolongedStruggle = new RegExp(`${subject}[^。！？\\n]{0,18}((?:与|和|同)[^。！？\\n]{0,10}(?:强敌|对手|敌人)[^。！？\\n]{0,12}(?:大战|苦战|鏖战)[^。！？\\n]{0,20}(?:三百回合|数百回合|上百回合|许久|良久|半日|多时)[^。！？\\n]{0,14}(?:才|方才|终于)[^。！？\\n]{0,8}(?:勉强|艰难|险险)?(?:取胜|获胜|击败))`, "g");
+    const rescuedByOthers = new RegExp(`${subject}[^。！？\\n]{0,60}((?:好友|同伴|队友)[^。！？\\n]{0,12}(?:出手|赶来)[^。！？\\n]{0,12}(?:救走|救下|救场))`, "g");
+    const heroWeakening = new RegExp(`${subject}(?:本人)?(?:的|自身的)?(?:能力|修为|实力|系统)[^。！？\\n]{0,10}?(被?封印|被?削弱|失去|收回)`, "g");
+    const blueprintWeakening = /"(?:protagonistPosition|visibleGoal|conflictEngine|recurringCost|endingShape|targetEnding)"\s*:\s*"[^"]*?(?:能力|修为|实力|系统)[^"]{0,18}?(被?封印|被?削弱|失去|收回)/g;
+    if (
+      hasUnnegatedCapturedTerm(content, heroDefeat) ||
+      hasActualHeroPassiveDefeat(content, heroPassiveDefeat, subject) ||
+      hasActualHeroReverseDefeat(content, heroReverseDefeat) ||
+      hasUnnegatedCapturedTerm(content, heroSurrender) ||
+      hasUnnegatedCapturedTerm(content, heroSevereHarm) ||
+      hasUnnegatedCapturedTerm(content, heroBegsForMercy) ||
+      hasUnnegatedCapturedTerm(content, heroHidesFromOpponent) ||
+      hasUnnegatedCapturedTerm(content, prolongedStruggle) ||
+      hasUnnegatedCapturedTerm(content, rescuedByOthers) ||
+      hasUnnegatedCapturedTerm(content, heroWeakening) ||
+      hasUnnegatedCapturedTerm(content, blueprintWeakening)
+    ) {
+      throw new Error("正文通过落败、救场、封印或削弱破坏“无敌”体验，已阻止发布。");
+    }
+  }
+}
+
+function continuityAnchors(
+  facts: string[],
+  context: ReadingExperienceValidationContext,
+): string[] {
+  const genericTerms = /系统|面板|主角|宿主|奖励|权限|能力|状态|确认|发放|获得|领取|已经|永久|生效|保持|运行|一击|一招|一掌|击败|镇压|碾压|敌人|对手|全场|无人|能够|无法|反抗|胜利|仍然|继续|现实|当场|记录|提示|任务|结算/g;
+  const names = (context.protagonistNames ?? []).filter(Boolean);
+  const anchors = new Set<string>();
+  for (const fact of facts) {
+    let stripped = fact.replace(genericTerms, "|");
+    for (const name of names) stripped = stripped.replace(new RegExp(escapeRegExp(name), "g"), "|");
+    for (const chunk of stripped.split(/[|，。！？；：、\s“”"'【】（）()]+/).filter(Boolean)) {
+      const compact = chunk.replace(/[^\p{L}\p{N}]/gu, "");
+      if (Array.from(compact).length < 3) continue;
+      if (Array.from(compact).length <= 10) {
+        anchors.add(compact);
+        continue;
+      }
+      const characters = Array.from(compact);
+      for (let index = 0; index <= characters.length - 5; index += 1) {
+        anchors.add(characters.slice(index, index + 5).join(""));
+      }
+    }
+  }
+  return [...anchors];
+}
+
+function hasPriorPersistentFactContinuity(
+  content: string,
+  facts: string[] | undefined,
+  context: ReadingExperienceValidationContext,
+): boolean {
+  if (!Array.isArray(facts) || facts.length === 0) return false;
+  const compactContent = content.replace(/\s/g, "");
+  const protagonist = protagonistIdentityPattern(context);
+  const deniedOwnership = new RegExp(`(?:从未|未曾|不曾|并未|没有|不|并不|并非)[^。！？\\n]{0,10}(?:归|属于|为[^。！？\\n]{0,6}所有|被[^。！？\\n]{0,6}拥有)[^。！？\\n]{0,12}${protagonist}|(?:从未|未曾|不曾|并未|没有|不|并不|并非)[^。！？\\n]{0,6}(?:归|属于)${protagonist}|(?:不属于|不归|从未归|未曾归)[^。！？\\n]{0,12}(?:${protagonist}|主角所有)`);
+  const transferAway = new RegExp(`(?:转交|转移|转赠|交给|归还)[^。！？\\n]{0,12}(?:敌人|对手|反派|他人)|(?:归|属于)[^。！？\\n]{0,8}(?:敌人|对手|反派|他人)所有`);
+  const unavailableTerms = [
+    "遗失", "丢失", "失去", "被夺", "被抢", "抢走", "夺走", "被收回", "撤回", "作废", "失效", "不可使用",
+    "无法使用", "不能使用", "解除", "归零", "清零", "销毁", "摧毁", "毁掉", "彻底消失",
+  ];
+  return continuityAnchors(facts, context).some((anchor) => {
+    const escapedAnchor = escapeRegExp(anchor);
+    let invalidated = false;
+    let validContinuation = false;
+    let anchorReferentTurns = 0;
+    for (const rawSentence of compactContent.split(/[。！？\n]/).filter(Boolean)) {
+      const mentionsAnchor = rawSentence.includes(anchor);
+      const refersToRecentAnchor = !mentionsAnchor && anchorReferentTurns > 0 &&
+        /(?:它|该(?:物|剑|刀|枪|书|戒|印|令|面板|系统)|此(?:物|剑|刀|枪|书|戒|印|令)|这把(?:剑|刀|枪)|那把(?:剑|刀|枪))/.test(rawSentence);
+      if (!mentionsAnchor && !refersToRecentAnchor) {
+        anchorReferentTurns = Math.max(0, anchorReferentTurns - 1);
+        continue;
+      }
+      const sentence = refersToRecentAnchor
+        ? rawSentence.replace(/它|该(?:物|剑|刀|枪|书|戒|印|令|面板|系统)|此(?:物|剑|刀|枪|书|戒|印|令)|这把(?:剑|刀|枪)|那把(?:剑|刀|枪)/g, anchor)
+        : rawSentence;
+      anchorReferentTurns = mentionsAnchor ? 2 : Math.max(0, anchorReferentTurns - 1);
+      const otherActorUsesAnchor = new RegExp(`(?:敌人|对手|反派|路人|陌生人)[^。！？\\n]{0,18}(?:挥舞|使用|持有|拥有|拿着|抢走|夺走|摧毁|提到|谈到|展示)[^。！？\\n]{0,12}${escapedAnchor}|${escapedAnchor}[^。！？\\n]{0,18}(?:是|归|属于)[^。！？\\n]{0,12}(?:敌人|对手|反派|路人|陌生人)(?:手中|所有)?`).test(sentence);
+      const reducedToFiction = /(?:只是|仅是|不过是|原来(?:只是|仅是|不过是)?|实为)(?:一则|一个|一场)?(?:虚构(?:之物|事物|传说)?|传说|幻觉|梦境|模拟|谣言|假象)/.test(sentence);
+      const explicitlyInvalid = reducedToFiction || otherActorUsesAnchor || deniedOwnership.test(sentence) || transferAway.test(sentence) ||
+        hasUnnegatedTerm(sentence, unavailableTerms);
+      const reacquired = new RegExp(`${protagonist}[^。！？\\n]{0,18}(?:重新|再次|成功)?(?:夺回|取回|找回|收回|拿回|获得|领取|绑定|重获)[^。！？\\n]{0,12}${escapedAnchor}|${protagonist}[^。！？\\n]{0,12}${escapedAnchor}[^。！？\\n]{0,12}(?:夺回|取回|找回|收回|拿回|重新到手|重回手中|再次归位)`).test(sentence);
+      if (explicitlyInvalid) {
+        invalidated = true;
+        validContinuation = false;
+        if (!reacquired) continue;
+      }
+      if (reacquired) invalidated = false;
+      const durableStatus = hasUnnegatedTerm(sentence, [
+        "仍然生效", "仍生效", "继续生效", "保持生效", "依旧生效", "仍然有效", "仍有效",
+        "继续有效", "保持有效", "仍然可用", "仍可用", "继续可用", "保持可用", "永久保留", "继续保留",
+        "已经永久生效", "永久生效", "已经生效", "持续生效", "仍然存在", "继续存在", "仍然保持",
+      ]);
+      const protagonistParticipates = new RegExp(protagonist).test(sentence);
+      const protagonistUsesState = protagonistParticipates && hasUnnegatedTerm(sentence, [
+        "使用", "调用", "持有", "拥有", "握住", "挥动", "挥舞", "借助", "凭借", "依靠", "装备", "催动", "拔出",
+        "保有", "掌控", "驱使", "驱动", "施展", "发动", "激活", "领取", "运用", "取出", "取用", "祭出", "以",
+        "斩开", "迎向", "压住", "击溃", "斩断", "挡下", "保护", "照料", "合作", "同行",
+      ]);
+      if (!invalidated && (durableStatus || protagonistUsesState || reacquired)) validContinuation = true;
+    }
+    return validContinuation && !invalidated;
+  });
+}
+
+export function assertPersistentExperienceFacts(
+  contract: ReadingExperienceContract,
+  content: string,
+  facts: string[] | undefined,
+  context: ReadingExperienceValidationContext = {},
+): void {
+  assertReadingExperienceNegativeInvariants(contract, content, context);
+  if (
+    !Array.isArray(facts) || facts.length < 2 || facts.length > 8 ||
+    !facts.every((fact) => {
+      const normalized = typeof fact === "string" ? fact.trim() : "";
+      return Array.from(normalized).length >= 8 && Array.from(normalized).length <= 300 && content.includes(normalized);
+    })
+  ) {
+    throw new Error("开篇没有返回可由第二章继续使用的正文状态事实，已拒绝发布。");
+  }
+  if (
+    contract.sourceWords.includes("系统") &&
+    !facts.some((fact) =>
+      /(?:系统|面板)[\s\S]{0,24}(?:奖励|权限|能力|修为|状态|任务|结算)/.test(fact) &&
+      hasProtagonistSystemInteraction(fact, context),
+    )
+  ) {
+    throw new Error("开篇状态账本没有保存系统奖励、权限或能力，已拒绝发布。");
+  }
+  if (
+    contract.sourceWords.includes("无敌") &&
+    !hasDominantProtagonistVictory(facts.join("\n"), context)
+  ) {
+    throw new Error("开篇状态账本没有保存主角的压倒性胜利，已拒绝发布。");
+  }
+}
+
+function quoteSupportsClaimedModelSignal(
+  quote: string,
+  axisWord: string,
+  signals: ReadingExperienceSignal[],
+): boolean {
+  const normalizedQuote = quote.normalize("NFKC").toLowerCase();
+  return signals.some((signal) => {
+    const anchors = signal.evidenceAnchors?.length
+      ? signal.evidenceAnchors
+      : deriveSignalEvidenceAnchors(signal.description, axisWord);
+    const matches = Array.from(new Set(anchors
+      .map((anchor) => anchor.normalize("NFKC").toLowerCase())
+      .filter((anchor) => normalizedQuote.includes(anchor))));
+    return hasIndependentSignalEvidenceAnchors(matches);
+  });
+}
+
+export function assertReadingExperienceEvidence(
+  contract: ReadingExperienceContract,
+  content: string,
+  evidence: ReadingExperienceEvidence[] | undefined,
+  context: ReadingExperienceValidationContext = {},
+): void {
+  assertReadingExperienceNegativeInvariants(contract, content, context);
+  const supplied = evidence ?? [];
+  const modelBoundQuotes: string[] = [];
+  for (const axis of contract.axes) {
+    const validSignalIds = new Set(axis.observableSignals.map((signal) => signal.id));
+    const axisEvidence = supplied.find((item) => item.axisId === axis.id && item.word === axis.word);
+    if (!axisEvidence) {
+      throw new Error(`正文缺少阅读体验轴“${axis.word}”的可核验正文证据，已阻止发布。`);
+    }
+    const quote = axisEvidence.quote.trim();
+    if (Array.from(quote).length < 8 || !content.includes(quote)) {
+      throw new Error(`阅读体验轴“${axis.word}”的正文证据不是有效原文引用，已阻止发布。`);
+    }
+    if (!axisEvidence.signalIds.some((signalId) => validSignalIds.has(signalId))) {
+      throw new Error(`阅读体验轴“${axis.word}”没有命中约定的可观察信号，已阻止发布。`);
+    }
+    const modelSignalIds = axis.observableSignals.filter((signal) => signal.id.includes("_model_signal_")).map((signal) => signal.id);
+    const baselineSignalIds = axis.observableSignals.filter((signal) => !signal.id.includes("_model_signal_")).map((signal) => signal.id);
+    if (
+      modelSignalIds.length > 0 &&
+      (!axisEvidence.signalIds.some((signalId) => modelSignalIds.includes(signalId)) ||
+        !axisEvidence.signalIds.some((signalId) => baselineSignalIds.includes(signalId)))
+    ) {
+      throw new Error(`阅读体验轴“${axis.word}”必须同时命中模型细化信号与行动结果基线，已阻止发布。`);
+    }
+    if (modelSignalIds.length > 0) {
+      const claimedModelSignals = axis.observableSignals
+        .filter((signal) => modelSignalIds.includes(signal.id) && axisEvidence.signalIds.includes(signal.id))
+      if (!quoteSupportsClaimedModelSignal(quote, axis.word, claimedModelSignals)) {
+        throw new Error(`阅读体验轴“${axis.word}”的证据原句没有兑现所申报模型信号中的具体行动语义，已阻止发布。`);
+      }
+      if (quote.includes(axis.word) && usesExperienceWordAsLiteralLabel(quote, axis.word)) {
+        throw new Error(`阅读体验轴“${axis.word}”只作为字样或标签出现，没有兑现语义，已阻止发布。`);
+      }
+      modelBoundQuotes.push(quote.replace(/\s/g, ""));
+    }
+    const chapterNumber = context.chapterNumber ?? (context.opening ? contract.effectiveFromChapter : undefined);
+    const chapterRequirement = chapterNumber === undefined
+      ? undefined
+      : contract.openingRequirements.find((requirement) => requirement.chapterOffset === chapterNumber - contract.effectiveFromChapter);
+    if (chapterRequirement) {
+      const required = chapterRequirement.requiredSignalIds.filter((signalId) => validSignalIds.has(signalId));
+      const missingRequired = required.filter((signalId) => !axisEvidence.signalIds.includes(signalId));
+      if (missingRequired.length > 0) {
+        const phase = chapterNumber === contract.effectiveFromChapter ? "开篇" : `第 ${chapterNumber} 章`;
+        throw new Error(`${phase}没有完整命中阅读体验轴“${axis.word}”的必需信号，无法延续既有状态变化，已阻止发布。`);
+      }
+      if (
+        chapterRequirement.chapterOffset === 1 &&
+        !hasPriorPersistentFactContinuity(content, context.priorPersistentFacts, context)
+      ) {
+        throw new Error("第二章没有沿用第一章已经获得的能力、奖励、权限、资源或关系状态，已阻止发布。");
+      }
+    }
+  }
+
+  if (modelBoundQuotes.length === contract.axes.length && new Set(modelBoundQuotes).size !== modelBoundQuotes.length) {
+    throw new Error("两个自定义阅读体验必须分别提供语义明确的正文证据，不能复用同一句泛化动作。");
+  }
+
+  if (contract.sourceWords.includes("系统")) {
+    const systemEvidence = supplied.find((item) => item.axisId === contract.axes.find((axis) => axis.word === "系统")?.id);
+    if (
+      !hasProtagonistSystemInteraction(content, context) ||
+      !systemEvidence || !hasProtagonistSystemInteraction(systemEvidence.quote, context)
+    ) {
+      throw new Error("正文没有出现归属于主角且真实可操作的系统交互，已阻止发布。");
+    }
+    if (context.opening) {
+      const compact = content.replace(/\s/g, "");
+      const openingSlice = compact.slice(0, Math.max(120, Math.ceil(compact.length * 0.15)));
+      if (!hasProtagonistSystemInteraction(openingSlice, context)) {
+        throw new Error("第一章前 15% 没有兑现真实系统交互，已阻止发布。");
+      }
+    }
+  }
+  if (contract.sourceWords.includes("无敌")) {
+    const invincibleEvidence = supplied.find((item) => item.axisId === contract.axes.find((axis) => axis.word === "无敌")?.id);
+    if (
+      !hasDominantProtagonistVictory(content, context) ||
+      !invincibleEvidence || !hasDominantProtagonistVictory(invincibleEvidence.quote, context)
+    ) {
+      throw new Error("正文没有兑现由主角完成的“无敌”压倒性胜利，已阻止发布。");
+    }
+  }
 }
 
 export interface ConversationContext {
@@ -130,6 +668,7 @@ export interface ExtractedChapterState {
   usageTokens?: number;
   usageEstimated?: boolean;
   endingResolution?: EndingResolution;
+  experienceEvidence?: ReadingExperienceEvidence[];
 }
 
 function numericSeed(value: string) {
@@ -646,12 +1185,13 @@ export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
     `世界观圣经 v${story.worldBible.version}（来源 ${story.worldBible.sourceRevisionIds.join(", ") || "无"}）：${worldBible}。`,
     `暂定结局契约：${story.endingContract.targetEnding}。`,
     `全书篇幅规划：当前第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，进度 ${(plan.storyArc.progress * 100).toFixed(1)}%；第 ${plan.storyArc.volumeNumber} / ${plan.storyArc.totalVolumes} 卷，本卷第 ${plan.storyArc.chapterInVolume} / ${plan.storyArc.volumeChapterCount} 章，阶段=${plan.storyArc.label}。阶段要求：${plan.storyArc.guidance}。结局前置条件：${story.endingContract.prerequisites.join("；")}。`,
-    `上一章：第${latest?.number ?? 0}章《${latest?.title ?? "序章"}》。`,
+    `最近已发生场景：《${latest?.title ?? "故事起点"}》。`,
     `入选剧情胶囊：事件=${plan.selected.event}；原因=${plan.selected.cause}；代价=${plan.selected.cost}；影响=${plan.selected.impact}。`,
     `结构化转换：参与者=${plan.selected.participantNames?.join("、") || "无"}；时间=${plan.selected.storyTime}；依赖=${plan.selected.dependsOnEventIds?.join("、") || "无"}；知识声明=${plan.selected.knowledgeClaims?.map((claim) => `${claim.characterName}:${claim.fact}`).join("、") || "无"}；物品转换=${plan.selected.itemTransitions?.map((item) => `${item.actorName}:${item.itemName}:${item.fromStatus}->${item.toStatus}`).join("、") || "无"}。`,
     `人物结构化状态：\n${characterState}`,
     `伏笔状态：${clueState || "无"}。物品账本：${itemState || "无"}。篇幅目标：${plan.targetCharacters} 个中文字符（含标点，不计空白），必须在 ${plan.minCharacters}—${plan.maxCharacters} 字之间；写成 ${plan.targetParagraphs} 个完整段落，允许误差不超过 1 段。`,
     `硬规则：${hardRules || "无"}。读者硬约束：${hardPreferences || "无"}。近期软偏好：${softPreferences || "无"}。`,
+    formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1),
     `固定预算相关记忆：\n${plan.memories.map((memory) => `[${memory.sourceId}|${memory.confidence.toFixed(2)}] ${memory.text}`).join("\n")}`,
     `分支会话摘要（来源消息 ${plan.conversationContext.sourceMessageIds.join(", ") || "无"}）：${plan.conversationContext.summary || "无"}`,
     `相关历史消息（按当前事件检索）：\n${plan.conversationContext.relevantMessages.join("\n") || "无"}`,
@@ -663,6 +1203,7 @@ export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
 export function generateLocalChapter(story: Story, plan: GenerationPlan): GeneratedChapter {
   const lead = activeLead(story)?.name ?? "主角";
   const number = (story.chapters.at(-1)?.number ?? 0) + 1;
+  const isSystemInvincible = isSystemInvincibleExperience(story.readingExperience.sourceWords);
   const axisTitle: Record<string, string> = {
     错误证词: "证词的背面",
     关系代价: "留下的人先离开",
@@ -674,7 +1215,9 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
   const title = isTerminalChapter ? "终章 · 回声归处" : axisTitle[plan.selected.creativeAxis] ?? `第 ${number} 次回声`;
   const memory = plan.memories[0]?.text.replace(/\s+/g, " ").slice(0, 150) || story.summary.slice(0, 150);
   const sceneKit = sceneKitForGenre(story.genre);
-  const endingPrerequisites = story.endingContract.prerequisites.join("；");
+  const endingPrerequisites = story.endingContract.prerequisites
+    .map(immerseAuthorFacingProse)
+    .join("；");
   const terminalParagraphPool = [
     `${sceneKit.setting}。这是所有既定期限汇合的最后一天，${lead}没有再寻找能够拖延决定的借口。他把各卷留下的记录、损失和承诺逐一摆开，让每个参与者都确认终局不是突然降临，而是他们此前每一次选择共同推到眼前的结果。`,
     `${plan.selected.event}。直接原因是${plan.selected.cause}。这一次，行动不再为了打开新的可能，而是要给已经建立的核心冲突一个不可撤销的答案；任何未被承担的代价都会使结果失去意义。`,
@@ -697,13 +1240,13 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `${lead}完成最后一次复盘，把已经解决的主线、已经兑现的承诺和需要由日常维护的规则分别归档。记录中没有制造新的危机，也没有暗示某个更强敌人正在门外等待；它只诚实说明，结局之后的生活仍需要人们继续负责。`,
     `曾经反复出现的象征或旧物被放回合适的位置。它不再指向谜团或任务，而只是见证人物从哪里出发、最终作出了什么选择。${lead}能够看见它而不再被旧恐惧支配，这个细小变化比任何宣言更接近真正的自由。`,
     `告别没有持续太久。同行者各自带走属于自己的成果，也留下愿意共同维护的底线。没有人承诺从此永不失败，他们只确认即使以后犯错，也不会再用沉默、牺牲他人或抹除事实来换取表面安稳。`,
-    `暮色落下时，${sceneKit.setting}。${lead}最后回望一次，确认门已经关好、名字已经留下、该说的话也都说完。随后他走向已经由自己选择的生活；故事停在这个完整的动作上，核心因果、人物弧与结局契约都获得了清楚的落点。`,
+    `暮色落下时，${sceneKit.setting}。${lead}最后回望一次，确认门已经关好、名字已经留下、该说的话也都说完。随后他走向已经由自己选择的生活；这个完整的动作给漫长旅程画下句点，最初的因果、一路的内心转变与最终承诺都获得了清楚的落点。`,
   ];
   const terminalDetailLayers = [
     `每一项材料都标有来源，任何人都可以指出其中的遗漏，而不是被要求相信主角的权威。`,
     `选择的边界被说清以后，终局第一次不再依赖误会或信息差维持紧张。`,
     `过去的失败仍然影响今天的资源和关系，因此结局保留了长篇应有的累积重量。`,
-    `前置条件对应到具体行动与结果，避免用抽象的“终于成功”跳过真正兑现过程。`,
+    `每项承诺都对应到具体行动与结果，避免用抽象的“终于成功”跳过真正兑现过程。`,
     `这次行动留下明确反馈，使人物知道最后一步改变了什么、没有改变什么。`,
     `合作来自知情同意，任何人的贡献都没有被缩写成主角胜利的背景。`,
     `反制失败有既有因果支撑，不需要临时削弱对手或修改世界规则。`,
@@ -724,9 +1267,9 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `最后画面回应开篇空间，却让人物的位置和选择发生了不可逆变化。`,
   ];
   const paragraphPool = [
-    `${sceneKit.setting}。${lead}最先注意到的不是最响亮的变化，而是熟悉节奏里那半拍迟疑。它单独看并不起眼，放回上一章留下的因果后，却意味着某个已经作出的选择正在产生新的回声，而今天必须有人决定如何接住它。`,
+    `${sceneKit.setting}。${lead}最先注意到的不是最响亮的变化，而是熟悉节奏里那半拍迟疑。它单独看并不起眼；和此前亲历的事情连在一起，却意味着某个已经作出的选择正在产生新的回声，而今天必须有人决定如何接住它。`,
     `${plan.selected.event}。这件事并非凭空发生，直接原因是${plan.selected.cause}。${lead}没有让突如其来的解释替代事实，而是先分清哪些变化亲眼可见、哪些只是他人判断，又有哪些后果已经真实落在具体的人身上。`,
-    `上一章留下的记忆重新浮上来：“${memory}”。当时不受注意的动作，如今在新的因果位置上显得格外清楚。${lead}把过去的承诺与眼前局面并排，确认这不是可以一笑置之的小波动，而是${plan.storyArc.label}必须处理的阶段性问题。`,
+    `${lead}想起此前亲历的一幕：“${memory}”。当时不受注意的动作，如今在新的因果位置上显得格外清楚。${lead}把过去的承诺与眼前局面并排，确认这不是可以一笑置之的小波动，而是眼下必须处理的问题。`,
     `${lead}先采取了最小的一步：${sceneKit.action}。这一步无法直接完成“${story.storyGene.visibleGoal}”，却能验证当前判断是否站得住。结果很快出现，其中一部分与预期一致，另一部分却把“${plan.selected.creativeAxis}”从背景推到了行动正中央。围观者的反应也被如实保留，因为同一个结果落在不同人物身上，往往会产生完全不同的下一步。`,
     `第一位作出回应的人没有立刻赞同。他担心${sceneKit.pressure}会因为这次行动全面失控，也质疑${lead}是否准备好承担后果。${lead}没有用一句保证压过对方，而是把已知、未知与必须在今天决定的部分分别说清，让争执至少建立在同一组事实之上。`,
     `新的分歧落在${sceneKit.relationship}。有人愿意继续同行，但要求看见更完整的计划；有人选择暂时后退，也留下自己能够承担的帮助。关系没有因为一次对话变得牢不可破，却从模糊的好意变成了可以检验的承诺。`,
@@ -735,17 +1278,47 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `两种选择很快变得无法兼得：一边能够直接推进目标，另一边能够保护刚刚建立的信任。${lead}试图寻找没有损失的第三条路，最终承认那只会拖到两边同时失去。选择之所以重要，正因为它会明确留下不能撤销的部分。`,
     `${lead}作出决定，并把理由清楚告诉所有受影响的人。这个决定意味着${plan.selected.cost}。没有任何漂亮说法能够抹去代价；能做的只有提前约定边界、为被放弃的一侧保留补救路径，并确保损失不会被后来叙述成从未发生。`,
     `行动开始后，先前那次“${sceneKit.action}”不再只是试探。${lead}根据现场变化连续调整两次，第一次守住了关键条件，第二次却暴露自身判断中的空缺。局面因此没有按照任何人的完整计划发展，但至少仍在可以理解和承担的范围内。`,
-    `真正的转折来自一位此前保持沉默的人。对方没有提供万能答案，只指出${lead}一直把两个不同问题当成了同一件事：眼前胜负属于今天，长期目标却要跨过许多章节才能兑现。若为一次结果耗尽所有筹码，后面的路便只剩重复。这个提醒也让此前的争执换了角度——不同意见未必来自背叛，可能只是各自在保护不同的未来。`,
+    `真正的转折来自一位此前保持沉默的人。对方没有提供万能答案，只指出${lead}一直把两个不同问题当成了同一件事：眼前胜负属于今天，长期目标却要耗费很长时间才能兑现。若为一次结果耗尽所有筹码，后面的路便只剩重复。这个提醒也让此前的争执换了角度——不同意见未必来自背叛，可能只是各自在保护不同的未来。`,
     `这个提醒改变了行动的尺度。${lead}放弃追求一次解决全部矛盾，转而拿下一个能够长期保留的阶段成果。${plan.selected.impact}。它看起来不如彻底胜利耀眼，却让人物、规则和资源都进入了新的状态，后续故事有了真实的生长点。`,
     `阶段成果落地的同时，${sceneKit.consequence}也随之显现。损失没有被好运抵消，也没有因为结果尚可就变得不值一提。${lead}把它明确告诉同伴，因为隐瞒代价只会让下一次计划建立在错误边界上，最终伤害同样的人。`,
-    `短暂休整中，${lead}意识到自己真正需要面对的是“${story.storyGene.hiddenNeed}”。这不是靠一次领悟就能完成的角色弧，而是会在未来相似选择里反复被检验。今天能够做到的，只是在旧习惯出现时，比上一次更早看见它。`,
+    `短暂休整中，${lead}意识到自己真正需要面对的是“${story.storyGene.hiddenNeed}”。这种内心转变无法靠一次领悟完成，还会在未来相似的选择里反复受到检验。今天能够做到的，只是在旧习惯出现时，比上一次更早看见它。`,
     `众人重新分配下一步责任。每个人只承担自己明确同意的部分，退出条件与求助信号也被说清。${sceneKit.relationship}仍然存在裂缝，但这种带着边界的合作比含混热血更可靠，也让彼此不必靠猜测维持同路。分工完成以后，最难的任务并没有自动落给最强的人，而是交给真正掌握必要信息并愿意承担的人。`,
     `复盘时，唯一无法归位的细节恰好指向“${plan.selected.novelty}”。此前它只是一个大胆设想，如今已经被两次独立变化支持。更重要的是，这个发现没有抹掉旧因果，而是解释了旧选择为何会在今天以不同形式回来。`,
     `${lead}设计了一次规模很小的二次验证，只改变无关紧要的变量，不拿无辜者测试猜想。结果在可接受的时间内出现，证明现有规则确实会对他们的行动作出反应，也暴露出规则无法覆盖的短暂空隙。`,
     `反应让局面再次升温。${sceneKit.pressure}同时压向团队，刚刚得到的阶段成果随时可能被夺回。${lead}没有执着守住所有东西，而是优先保留能重建行动链的核心，让一次被迫撤退仍然能够为下一次前进提供依据。`,
     `压力稍退后，最年轻的同伴问这一切是否值得。${lead}没有给出激昂答案，只说现在至少知道损失因何发生，也知道下一次可以怎样少付一点代价。人们继续前进，不是因为不再害怕，而是因为风险终于有了可以共同面对的形状。`,
     `回到暂时稳定的位置后，他们完成三件小事：确认彼此状态、保存阶段成果、写下尚未解决的问题。${lead}特意把反对意见也保留下来，避免未来只剩胜利者的版本。今天的答案有限，但任何后来者都能看见决定如何一步步成立。那份记录还标出了下一次必须复核的条件，防止阶段成功被误读成永久安全。`,
-    `就在众人以为可以暂时休息时，先前那个反常细节再次出现，并准确回应了他们尚未公开的行动。新的变化说明对方或规则不只知道结果，还能观察某些过程；这里从一开始就不真正安全，下一章的时间窗口已经开始缩短。${lead}没有惊动众人，只先确认撤离方向仍然有效。`,
+    `就在众人以为可以暂时休息时，先前那个反常细节再次出现，并准确回应了他们尚未公开的行动。新的变化说明对方或规则不只知道结果，还能观察某些过程；这里从一开始就不真正安全，留给他们行动的时间已经开始缩短。${lead}没有惊动众人，只先确认撤离方向仍然有效。`,
+  ];
+  const persistedSystemState = activeLead(story)?.knowledgeSources
+    .map((fact) => fact.fact)
+    .find((fact) => /系统|奖励|权限|修为|能力/.test(fact))
+    ?.replace(/\s+/g, " ")
+    .slice(0, 180) ?? "既有修为、能力、奖励与世界权限全部持续生效";
+  const systemInvincibleParagraphPool = [
+    `金色的系统面板在${lead}眼前展开，上一场胜利获得的修为、功法权限与势力声望全部保留，没有一项衰减。【既有状态：${persistedSystemState}】新的状态提示紧跟着亮起：【检测到外部势力越界施压。可选目标：解除压迫、接管资源、重订规则。完成任意一项即可获得世界权限。】面板下方还逐项列出已经生效的长期状态，昨日得到帮助的人、已经归还的资源和被改写的权限都在现实中保持原样。${lead}随手关闭不需要的提示，只留下与眼前行动直接相关的三项信息。`,
+    `${plan.selected.event}。起因已经由系统标得清清楚楚：${plan.selected.cause}。${lead}没有把任务当成束缚，而是先看奖励能为身边的人解决什么；确认选择以后，系统立刻开放相关地图、敌方状态和可调动资源，把决定权完整留给宿主。`,
+    `挡在前方的人试图用身份压住现场，随后又展示足以让寻常修士绝望的境界。${lead}只看了一眼，系统便完成对比：【敌方综合强度不足宿主亿万分之一，不构成威胁。】这不是鼓励，也不是夸张的口号，而是一份即将由结果证明的力量差距。`,
+    `对方率先出手，灵力化作遮蔽半座山门的巨印。${lead}没有后退，独自抬手向前一推。巨印从中心无声崩散，施术者的护体法宝与身后阵旗同时熄灭，浩大的攻势连他脚下的一粒尘土都没能吹动。`,
+    `${lead}随后踏出一步。没有拉扯数百回合，压向众人的威压便被反向镇回施术者身上。那人双膝撞碎石板，连第二招都无法抬起。围观者终于确认，所谓上宗强者与${lead}之间不是略逊一筹，而是根本不存在可以交手的资格。`,
+    `【压倒性胜利成立。奖励：目标势力全部资源合法接管；奖励：指定友方境界提升；奖励：敌方功法自动解析至圆满。】系统提示落下的同时，封锁仓库的禁制自行开启，被扣押的灵石和药材按原主人姓名飞出，一件不少地回到众人手中。`,
+    `${lead}没有让胜利停在打倒一个人。他调出势力面板，把侵吞记录、受益者和受害者公开投在半空，命令仍掌权的人当场选择：归还资源并接受新规则，或失去继续利用这套秩序的资格。曾经只能沉默的人第一次拥有了能够真正使用的证据和力量。`,
+    `有人怀疑${lead}的强势只是一时爆发，暗中启动更高层的杀阵。系统提前标出每一道阵纹，却没有发出危险警告，因为它们根本无法伤到宿主。${lead}屈指一点，所有阵纹逆向亮起，布阵者藏身的密室直接显现在广场中央。`,
+    `密室里的人还想拿无辜弟子做人质。${lead}隔着数重墙壁握住五指，人质身上的禁制便化作灵光脱落，施术者却被自己的锁链牢牢缚住。力量落点精准得没有误伤一人，绝对优势也因此不只是破坏：他能够在碾压敌人的同时，把需要保护的人完整带出来。`,
+    `系统面板记录下新的世界变化：外门资源重新分配，旧执法权限冻结，十二名受害者恢复身份，敌对势力威望归零。每一项状态都将在后续行动中继续生效，不会因换一个场景便被忘记。${lead}查看结果后，把下一批待解决的问题按紧急程度重新排序。`,
+    `${plan.selected.impact}。这份影响不需要旁白宣布，现场已经给出答案：原本高高在上的人开始请求谈判，旁观者敢于说出姓名，被救下的人主动承担新的职责，远处观望的势力则连夜修改了对待此地的规矩。`,
+    `更强的援军终于赶到，带队者自称已踏入此界最高境界。他没有轻敌，出手便燃烧本命法则，试图把整片空间连同${lead}一起抹去。系统只弹出一条简短提示：【检测到无效攻击。是否自动反制？】${lead}选择否，他要亲手让所有人看清答案。`,
+    `他迎着破碎的空间伸出手，将那道法则握在掌心，像揉碎一张废纸般轻易碾灭。随后一掌落下，来援者的全部修为被压回体内，整个人从云端坠下，却没有伤及性命。胜负在一击间结束，敌人甚至无法逼出${lead}第二个动作。`,
+    `【越阶碾压判定：宿主实际并未越阶，当前世界上限低于宿主。额外奖励诸天坐标一枚。】系统用最平静的方式确认事实。${lead}收下奖励，新的世界入口随之出现；那不是用来逃避眼前问题的退路，而是绝对力量继续向更大天地展开的方向。`,
+    `短暂安静之后，${lead}把今天的新规则交给受影响的人共同确认。他不需要靠削弱自己制造悬念，也不必假装敌人仍有翻盘机会。真正需要认真处理的是胜利后的分配、保护与选择：谁先获得资源，谁监督新的权力，谁可以在不认同他时安全离开。`,
+    `系统状态在视野一角稳定亮着，修为、能力和奖励全部真实可用。${lead}越过再无人敢阻拦的山门，朝下一个目标走去。身后的人群仍在消化刚才那场一击结束的战斗，而前方的势力已经收到消息——一个带着系统、从未败过的人，正在正面改写他们习以为常的秩序。新的资源已经送往最需要的地方，获救者开始执行共同确认的分配方式，敌对势力则被迫放弃原有禁令。这场胜利拥有清晰而持续的结果，也为下一次更大范围的横推准备好了现实基础。`,
+  ];
+  const systemInvincibleTerminalParagraphPool = [
+    `金色的系统面板在${lead}眼前展开，第一行不是新的诱饵，而是对既有状态的确认：【${persistedSystemState}】。所有修为、能力、奖励与权限都保持真实可用，系统随即开放最终结算，让${lead}亲自决定力量将如何改变眼前秩序。`,
+    `最后一名反对者调动此界全部法则，试图用封锁和人质逼${lead}后退。系统只给出一条提示：【攻击无效；宿主当前权限高于本界上限。】${lead}关闭自动反制，向前走了一步，把保护范围准确落在每个无辜者身上。`,
+    `${lead}抬手一掌迎向对方。漫天法则当场崩碎，敌人连第二招都无法抬起便倒飞出去，所有后手同时熄灭。胜负在一击间结束，${lead}没有受伤，也不需要任何人救场；旁观者亲眼确认，这场对抗从来不存在势均力敌的可能。`,
+    `【压倒性胜利结算完成。既有奖励永久保留；新秩序权限已经生效。】系统提示落下，被冻结的资源回到原主人手中，旧有禁令失去效力，各方代表开始按公开规则重新分配权力。${lead}赢下的不只是一场战斗，而是让胜利成为所有人都能验证的长期变化。`,
+    ...terminalParagraphPool.slice(4),
   ];
   const detailLayers = [
     `${lead}把这个微小变化记下来，因为真正能支撑长篇因果的细节，往往不是当下最惊人的那个。`,
@@ -758,7 +1331,7 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `${lead}为这条路径留下退出方案，避免勇敢成为要求别人无条件冒险的借口。`,
     `两种选择都有人受益也有人受损，决定因此不能被包装成唯一正确答案。`,
     `决定公布后没有人欢呼，每个人只是确认自己需要承担的那一部分。`,
-    `第二次调整来自现场而非预设大纲，人物判断因此真正参与了结果。`,
+    `第二次调整来自现场而非预先安排，人物判断因此真正参与了结果。`,
     `沉默者说完便退回人群，没有借一条信息夺走其他人的行动权。`,
     `阶段成果被写成可延续的状态，而不是一句“问题解决”草草收场。`,
     `${lead}没有隐瞒自身状态，避免同伴用错误边界规划下一次行动。`,
@@ -769,28 +1342,73 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `被迫放弃的部分同样被记录，未来若要找回，必须承认今天为何失去。`,
     `一杯水或一次沉默陪伴无法解决危机，却让承担代价的人仍被具体看见。`,
     `阶段记录分别交给不同的人保存，即使一处失守，也能重建主要因果。`,
-    `${lead}没有立刻追向新变化，而是先让所有人看见它，避免下一章再次从信息差开始。`,
+    `${lead}没有立刻追向新变化，而是先让所有人看见它，避免日后再次因信息差受制。`,
   ];
-  const sourceParagraphs = isTerminalChapter ? terminalParagraphPool : paragraphPool;
-  const sourceDetails = isTerminalChapter ? terminalDetailLayers : detailLayers;
+  const sourceParagraphs = isTerminalChapter
+    ? isSystemInvincible
+      ? systemInvincibleTerminalParagraphPool
+      : terminalParagraphPool
+    : isSystemInvincible
+      ? systemInvincibleParagraphPool
+      : paragraphPool;
+  const sourceDetails = isTerminalChapter && !isSystemInvincible ? terminalDetailLayers : detailLayers;
   const paragraphs = sourceParagraphs.slice(0, plan.targetParagraphs);
   let characterCount = paragraphs.join("").replace(/\s/g, "").length;
   for (let index = 0; index < paragraphs.length && characterCount < plan.minCharacters; index += 1) {
     paragraphs[index] += sourceDetails[index];
     characterCount = paragraphs.join("").replace(/\s/g, "").length;
   }
-  if (isTerminalChapter && characterCount < plan.minCharacters) {
-    paragraphs[paragraphs.length - 1] += `终局核验完成以后，众人又按时间顺序复述了一遍核心因果：最初的目标如何形成，各卷选择怎样改变人物和规则，持续代价由谁承担，结局前置条件又分别在哪些行动中兑现。每一项都能在正史记录里找到来源，也能由不止一个参与者确认。${lead}因此知道，这个结束不会因一句漂亮话成立，也不会因往后的普通生活而失效；它已经成为所有人共同经历、共同承担且无法被轻易抹除的事实。`;
+  if (isSystemInvincible && characterCount < plan.minCharacters) {
+    const continuityDetails = [
+      `系统把奖励生效前后的状态同时展示，任何人都能从资源、身份和现场反应中确认变化真实发生。`,
+      `${lead}没有停下来解释自己多强，而是用下一个准确动作把绝对差距再次落到结果上。`,
+      `被保护的人保留自己的选择，压倒性力量因此服务于清晰目标，而不是让其他人物失去作用。`,
+      `敌方所有后手都被面板标出，却没有任何一项足以构成威胁，胜负从未重新变得含混。`,
+    ];
+    let detailIndex = 0;
+    while (characterCount < plan.minCharacters) {
+      paragraphs[detailIndex % paragraphs.length] += continuityDetails[detailIndex % continuityDetails.length];
+      detailIndex += 1;
+      characterCount = paragraphs.join("").replace(/\s/g, "").length;
+    }
   }
+  if (isTerminalChapter && characterCount < plan.minCharacters) {
+    paragraphs[paragraphs.length - 1] += `最终结果确认以后，众人又按时间顺序复述了一遍核心因果：最初的目标如何形成，一路作出的选择怎样改变人物和规则，持续代价由谁承担，此前必须完成的事情又分别在哪些行动中兑现。每一项都能在既有记录里找到来源，也能由不止一个参与者确认。${lead}因此知道，这个结束不会因一句漂亮话成立，也不会因往后的普通生活而失效；它已经成为所有人共同经历、共同承担且无法被轻易抹除的事实。`;
+  }
+  const immersiveParagraphs = paragraphs.map(immerseAuthorFacingProse);
+  const experienceEvidence = isSystemInvincible ? (() => {
+    const systemAxis = story.readingExperience.axes.find((axis) => axis.word === "系统");
+    const invincibleAxis = story.readingExperience.axes.find((axis) => axis.word === "无敌");
+    const validationContext = { protagonistNames: [lead], chapterNumber: number };
+    const systemQuote = immersiveParagraphs.find((paragraph) => hasProtagonistSystemInteraction(paragraph, validationContext));
+    const invincibleQuote = immersiveParagraphs.find((paragraph) => hasDominantProtagonistVictory(paragraph, validationContext));
+    if (!systemAxis || !invincibleAxis || !systemQuote || !invincibleQuote) return undefined;
+    return [
+      {
+        axisId: systemAxis.id,
+        word: systemAxis.word,
+        signalIds: systemAxis.observableSignals.map((signal) => signal.id),
+        quote: systemQuote,
+      },
+      {
+        axisId: invincibleAxis.id,
+        word: invincibleAxis.word,
+        signalIds: invincibleAxis.observableSignals.map((signal) => signal.id),
+        quote: invincibleQuote,
+      },
+    ];
+  })() : undefined;
   return {
     title,
     model: "platform-writer",
-    paragraphs,
+    origin: "local",
+    paragraphs: immersiveParagraphs,
+    experienceEvidence,
     endingResolution: isTerminalChapter ? {
       targetEndingSatisfied: true,
-      targetEndingEvidence: paragraphs[3],
+      targetEndingEvidence: immersiveParagraphs.at(-1) ?? immersiveParagraphs[3],
       satisfiedPrerequisiteIndices: story.endingContract.prerequisites.map((_, index) => index),
-      prerequisiteEvidence: story.endingContract.prerequisites.map((_, prerequisiteIndex) => ({ prerequisiteIndex, evidence: paragraphs[3] })),
+      prerequisiteEvidence: story.endingContract.prerequisites.map((_, prerequisiteIndex) => ({ prerequisiteIndex, evidence: immersiveParagraphs.at(-1) ?? immersiveParagraphs[3] })),
       noContinuationHook: true,
     } : undefined,
   };
@@ -809,11 +1427,35 @@ export function validateGeneratedChapter(
     throw new Error(`章节长度为 ${generated.paragraphs.length} 段，偏离目标 ${plan.targetParagraphs} 段，已阻止发布。`);
   }
   const content = generated.paragraphs.join("\n");
+  assertImmersiveNarration(`${generated.title}\n${content}`);
   const characterCount = content.replace(/\s/g, "").length;
   if (characterCount < plan.minCharacters || characterCount > plan.maxCharacters) {
     throw new Error(`章节字数为 ${characterCount} 字，要求 ${plan.minCharacters}—${plan.maxCharacters} 字，已阻止发布。`);
   }
   const nextChapterNumber = (story.chapters.at(-1)?.number ?? 0) + 1;
+  if (nextChapterNumber >= story.readingExperience.effectiveFromChapter) {
+    const lead = activeLead(story);
+    const validationContext: ReadingExperienceValidationContext = {
+      protagonistNames: [lead?.name ?? "主角"],
+      chapterNumber: nextChapterNumber,
+      priorPersistentFacts: lead?.knowledgeSources
+        .filter((fact) => fact.sourceChapter < nextChapterNumber)
+        .map((fact) => fact.fact) ?? [],
+    };
+    const requiresEvidence = generated.origin !== "local" ||
+      story.readingExperience.provenance === "model" ||
+      isSystemInvincibleExperience(story.readingExperience.sourceWords);
+    if (requiresEvidence) {
+      assertReadingExperienceEvidence(
+        story.readingExperience,
+        content,
+        extracted?.experienceEvidence ?? generated.experienceEvidence,
+        validationContext,
+      );
+    } else {
+      assertReadingExperienceNegativeInvariants(story.readingExperience, content, validationContext);
+    }
+  }
   if (nextChapterNumber >= story.targetChapterCount && !endingContractSatisfied(story, content, generated.endingResolution ?? extracted?.endingResolution)) {
     throw new Error("目标章没有完整兑现结局契约与必要前置条件，已阻止完结。");
   }

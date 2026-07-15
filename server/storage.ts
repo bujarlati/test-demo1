@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { AppStore } from "../src/types";
 import { createSeedStore } from "./seed";
 import { captureCanonState } from "./canonState";
+import { createLegacyExperienceContract } from "./readingExperience";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const dataDirectory = path.join(currentDirectory, "data");
@@ -17,6 +18,12 @@ function normalizeStore(store: AppStore): AppStore {
   store.storyCreationRequests ??= [];
   store.jobs ??= [];
   for (const story of store.stories ?? []) {
+    story.readingExperience ??= createLegacyExperienceContract({
+      tone: story.tone,
+      genre: story.genre,
+      effectiveFromChapter: story.chapters.length + 1,
+      createdAt: story.updatedAt,
+    });
     story.proposals ??= [];
     story.items ??= [];
     story.worldBible ??= {
@@ -96,7 +103,10 @@ function normalizeStore(store: AppStore): AppStore {
     }
     for (const [index, event] of (story.events ?? []).entries()) {
       event.sequence ??= index + 1;
-      event.storyTime ??= `第${event.chapterNumber}章·场景1`;
+      if (event.cause === "上一章留下的未解线索") event.cause = "尚未查明的异常痕迹仍在现场";
+      if (/^第\s*\d+\s*章产生一条可继续追查的事实$/.test(event.outcome)) event.outcome = "现场新增一条可继续追查的事实";
+      event.storyTime ??= `事件序列${event.sequence}·场景1`;
+      event.storyTime = event.storyTime.replace(/^第\d+章·场景/, `事件序列${event.sequence}·场景`);
       event.branchId ??= story.activeBranchId;
     }
     for (const chapter of story.chapters ?? []) {

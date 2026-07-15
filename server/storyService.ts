@@ -21,6 +21,7 @@ import {
 } from "./narrativeEngine";
 import { captureCanonState, deriveStateEffects } from "./canonState";
 import { narrativeProfileForGenre, sceneKitForGenre } from "./genreProfiles";
+import { createReadingExperienceContract, isSystemInvincibleExperience, parseReadingExperienceWords } from "./readingExperience";
 
 export function summarizeStory(story: Story): StorySummary {
   const activeChapter =
@@ -269,8 +270,10 @@ function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput,
   const lead = namePool[(seed >>> 3) % namePool.length];
   const firstTitle = openings[(seed >>> 6) % openings.length];
   const motif = inspiration.replace(/[。！？!?]/g, "").slice(0, 46);
-  const paragraphs = [
-    `${tone}的天光慢慢落下来，${sceneKit.setting}。${lead}原本准备照常完成今天的安排，却发现一个反常细节正与“${motif}”指向同一方向。它并不喧闹，只是让熟悉的节奏错开了半步，仿佛生活提前递来一项无法继续回避的选择。`,
+  const experienceWords = parseReadingExperienceWords(input.tone, input.genre);
+  const isSystemInvincible = isSystemInvincibleExperience(experienceWords);
+  const defaultParagraphs = [
+    `${sceneKit.setting}。${lead}原本准备照常完成今天的安排，一个具体变化却打断了手上的动作，并与“${motif}”指向同一方向。它已经改变眼前的人或资源，迫使${lead}立刻作出第一次选择。`,
     `${lead}并不是容易被一时情绪说服的人。作为${profile.protagonistPosition}，过去的经验早已教会自己先确认身体状态、周围环境和相关人物的反应，再判断眼前变化是否值得冒险。可这一次，自己的感受、既定安排与他人的说法只有两项能够同时成立，剩下那一项正在安静地改变今天的局面。`,
     `变化留下了可以触摸和复核的痕迹。${lead}没有急着给它命名，而是把发生前后的差异逐项记下，并用${sceneKit.action}的方式做了第一次验证。谨慎没有让事情变简单，它只是保证接下来失去某样东西时，至少还有一条清楚的路径，能够证明损失从何处开始。`,
     `第一位与此事有关的人坚称一切如常，转身时却准确说出了${lead}从未公开的细节。${lead}叫住对方，对方的神情先是茫然，继而像想起了某个不能提及的决定。那一瞬间的迟疑比完整解释更可靠，也把原本只属于个人的困惑推向了${sceneKit.pressure}。`,
@@ -288,9 +291,46 @@ function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput,
     `恐惧没有消失，只是被更具体的问题压到一旁。${lead}想起自己真正缺少的并非更多勇气，而是${profile.hiddenNeed}。如果仍按过去的方式独自承担，所有关系最终都会变成阻碍合作的盲点。于是，${lead}第一次把完整计划和真实状态交给可信的人，并明确约定：一旦局面变化，不要等待允许，立刻按共同确认的边界行动。`,
     `夜色完全落下时，早晨留下的标记被人改动了，旁边却多出一道更清楚的新痕。对方来过，也知道${lead}没有接受交换。${sceneKit.consequence}已经开始显现，这不是单纯的威胁，而是一份倒计时。${lead}收好全部记录，明白下一次行动必须赶在局面彻底锁死以前。`,
     `回到仍愿意等待自己的人身边，${lead}第一次完整说出今天发生了什么。${sceneKit.relationship}没有因为坦白立刻变得牢固，反而暴露出新的分歧；但每个人终于能在同一组事实上作出选择。这样的共同承担，比毫无裂缝的表面一致更可靠，也让下一步不再只属于一个人。`,
-    `${lead}随后再次尝试${sceneKit.action}。结果没有解决总目标，却证明“${profile.creativeAxes[3]}”能够被观察、被影响，也会留下反作用。${lead}把这次结果连同失败部分一起保存，不允许胜利的叙述删掉损失；一部长篇真正需要的，正是这些会在后来继续生长的后果。`,
-    `熟悉的空间重新安静下来，早晨那场变化却以另一种形式再次出现。几秒以后，新的安排、消息或规则把矛头清楚指向${lead}，也带来一项尚未到来的考验。第一条可追溯的因果已经成立，真正的故事在这一刻开始向更远处生长。`,
+    `${lead}随后再次尝试${sceneKit.action}。结果没有解决总目标，却证明“${profile.creativeAxes[3]}”能够被观察、被影响，也会留下反作用。${lead}把这次结果连同失败部分一起保存，不允许一次胜利掩盖损失；这些后果会继续影响后来的人、资源和选择。`,
+    `熟悉的空间重新安静下来，早晨那场变化却以另一种形式再次出现。几秒以后，新的安排、消息或规则把矛头清楚指向${lead}，也带来一项即将面对的考验。第一条可追溯的因果已经成立，${lead}收好记录，立即朝最需要处理的方向走去。`,
   ];
+  const systemInvincibleParagraphs = [
+    `外门演武场的测灵碑在${lead}掌下裂成两半时，执事手里的逐出名册刚写完最后一笔。满场哄笑戛然而止，石屑还悬在半空，一道只有${lead}能够看见的金色界面已经横在眼前——【诸天至强系统绑定完成。宿主遭遇不公裁定，满足首次激活条件。】`,
+    `${lead}没有发愣。界面上只有三行信息：境界可无限提升，已掌握功法可瞬间圆满，击破强敌或旧秩序便能解锁新的世界权限。最下方的新人奖励正在闪烁：【万法归一体】【十万年修为】【一次规则豁免】。他在心中确认领取，沉睡的经脉随即被一股浩瀚力量彻底贯通。`,
+    `没有疼痛，也没有故弄玄虚的倒计时。系统反馈清清楚楚：奖励已经到账，力量已经属于他，任何人都无法撤回。${lead}抬眼看向高台，方才宣布他“灵根尽毁、终身不得入内门”的执事还保持着冷笑，却没发现自己腰间的验灵玉正在疯狂震颤，表面一连炸开了七道裂纹。`,
+    `“测灵碑年久失修，与他无关。”执事厉声盖过骚动，抬手便是一记镇脉掌。那是专门惩戒外门弟子的玄阶武技，掌风压得前排弟子连退数步。${lead}站在原地，只伸出一根手指。掌印撞上指尖的一刻，所有劲力像撞进无底深渊，连他的衣角都没能掀动。`,
+    `${lead}屈指轻弹。执事身前的护体灵光层层崩碎，整个人横飞十余丈，撞断高台石栏才停下。没有缠斗，没有险胜，更没有谁及时赶来救场；从执事出手到落地，不过一次呼吸。演武场上数百人同时噤声，终于看清这不是侥幸，而是无法用境界差距衡量的绝对差距。`,
+    `【击溃外门执事，首次碾压完成。奖励：宗门功法库最高权限；奖励：修为提升至本界极限；奖励：宿主可指定一门功法，令在场友方共同掌握。】系统提示接连亮起，每一项奖励都立刻生效。${lead}随手翻开执事掉落的青木诀，只看一眼，整部功法便从入门推演到了从未有人抵达的第九重。`,
+    `高台后的三口古钟无人敲击，却同时长鸣。内门长老、峰主乃至闭关多年的太上长老纷纷睁眼，神识越过山门落在${lead}身上。有人惊疑，有人贪婪，也有人已经开始计算如何抹去刚才的裁定。力量差距带来的第一个结果不是新的苦战，而是整个宗门的立场被迫重新排列。`,
+    `执事挣扎着抬头，第一句话仍是威胁：“你敢在宗门伤人，执法堂——”${lead}走到他面前，把逐出名册从其手中抽走。他没有解释力量从何而来，只指着名册上被强占名额的十二个名字：“把他们的灵石、功勋和入门资格全部还回去。现在。”`,
+    `执事还想拖延，系统界面已经替${lead}标出名册背后的灵力暗记：谁改过记录，赃物藏在何处，哪位内门管事从中分利，一目了然。${lead}抬手一划，暗记化作金光投在半空，所有人的名字与数目清晰可见。系统没有替他决定该怎么做，却把足以改变局势的信息和力量完整交到了他手里。`,
+    `人群里先响起一声压抑的抽气，随后是越来越多的质问。那些被夺走名额的弟子不再只敢低头，负责维持秩序的杂役也停下了驱赶动作。${lead}的胜利第一次越过个人恩怨：他只是公开一份记录，外门多年默认的分配方式便失去了遮掩。`,
+    `执法堂主带着十六名弟子御剑而来，剑阵在半空合成一条百丈青蛟。堂主没有询问缘由，开口便要废去${lead}修为，以宗规封住所有人的嘴。系统显示出剑阵的一百三十七处破绽，但${lead}没有逐一破解；他向前踏出一步，单凭释放的气息便让青蛟寸寸瓦解，十六柄飞剑齐齐坠地。`,
+    `堂主脸色惨白，直到此刻才明白人数、阵法和境界都无法填平差距。${lead}没有追着弱者炫耀，只隔空按下一掌。执法堂象征权威的黑铁牌楼轰然陷入地面，唯独站在牌楼下的弟子毫发无伤。这份精准比毁灭更令人恐惧：他不仅能横推眼前的一切，也能决定力量落在哪里。`,
+    `【连续改变两项宗门规则，世界权限解锁百分之一。新功能开放：势力面板。】金色界面展开，宗门各峰的资源、敌意和求援状态化为清晰条目。${lead}看见外门药田被私吞，看见矿脉里还有三十七名弟子被困，也看见山门之外，一艘来自上宗的云舟正以问罪之名逼近。`,
+    `他没有因为新的敌人出现就怀疑自己能否获胜。系统给出的力量没有上限，眼前世界也没有能让他退让的对手。真正需要选择的是先救谁、先改哪一条规则，以及每一次轻易获胜之后，要让留下的人生活在怎样的秩序里。`,
+    `${lead}把共同掌握功法的奖励指定给名册上的十二人。金光落下，他们堵塞多年的经脉同时贯通，有人当场突破，有人捂着脸失声痛哭。系统再次确认状态永久生效，不会因为离开宗门或得罪长老而消失。围观者望向${lead}的目光由震惊变成了第一次真实的期待。`,
+    `太上长老的虚影终于在云端显现，语气比执法堂主客气，却仍想用首席弟子之位换取沉默。${lead}抬起那份名册：“我可以做首席，但不是接过你们的位置。我今天留下，是要把被拿走的东西一件件还回去。谁阻拦，谁就先从自己的位置上下来。”`,
+    `云层深处传来一声冷哼，护山大阵随之开启，九座山峰的灵力尽数压向演武场。${lead}抬手握住阵法落下的光柱，像折断一根枯枝般将它从中掰开。反噬没有落到弟子身上，而是沿阵纹倒卷回九峰，所有掌阵者面前的令牌同时熄灭。`,
+    `系统给出新的结算：【正面击破宗门最高防御，奖励诸天通行印；当前世界已无可对宿主构成威胁的力量。】${lead}收起界面，越过跪倒的执事与沉默的长老，朝矿脉方向走去。十二名刚刚获得功法的弟子跟在身后，脚步从迟疑变得整齐。`,
+    `山门外的上宗云舟恰在此时压过峰顶，传令者扬声要求交出“扰乱秩序的罪徒”。太上长老们脸色再变，过去足以让全宗低头的威压却没能让${lead}停步。他甚至没有回头，只向天空挥了一下手。庞大云舟便被无形力量定在原处，再也前进不了半寸。`,
+    `${lead}的第一天不再围绕如何证明自己有资格留下。他已经拥有随时横推宗门、上宗乃至此界的力量，也有一个会持续反馈、持续奖励并记录世界变化的系统。接下来要发生的，是他带着这份绝对优势走过诸天，把每个挡路的旧秩序正面击碎。`,
+  ];
+  const paragraphs = [...(isSystemInvincible ? systemInvincibleParagraphs : defaultParagraphs)];
+  if (!isSystemInvincible && paragraphs.join("").length < 2_400) {
+    paragraphs.splice(-1, 0,
+      `真正动身以前，${lead}又沿着${sceneKit.setting}走了一遍。先前被忽略的声音、位置与时间差此刻都有了意义：有人在回避视线，有人悄悄护住关键物件，也有人因为资源已经改变而不得不提前行动。${lead}没有把这些反应当成猜测，而是逐项记下能够再次验证的部分，并据此调整了下一步的顺序。`,
+    );
+  }
+  const experienceGene = isSystemInvincible ? {
+    protagonistPosition: "绑定诸天至强系统、从激活起便拥有压倒性力量的主角",
+    visibleGoal: "横推阻挡自己的势力，并用每次胜利重塑诸天秩序",
+    hiddenNeed: "决定如何使用无需担心失败的力量，让胜利真正改变他人的处境",
+    conflictEngine: "系统持续展示、量化并扩大主角的绝对优势；冲突关注胜利如何改变资源、身份与世界秩序",
+    recurringCost: "胜利不会削弱主角，却会扩大他的影响范围、保护目标与必须作出的治理选择",
+    endingShape: "主角保持不败走到诸天之巅，并建立不再依赖强者恩赐的新秩序",
+    creativeAxes: ["系统交互", "即时奖励", "碾压胜利", "众生反应", "秩序重塑"],
+  } : null;
   return {
     title,
     lead,
@@ -298,20 +338,20 @@ function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput,
     paragraphs,
     subtitle: inspiration,
     gene: {
-      protagonistPosition: `${profile.protagonistPosition}；故事起点由“${motif}”触发`,
-      visibleGoal: profile.visibleGoal,
-      hiddenNeed: profile.hiddenNeed,
-      conflictEngine: `${profile.conflictEngine}；所有推进保持“${tone}”的叙事温度`,
-      recurringCost: `${profile.recurringCost}；每次选择必须留下可追溯损失`,
-      endingShape: profile.endingShape,
-      creativeAxes: profile.creativeAxes,
+      protagonistPosition: experienceGene?.protagonistPosition ?? `${profile.protagonistPosition}；故事起点由“${motif}”触发`,
+      visibleGoal: experienceGene?.visibleGoal ?? profile.visibleGoal,
+      hiddenNeed: experienceGene?.hiddenNeed ?? profile.hiddenNeed,
+      conflictEngine: experienceGene?.conflictEngine ?? `${profile.conflictEngine}；所有推进保持“${tone}”的叙事温度`,
+      recurringCost: experienceGene?.recurringCost ?? `${profile.recurringCost}；每次选择必须留下可追溯损失`,
+      endingShape: experienceGene?.endingShape ?? profile.endingShape,
+      creativeAxes: experienceGene?.creativeAxes ?? profile.creativeAxes,
     },
     ending: {
-      targetEnding: `${profile.endingShape}；结局必须回应开篇意象“${motif}”`,
-      characterArc: `从受困于既有处境，到真正理解“${profile.hiddenNeed}”`,
+      targetEnding: `${experienceGene?.endingShape ?? profile.endingShape}；结局必须回应开篇意象“${motif}”`,
+      characterArc: `从受困于既有处境，到真正理解“${experienceGene?.hiddenNeed ?? profile.hiddenNeed}”`,
       prerequisites: [
-        `${profile.creativeAxes[0]}至少完成一次可验证回收`,
-        `${profile.creativeAxes[1]}对人物关系造成不可逆影响`,
+        `${experienceGene?.creativeAxes[0] ?? profile.creativeAxes[0]}至少完成一次可验证回收`,
+        `${experienceGene?.creativeAxes[1] ?? profile.creativeAxes[1]}对人物关系造成不可逆影响`,
         `开篇灵感“${motif}”在结局前获得因果解释`,
       ],
     },
@@ -331,6 +371,17 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
   const lengthPlan = getStoryLengthOption(input.lengthPlan);
   const length = lengthPlan.label;
   const blueprint = personalizedBlueprint(template, input, id);
+  const readingExperience = createReadingExperienceContract({
+    tone: input.tone,
+    genre: input.genre,
+    createdAt,
+  });
+  const initialKnowledge = isSystemInvincibleExperience(readingExperience.sourceWords)
+    ? [
+        "系统确认既有修为、能力、奖励与世界权限全部持续生效",
+        `${blueprint.lead}已经在第一场正面对抗中以一击取得压倒性胜利`,
+      ]
+    : ["亲眼看到的起始异常仍然影响眼前选择"];
   const story: Story = {
     id,
     ownerId,
@@ -361,6 +412,7 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     updatedAt: createdAt,
     unreadCanonChanges: 0,
     readingProgress: { chapterId, scrollProgress: 0, updatedAt: createdAt, progressVersion: 1, activeBranchId: branchId, canonVersion: 1 },
+    readingExperience,
     storyGene: { ...blueprint.gene, version: 1, createdAt },
     endingContract: {
       ...blueprint.ending,
@@ -437,8 +489,8 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         lifecycle: "alive",
         location: "故事起点",
         goal: blueprint.gene.visibleGoal,
-        knowledge: ["第一章中亲眼看到的异常"],
-        knowledgeSources: [{ fact: "第一章中亲眼看到的异常", sourceChapter: 1, sourceRevisionId: revisionId }],
+        knowledge: initialKnowledge,
+        knowledgeSources: initialKnowledge.map((fact) => ({ fact, sourceChapter: 1, sourceRevisionId: revisionId })),
         inventoryItemIds: [],
         relationship: "尚未建立稳定同盟",
         protected: false,

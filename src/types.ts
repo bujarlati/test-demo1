@@ -247,6 +247,72 @@ export interface StoryGene {
   createdAt: string;
 }
 
+export type ReadingExperienceAxisId = "primary" | "secondary";
+
+export type ReadingExperienceSignalKind =
+  | "mechanic"
+  | "protagonist_action"
+  | "conflict_outcome"
+  | "world_reaction"
+  | "relationship"
+  | "pacing"
+  | "voice";
+
+export interface ReadingExperienceSignal {
+  id: string;
+  kind: ReadingExperienceSignalKind;
+  description: string;
+  /** Concrete phrases the writer must realize verbatim so evidence can be checked without reusing the feeling word as a label. */
+  evidenceAnchors?: string[];
+}
+
+export interface ReadingExperiencePromise {
+  id: string;
+  description: string;
+  scope: "opening" | "every_chapter" | "every_arc" | "whole_story";
+}
+
+export interface ReadingExperienceAxisContract {
+  id: ReadingExperienceAxisId;
+  word: string;
+  interpretation: string;
+  observableSignals: ReadingExperienceSignal[];
+  hardPromises: ReadingExperiencePromise[];
+  forbiddenShortcuts: string[];
+}
+
+export interface OpeningExperienceRequirement {
+  chapterOffset: 0 | 1;
+  requiredSignalIds: string[];
+  mustHappen: string[];
+}
+
+export interface ReadingExperienceContract {
+  schemaVersion: 1;
+  sourceTone: string;
+  sourceWords: [string, string];
+  axes: [ReadingExperienceAxisContract, ReadingExperienceAxisContract];
+  synthesis: string;
+  globalHardPromises: ReadingExperiencePromise[];
+  forbiddenCliches: string[];
+  openingRequirements: [OpeningExperienceRequirement, OpeningExperienceRequirement];
+  delivery: {
+    minSignalsPerAxisPerChapter: number;
+    maxSilentChapters: number;
+    combinedSignalEveryChapters: number;
+  };
+  effectiveFromChapter: number;
+  provenance: "curated" | "model" | "fallback" | "legacy";
+  createdAt: string;
+}
+
+export interface ReadingExperienceEvidence {
+  axisId: ReadingExperienceAxisId;
+  word: string;
+  signalIds: string[];
+  quote: string;
+}
+
 export interface EndingContract {
   version: number;
   targetEnding: string;
@@ -338,6 +404,7 @@ export interface Story {
   updatedAt: string;
   unreadCanonChanges: number;
   readingProgress: ReadingProgress;
+  readingExperience: ReadingExperienceContract;
   storyGene: StoryGene;
   endingContract: EndingContract;
   worldBible: WorldBible;
@@ -428,7 +495,7 @@ export interface GenerationJob {
   idempotencyKey?: string;
   storyTitle: string;
   chapterNumber: number;
-  task: "chapter" | "retcon" | "extract";
+  task: "opening" | "chapter" | "retcon" | "extract";
   model: string;
   connectionId: string;
   promptVersion: string;
@@ -589,6 +656,7 @@ export interface AppStore {
 export interface BootstrapPayload {
   user: UserProfile;
   stories: StorySummary[];
+  modelConnections: GenerationModelOption[];
   activeStoryId: string | null;
   pendingJobs: GenerationJob[];
   recoverableJobs: GenerationJob[];
@@ -604,6 +672,17 @@ export interface CreateStoryInput {
   tone?: string;
   lengthPlan?: StoryLengthPlanId;
   inspiration?: string;
+  modelConnectionId?: string;
+}
+
+export interface GenerationModelOption {
+  id: string;
+  name: string;
+  status: ModelConnectionStatus;
+  plannerModel: string;
+  writerModel: string;
+  isDefault: boolean;
+  managedLocal: boolean;
 }
 
 export interface ModelConnectionInput {

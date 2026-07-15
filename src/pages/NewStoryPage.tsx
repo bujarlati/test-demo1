@@ -1,16 +1,53 @@
-import { ArrowLeft, ArrowRight, Check, Dices, LoaderCircle, Sparkles } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { ArrowLeft, ArrowRight, Check, CircleAlert, Dices, LoaderCircle, ServerCog, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { BookCover } from "../components/BookCover";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
 import { composeCustomTone, CUSTOM_TONE_WORD_MAX_LENGTH, DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
+import type { GenerationModelOption, ModelConnectionStatus } from "../types";
+
+const connectionStatusLabel: Record<ModelConnectionStatus, string> = {
+  draft: "待测试",
+  validating: "测试中",
+  active: "可用",
+  degraded: "能力降级",
+  disabled: "已停用",
+  revoked: "凭据失效",
+};
+
+function canGenerateWith(connection: GenerationModelOption) {
+  return connection.status === "active" && !connection.managedLocal;
+}
+
+function generationAvailability(connection: GenerationModelOption) {
+  if (connection.managedLocal) {
+    return {
+      selectable: false,
+      label: "托管占位 · 禁用",
+      reason: "本地托管占位不可用于高质量故事生成。",
+    };
+  }
+  if (connection.status !== "active") {
+    return {
+      selectable: false,
+      label: connectionStatusLabel[connection.status],
+      reason: "连接尚未通过测试，当前不能用于生成。",
+    };
+  }
+  return { selectable: true, label: null, reason: null };
+}
+
+function preferredConnection(connections: GenerationModelOption[]) {
+  return connections.find((connection) => canGenerateWith(connection) && connection.isDefault)
+    ?? connections.find(canGenerateWith);
+}
 
 export function NewStoryPage() {
   const navigate = useNavigate();
   const toast = useToast();
-  const { refresh } = useApp();
+  const { data, refresh } = useApp();
   const [genre, setGenre] = useState<StoryGenre>("悬疑");
   const [presetTone, setPresetTone] = useState<string>(STORY_TONES[0]);
   const [toneMode, setToneMode] = useState<"preset" | "custom">("preset");
@@ -19,6 +56,9 @@ export function NewStoryPage() {
   const [inspiration, setInspiration] = useState("");
   const [creating, setCreating] = useState(false);
   const [stage, setStage] = useState(0);
+  const [modelConnectionId, setModelConnectionId] = useState(
+    () => preferredConnection(data?.modelConnections ?? [])?.id ?? "",
+  );
   const creationIdempotencyKey = useRef(crypto.randomUUID());
 
   const preview = useMemo(() => getGenreOption(genre), [genre]);
@@ -31,6 +71,20 @@ export function NewStoryPage() {
     [customToneWords],
   );
   const tone = toneMode === "custom" ? customTone : presetTone;
+  const modelConnections = useMemo(() => data?.modelConnections ?? [], [data?.modelConnections]);
+  const selectedConnection = useMemo(
+    () => modelConnections.find((connection) => connection.id === modelConnectionId && canGenerateWith(connection)),
+    [modelConnectionId, modelConnections],
+  );
+
+  useEffect(() => {
+    setModelConnectionId((currentId) => {
+      if (modelConnections.some((connection) => connection.id === currentId && canGenerateWith(connection))) {
+        return currentId;
+      }
+      return preferredConnection(modelConnections)?.id ?? "";
+    });
+  }, [modelConnections]);
 
   const randomize = () => {
     setGenre(STORY_GENRES[Math.floor(Math.random() * STORY_GENRES.length)].label);
@@ -46,11 +100,21 @@ export function NewStoryPage() {
       toast(`请分别输入两个不超过 ${CUSTOM_TONE_WORD_MAX_LENGTH} 个字的基调词语。`, "error");
       return;
     }
+    if (!selectedConnection) {
+      toast("请先选择一个已通过测试的模型连接；系统不会静默切换模型。", "error");
+      return;
+    }
     setCreating(true);
     setStage(0);
     const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 420);
     try {
-      const story = await api.createStory({ genre, tone, lengthPlan, inspiration }, creationIdempotencyKey.current);
+      const story = await api.createStory({
+        genre,
+        tone,
+        lengthPlan,
+        inspiration,
+        modelConnectionId: selectedConnection.id,
+      }, creationIdempotencyKey.current);
       await refresh();
       toast("第一章已经写好，故事开始了。");
       navigate(`/story/${story.id}`);
@@ -160,7 +224,66 @@ export function NewStoryPage() {
             <div className="textarea-meta"><span>不用解释如何写</span><span>{inspiration.length}/180</span></div>
           </fieldset>
 
-          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={creating || !tone}>
+          <fieldset>
+            <legend><span>05</span> 选择本次生成模型 <em>必选</em></legend>
+            {modelConnections.length > 0 && (
+              <div className="choice-grid choice-grid--models" role="radiogroup" aria-label="本次生成模型">
+                {modelConnections.map((connection) => {
+                  const availability = generationAvailability(connection);
+                  const selectable = availability.selectable;
+                  const selected = modelConnectionId === connection.id;
+                  return (
+                    <label
+                      key={connection.id}
+                      className={`${selected ? "selected" : ""}${selectable ? "" : " disabled"}`.trim()}
+                    >
+                      <input
+                        type="radio"
+                        name="model-connection"
+                        value={connection.id}
+                        checked={selected}
+                        disabled={!selectable}
+                        onChange={() => setModelConnectionId(connection.id)}
+                      />
+                      <span className="model-choice__icon"><ServerCog size={18} /></span>
+                      <span className="model-choice__body">
+                        <span className="model-choice__heading">
+                          <strong>{connection.name}</strong>
+                          {connection.isDefault && <small className="model-choice__tag">账号默认</small>}
+                          {!selectable && (
+                            <small className="model-choice__tag model-choice__tag--disabled">
+                              {availability.label}
+                            </small>
+                          )}
+                        </span>
+                        <span className="model-choice__routes">
+                          <span><small>Planner · 规划</small><strong>{connection.plannerModel}</strong></span>
+                          <span><small>Writer · 正文</small><strong>{connection.writerModel}</strong></span>
+                        </span>
+                        {!selectable && (
+                          <small className="model-choice__reason">{availability.reason}</small>
+                        )}
+                      </span>
+                      {selected && <Check className="model-choice__check" size={16} />}
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            {!selectedConnection && (
+              <div className="model-choice-empty" role="alert">
+                <CircleAlert size={18} />
+                <span>
+                  <strong>暂无可用于高质量生成的模型连接</strong>
+                  <small>请先新增并测试一个自定义连接，再回来开始故事。</small>
+                </span>
+                <Link className="text-link" to="/settings/models">前往模型连接</Link>
+              </div>
+            )}
+            <p className="model-choice-note">第一章固定使用所选 Planner 与 Writer；开篇失败时会停止并明确报错，不会静默切换。后续章节按该连接已配置的回退策略执行。</p>
+          </fieldset>
+
+          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={creating || !tone || !selectedConnection}>
             {creating ? <><LoaderCircle className="spin" size={19} /> 正在让故事醒来</> : <><Sparkles size={18} /> 生成第一章 <ArrowRight size={18} /></>}
           </button>
           <p className="form-footnote">系统会在后台生成故事基因、人物与暂定结局，但不会提前剧透。</p>
