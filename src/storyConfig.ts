@@ -53,6 +53,42 @@ export const STORY_GENRES = [
 
 export type StoryGenre = (typeof STORY_GENRES)[number]["label"];
 
+export const STORY_TONES = [
+  "冷冽 · 克制",
+  "温暖 · 轻盈",
+  "诡谲 · 梦境",
+  "明快 · 冒险",
+  "热血 · 激昂",
+  "沉郁 · 厚重",
+  "浪漫 · 细腻",
+  "轻松 · 幽默",
+  "紧张 · 压迫",
+  "苍凉 · 史诗",
+  "治愈 · 日常",
+  "黑暗 · 残酷",
+  "诗意 · 空灵",
+  "理性 · 冷静",
+  "爽快 · 逆袭",
+  "疯狂 · 荒诞",
+] as const;
+
+export const CUSTOM_TONE_WORD_MAX_LENGTH = 6;
+
+function isToneWord(value: string): boolean {
+  const word = value.trim();
+  return word.length > 0 && Array.from(word).length <= CUSTOM_TONE_WORD_MAX_LENGTH && /^[\p{L}\p{N}]+$/u.test(word);
+}
+
+export function composeCustomTone(firstWord: string, secondWord: string): string | null {
+  if (!isToneWord(firstWord) || !isToneWord(secondWord)) return null;
+  return `${firstWord.trim()} · ${secondWord.trim()}`;
+}
+
+export function isStoryTone(value: string): boolean {
+  const parts = value.split("·");
+  return parts.length === 2 && composeCustomTone(parts[0], parts[1]) !== null;
+}
+
 export const STORY_LENGTH_OPTIONS = [
   { id: "starter", label: "新锐连载 · 预计 80 章", name: "新锐连载", chapterCount: 80, note: "约 1 部完整故事" },
   { id: "standard", label: "标准长篇 · 预计 200 章", name: "标准长篇", chapterCount: 200, note: "适合稳定追更" },

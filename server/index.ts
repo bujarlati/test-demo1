@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
-import { STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
+import { isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
 import { audit, authenticate, login, publicUser, requireAdmin, type AuthLocals } from "./auth";
 import {
   assertSafeEndpoint,
@@ -243,7 +243,7 @@ const storyLengthPlanValues = STORY_LENGTH_OPTIONS.map((option) => option.id) as
 
 const createStorySchema = z.object({
   genre: z.enum(storyGenreValues),
-  tone: z.string().max(40).optional(),
+  tone: z.string().max(40).refine(isStoryTone, { message: "阅读基调需要由两个简短词语组成。" }).optional(),
   lengthPlan: z.enum(storyLengthPlanValues).optional(),
   inspiration: z.string().max(180).optional(),
   idempotencyKey: z.string().min(8).max(120).optional(),

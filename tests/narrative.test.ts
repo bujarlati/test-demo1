@@ -19,7 +19,7 @@ import { safetyCategories } from "../server/safetyService";
 import { recordSafetyDecision } from "../server/safetyService";
 import { createSeedStore } from "../server/seed";
 import { commitNextChapter, createStory, finalizeStoryIfTargetReached } from "../server/storyService";
-import { STORY_GENRES, STORY_LENGTH_OPTIONS } from "../src/storyConfig";
+import { composeCustomTone, isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES } from "../src/storyConfig";
 import { currentRevision } from "../src/storyDomain";
 
 test("new stories expose broad web-fiction genres and serial-scale chapter plans", () => {
@@ -48,6 +48,18 @@ test("new stories expose broad web-fiction genres and serial-scale chapter plans
   const sports = genreStories.find((story) => story.genre === "体育")!;
   assert.match(currentRevision(sports.chapters[0])!.paragraphs.join(""), /训练馆|赛程|队友|竞技/);
   assert.match(currentRevision(xianxia.chapters[0])!.paragraphs.join(""), /山门|灵气|宗门|修炼/);
+});
+
+test("story tone presets are broad and two custom words form one safe tone", () => {
+  assert.ok(STORY_TONES.length >= 12);
+  assert.equal(composeCustomTone(" 清冷 ", "浪漫"), "清冷 · 浪漫");
+  assert.equal(composeCustomTone("", "浪漫"), null);
+  assert.equal(composeCustomTone("过于漫长的基调词", "浪漫"), null);
+  assert.equal(composeCustomTone("清冷 · 阴郁", "浪漫"), null);
+  assert.equal(isStoryTone("清冷 · 浪漫"), true);
+  assert.equal(isStoryTone("只有一个词语"), false);
+  const story = createStory({ genre: "都市", tone: "清冷 · 浪漫" }, "user_test");
+  assert.equal(story.tone, "清冷 · 浪漫");
 });
 
 test("a newly created story opens with a substantial first chapter", () => {

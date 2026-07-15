@@ -5,16 +5,16 @@ import { api } from "../api";
 import { BookCover } from "../components/BookCover";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
-import { DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
-
-const tones = ["冷冽 · 克制", "温暖 · 轻盈", "诡谲 · 梦境", "明快 · 冒险"];
+import { composeCustomTone, CUSTOM_TONE_WORD_MAX_LENGTH, DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
 
 export function NewStoryPage() {
   const navigate = useNavigate();
   const toast = useToast();
   const { refresh } = useApp();
   const [genre, setGenre] = useState<StoryGenre>("悬疑");
-  const [tone, setTone] = useState(tones[0]);
+  const [presetTone, setPresetTone] = useState<string>(STORY_TONES[0]);
+  const [toneMode, setToneMode] = useState<"preset" | "custom">("preset");
+  const [customToneWords, setCustomToneWords] = useState<[string, string]>(["", ""]);
   const [lengthPlan, setLengthPlan] = useState<StoryLengthPlanId>(DEFAULT_STORY_LENGTH.id);
   const [inspiration, setInspiration] = useState("");
   const [creating, setCreating] = useState(false);
@@ -26,15 +26,26 @@ export function NewStoryPage() {
     () => STORY_LENGTH_OPTIONS.find((option) => option.id === lengthPlan) ?? DEFAULT_STORY_LENGTH,
     [lengthPlan],
   );
+  const customTone = useMemo(
+    () => composeCustomTone(customToneWords[0], customToneWords[1]),
+    [customToneWords],
+  );
+  const tone = toneMode === "custom" ? customTone : presetTone;
 
   const randomize = () => {
     setGenre(STORY_GENRES[Math.floor(Math.random() * STORY_GENRES.length)].label);
-    setTone(tones[Math.floor(Math.random() * tones.length)]);
+    setPresetTone(STORY_TONES[Math.floor(Math.random() * STORY_TONES.length)]);
+    setToneMode("preset");
+    setCustomToneWords(["", ""]);
     setLengthPlan(STORY_LENGTH_OPTIONS[Math.floor(Math.random() * STORY_LENGTH_OPTIONS.length)].id);
     setInspiration("");
   };
 
   const submit = async () => {
+    if (!tone) {
+      toast(`请分别输入两个不超过 ${CUSTOM_TONE_WORD_MAX_LENGTH} 个字的基调词语。`, "error");
+      return;
+    }
     setCreating(true);
     setStage(0);
     const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 420);
@@ -81,11 +92,46 @@ export function NewStoryPage() {
           </fieldset>
 
           <fieldset>
-            <legend><span>02</span> 阅读时希望是什么感觉？ <small>可跳过</small></legend>
+            <legend><span>02</span> 阅读时希望是什么感觉？ <small>选择预设，或自定义两个词语</small></legend>
             <div className="pill-options">
-              {tones.map((item) => (
-                <button type="button" key={item} className={tone === item ? "selected" : ""} onClick={() => setTone(item)}>{item}</button>
+              {STORY_TONES.map((item) => (
+                <button type="button" key={item} className={toneMode === "preset" && presetTone === item ? "selected" : ""} onClick={() => { setPresetTone(item); setToneMode("preset"); }}>{item}</button>
               ))}
+            </div>
+            <div className={`custom-tone ${toneMode === "custom" ? "selected" : ""}`}>
+              <div className="custom-tone__heading">
+                <strong>自定义基调</strong>
+                <small>每个词语最多 {CUSTOM_TONE_WORD_MAX_LENGTH} 个字</small>
+              </div>
+              <div className="custom-tone__fields">
+                <label>
+                  <span>第一个词语</span>
+                  <input
+                    aria-label="第一个基调词语"
+                    value={customToneWords[0]}
+                    maxLength={CUSTOM_TONE_WORD_MAX_LENGTH}
+                    placeholder="例如：清冷"
+                    onFocus={() => setToneMode("custom")}
+                    onChange={(event) => { setToneMode("custom"); setCustomToneWords([event.target.value, customToneWords[1]]); }}
+                  />
+                </label>
+                <span className="custom-tone__separator" aria-hidden="true">·</span>
+                <label>
+                  <span>第二个词语</span>
+                  <input
+                    aria-label="第二个基调词语"
+                    value={customToneWords[1]}
+                    maxLength={CUSTOM_TONE_WORD_MAX_LENGTH}
+                    placeholder="例如：浪漫"
+                    onFocus={() => setToneMode("custom")}
+                    onChange={(event) => { setToneMode("custom"); setCustomToneWords([customToneWords[0], event.target.value]); }}
+                  />
+                </label>
+                <div className="custom-tone__result" aria-live="polite">
+                  <small>组合效果</small>
+                  <strong>{customTone ?? "等待两个词语"}</strong>
+                </div>
+              </div>
             </div>
           </fieldset>
 
@@ -114,7 +160,7 @@ export function NewStoryPage() {
             <div className="textarea-meta"><span>不用解释如何写</span><span>{inspiration.length}/180</span></div>
           </fieldset>
 
-          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={creating}>
+          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={creating || !tone}>
             {creating ? <><LoaderCircle className="spin" size={19} /> 正在让故事醒来</> : <><Sparkles size={18} /> 生成第一章 <ArrowRight size={18} /></>}
           </button>
           <p className="form-footnote">系统会在后台生成故事基因、人物与暂定结局，但不会提前剧透。</p>
@@ -130,7 +176,7 @@ export function NewStoryPage() {
           />
           <dl>
             <div><dt>题材</dt><dd>{genre}</dd></div>
-            <div><dt>氛围</dt><dd>{tone}</dd></div>
+            <div><dt>氛围</dt><dd>{tone ?? "等待两个词语"}</dd></div>
             <div><dt>规模</dt><dd>{selectedLength.chapterCount} 章</dd></div>
           </dl>
           <p>第一章生成后直接进入阅读，不展示大纲确认页。</p>
