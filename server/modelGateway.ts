@@ -160,6 +160,46 @@ async function modelFetch(
   });
 }
 
+async function discardResponse(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Optional capability probes degrade to false even if the provider body is malformed.
+  }
+}
+
+async function readProviderError(response: Response, maxBytes = 4_096): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (totalBytes < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = maxBytes - totalBytes;
+      const chunk = Buffer.from(value.subarray(0, remaining));
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+      if (value.length > remaining) break;
+    }
+  } catch {
+    return "";
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return "";
+  try {
+    const payload = JSON.parse(raw) as { error?: { message?: unknown }; message?: unknown };
+    const detail = payload.error?.message ?? payload.message;
+    if (typeof detail === "string") return detail.replace(/\s+/g, " ").slice(0, 300);
+  } catch {
+    // Fall back to a bounded plain-text diagnostic.
+  }
+  return raw.replace(/\s+/g, " ").slice(0, 300);
+}
+
 async function probeJson(connection: ModelConnection, apiKey: string) {
   try {
     const response = await modelFetch(connection, apiKey, "/chat/completions", {
@@ -172,7 +212,10 @@ async function probeJson(connection: ModelConnection, apiKey: string) {
         stream: false,
       }),
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      await discardResponse(response);
+      return false;
+    }
     const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
     const content = payload.choices?.[0]?.message?.content;
     if (!content) return false;
@@ -183,22 +226,53 @@ async function probeJson(connection: ModelConnection, apiKey: string) {
   }
 }
 
-async function probeTextCompletion(connection: ModelConnection, apiKey: string) {
+async function assertWriterCompletion(connection: ModelConnection, apiKey: string) {
+  const timeoutMs = 30_000;
+  const writerRoute = `正文（writer）路由 ${connection.routes.writer}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await modelFetch(connection, apiKey, "/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model: connection.routes.writer,
-        messages: [{ role: "user", content: "回复：好" }],
-        max_tokens: 4,
-        stream: false,
-      }),
-    });
-    if (!response.ok) return false;
-    const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    return typeof payload.choices?.[0]?.message?.content === "string";
-  } catch {
-    return false;
+    let response: Response;
+    try {
+      response = await modelFetch(connection, apiKey, "/chat/completions", {
+        method: "POST",
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: connection.routes.writer,
+          messages: [{ role: "user", content: "回复：好" }],
+          max_tokens: 4,
+          stream: false,
+        }),
+      }, timeoutMs);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "未知传输错误";
+      if (controller.signal.aborted || /超时/.test(reason)) {
+        throw new Error(`${writerRoute}的最小正文请求超时（${timeoutMs / 1_000} 秒）。`);
+      }
+      throw new Error(`${writerRoute}的最小正文请求失败：${reason}`);
+    }
+
+    if (!response.ok) {
+      const detail = await readProviderError(response);
+      throw new Error(`${writerRoute}返回 ${response.status}${detail ? `：${detail}` : ""}。`);
+    }
+
+    let payload: { choices?: Array<{ message?: { content?: string } }> };
+    try {
+      payload = (await response.json()) as typeof payload;
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`${writerRoute}的最小正文请求超时（${timeoutMs / 1_000} 秒）。`);
+      }
+      const reason = error instanceof Error ? error.message : "未知响应错误";
+      throw new Error(`${writerRoute}返回的正文响应不是有效 JSON：${reason.slice(0, 160)}。`);
+    }
+
+    if (typeof payload.choices?.[0]?.message?.content !== "string") {
+      throw new Error(`${writerRoute}返回 200，但没有可用正文内容。`);
+    }
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -214,10 +288,14 @@ async function probeStreaming(connection: ModelConnection, apiKey: string) {
       }),
     });
     const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !/text\/event-stream/i.test(contentType)) {
+      await discardResponse(response);
+      return false;
+    }
     const reader = response.body?.getReader();
     const first = reader ? await reader.read() : null;
     await reader?.cancel();
-    return response.ok && /text\/event-stream/i.test(contentType) && Boolean(first && !first.done && first.value.length);
+    return Boolean(first && !first.done && first.value.length);
   } catch {
     return false;
   }
@@ -229,7 +307,10 @@ async function probeEmbedding(connection: ModelConnection, apiKey: string) {
       method: "POST",
       body: JSON.stringify({ model: connection.routes.embedding, input: "能力探测" }),
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      await discardResponse(response);
+      return false;
+    }
     const payload = (await response.json()) as { data?: Array<{ embedding?: unknown }> };
     return Array.isArray(payload.data?.[0]?.embedding);
   } catch {
@@ -249,7 +330,10 @@ async function probeToolCalling(connection: ModelConnection, apiKey: string) {
         max_tokens: 24,
       }),
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      await discardResponse(response);
+      return false;
+    }
     const payload = (await response.json()) as { choices?: Array<{ message?: { tool_calls?: unknown[] } }> };
     return Array.isArray(payload.choices?.[0]?.message?.tool_calls);
   } catch {
@@ -266,9 +350,16 @@ async function probePromptCache(connection: ModelConnection, apiKey: string) {
   });
   try {
     const warmup = await modelFetch(connection, apiKey, "/chat/completions", { method: "POST", body });
+    if (!warmup.ok) {
+      await discardResponse(warmup);
+      return false;
+    }
     await warmup.arrayBuffer();
     const response = await modelFetch(connection, apiKey, "/chat/completions", { method: "POST", body });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      await discardResponse(response);
+      return false;
+    }
     const payload = (await response.json()) as { usage?: { prompt_tokens_details?: { cached_tokens?: number }; cached_tokens?: number } };
     return (payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? 0) > 0;
   } catch {
@@ -276,13 +367,31 @@ async function probePromptCache(connection: ModelConnection, apiKey: string) {
   }
 }
 
-export async function testConnection(connection: ModelConnection): Promise<CapabilitySnapshot> {
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  const results = new Array<T>(tasks.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await tasks[index]();
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function testConnection(
+  connection: ModelConnection,
+  secretReader: typeof readSecret = readSecret,
+): Promise<CapabilitySnapshot> {
   await assertSafeEndpoint(connection.baseUrl);
-  const apiKey = await readSecret(connection.id, connection.secretVersion);
+  const apiKey = await secretReader(connection.id, connection.secretVersion);
   const startedAt = performance.now();
   const response = await modelFetch(connection, apiKey, "/models", { method: "GET" }, 10_000);
   if (!response.ok) {
-    throw new Error(`连接返回 ${response.status}，请检查地址、Key 与访问权限。`);
+    const detail = await readProviderError(response);
+    throw new Error(`连接返回 ${response.status}${detail ? `：${detail}` : ""}，请检查地址、Key 与访问权限。`);
   }
   const payload = (await response.json()) as { data?: Array<{ id?: string; context_window?: number; max_context_length?: number }> };
   const models = (payload.data ?? [])
@@ -290,15 +399,14 @@ export async function testConnection(connection: ModelConnection): Promise<Capab
     .filter((item): item is string => Boolean(item))
     .slice(0, 20);
   const maxContextTokens = Math.max(0, ...(payload.data ?? []).map((item) => item.context_window ?? item.max_context_length ?? 0)) || null;
-  const [textCompletion, jsonSchema, streaming, embedding, toolCalling, promptCache] = await Promise.all([
-    probeTextCompletion(connection, apiKey),
-    probeJson(connection, apiKey),
-    probeStreaming(connection, apiKey),
-    probeEmbedding(connection, apiKey),
-    probeToolCalling(connection, apiKey),
-    probePromptCache(connection, apiKey),
-  ]);
-  if (!textCompletion) throw new Error("连接能列出模型，但最小正文请求失败；请检查 writer 路由与调用权限。");
+  await assertWriterCompletion(connection, apiKey);
+  const [jsonSchema, streaming, embedding, toolCalling, promptCache] = await runWithConcurrency([
+    () => probeJson(connection, apiKey),
+    () => probeStreaming(connection, apiKey),
+    () => probeEmbedding(connection, apiKey),
+    () => probeToolCalling(connection, apiKey),
+    () => probePromptCache(connection, apiKey),
+  ], 2);
   return {
     streaming,
     jsonSchema,

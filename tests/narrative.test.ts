@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest } from "node:http";
 import test from "node:test";
-import { assertSafeEndpoint, createPinnedLookup } from "../server/modelGateway";
+import { assertSafeEndpoint, createPinnedLookup, testConnection } from "../server/modelGateway";
 import {
   applyExtractedCharacterState,
   buildChapterPrompt,
@@ -22,6 +22,132 @@ import { createSeedStore } from "../server/seed";
 import { commitNextChapter, createStory, finalizeStoryIfTargetReached } from "../server/storyService";
 import { composeCustomTone, isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES } from "../src/storyConfig";
 import { currentRevision } from "../src/storyDomain";
+import type { ModelConnection } from "../src/types";
+
+interface FakeModelProviderOptions {
+  writerDelayMs?: number;
+  writerHeadersOnly?: boolean;
+  writerStatus?: number;
+  responseDelayMs?: number;
+}
+
+const readFakeModelSecret = async () => "test-api-key";
+
+async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
+  let activeRequests = 0;
+  let maxConcurrentRequests = 0;
+  let resolveWriterProbeSeen: (() => void) | undefined;
+  let resolveWriterHeadersSent: (() => void) | undefined;
+  const writerProbeSeen = new Promise<void>((resolve) => {
+    resolveWriterProbeSeen = resolve;
+  });
+  const writerHeadersSent = new Promise<void>((resolve) => {
+    resolveWriterHeadersSent = resolve;
+  });
+  const server = createServer((request, response) => {
+    if (request.method === "GET" && request.url === "/models") {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ data: [{ id: "writer-test", context_window: 128_000 }] }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      activeRequests += 1;
+      maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+        messages?: Array<{ content?: string }>;
+        stream?: boolean;
+      };
+      const prompt = body.messages?.[0]?.content ?? "";
+      const isWriterProbe = prompt === "回复：好";
+      if (isWriterProbe) {
+        resolveWriterProbeSeen?.();
+        resolveWriterProbeSeen = undefined;
+      }
+      if (isWriterProbe && options.writerHeadersOnly) {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.write("{\"choices\":", () => {
+          resolveWriterHeadersSent?.();
+          resolveWriterHeadersSent = undefined;
+        });
+        return;
+      }
+      const delay = isWriterProbe ? options.writerDelayMs ?? 0 : options.responseDelayMs ?? 0;
+      const sendResponse = () => {
+        try {
+          if (isWriterProbe && options.writerStatus && options.writerStatus !== 200) {
+            response.statusCode = options.writerStatus;
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({ error: { message: "writer access denied" } }));
+          } else if (request.url === "/embeddings") {
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+          } else if (body.stream) {
+            response.setHeader("Content-Type", "text/event-stream");
+            response.end("data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n");
+          } else {
+            const content = prompt.startsWith("只返回 JSON") ? "{\"ok\":true}" : "好";
+            const message = prompt === "调用 ping 工具"
+              ? { content, tool_calls: [{ id: "call_ping", type: "function", function: { name: "ping", arguments: "{}" } }] }
+              : { content };
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({
+              choices: [{ message, finish_reason: "stop" }],
+              usage: { prompt_tokens_details: { cached_tokens: prompt.startsWith("提示词缓存") ? 8 : 0 } },
+            }));
+          }
+        } finally {
+          activeRequests -= 1;
+        }
+      };
+      if (delay > 0) setTimeout(sendResponse, delay);
+      else sendResponse();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const connection: ModelConnection = {
+    id: "conn_test_fake_provider",
+    name: "Fake model provider",
+    ownerScope: "platform",
+    ownerId: null,
+    protocol: "openai_compatible",
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    maskedKey: "test••••key",
+    secretRef: "test://fake-provider",
+    secretVersion: 1,
+    status: "draft",
+    routes: {
+      planner: "planner-test",
+      writer: "writer-test",
+      extractor: "extractor-test",
+      embedding: "embedding-test",
+    },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const previousAllowPrivate = process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
+  process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS = "true";
+  return {
+    connection,
+    writerHeadersSent,
+    writerProbeSeen,
+    maxConcurrentRequests: () => maxConcurrentRequests,
+    async close() {
+      if (previousAllowPrivate === undefined) delete process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
+      else process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS = previousAllowPrivate;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    },
+  };
+}
 
 test("new stories expose broad web-fiction genres and serial-scale chapter plans", () => {
   assert.ok(STORY_GENRES.length >= 20);
@@ -234,6 +360,61 @@ test("pinned model DNS lookup supports Node all-address requests", async () => {
     assert.equal(status, 200);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("connection test accepts a writer response beyond the former 12-second timeout", async (context) => {
+  const provider = await startFakeModelProvider({ writerDelayMs: 12_500 });
+  try {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const testResult = testConnection(provider.connection, readFakeModelSecret);
+    await provider.writerProbeSeen;
+    context.mock.timers.tick(12_500);
+    const capabilities = await testResult;
+    assert.equal(capabilities.embedding, true);
+    assert.equal(capabilities.maxContextTokens, 128_000);
+  } finally {
+    context.mock.timers.reset();
+    await provider.close();
+  }
+});
+
+test("connection test preserves the writer provider status and error detail", async () => {
+  const provider = await startFakeModelProvider({ writerStatus: 403 });
+  try {
+    await assert.rejects(
+      () => testConnection(provider.connection, readFakeModelSecret),
+      /writer.*403.*writer access denied/i,
+    );
+  } finally {
+    await provider.close();
+  }
+});
+
+test("connection test reports a writer timeout when the response body stalls", async (context) => {
+  const provider = await startFakeModelProvider({ writerHeadersOnly: true });
+  try {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const testResult = testConnection(provider.connection, readFakeModelSecret);
+    await provider.writerHeadersSent;
+    for (let turn = 0; turn < 10; turn += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    context.mock.timers.tick(30_000);
+    await assert.rejects(testResult, /writer.*超时（30 秒）/i);
+  } finally {
+    context.mock.timers.reset();
+    await provider.close();
+  }
+});
+
+test("connection test limits simultaneous capability probes to two", async () => {
+  const provider = await startFakeModelProvider({ responseDelayMs: 40, writerDelayMs: 40 });
+  try {
+    await testConnection(provider.connection, readFakeModelSecret);
+    assert.equal(provider.maxConcurrentRequests(), 2);
+  } finally {
+    await provider.close();
   }
 });
 
