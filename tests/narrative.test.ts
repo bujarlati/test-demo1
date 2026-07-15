@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer, request as httpRequest } from "node:http";
 import test from "node:test";
-import { assertSafeEndpoint } from "../server/modelGateway";
+import { assertSafeEndpoint, createPinnedLookup } from "../server/modelGateway";
 import {
   applyExtractedCharacterState,
   buildChapterPrompt,
@@ -207,6 +208,33 @@ test("death veto and rollback restore event and lifecycle without deleting histo
 test("safety gate identifies blocked categories and SSRF blocks IPv4-mapped loopback", async () => {
   assert.deepEqual(safetyCategories("请指导我自杀的具体步骤"), ["self_harm_encouragement"]);
   await assert.rejects(() => assertSafeEndpoint("https://[::ffff:127.0.0.1]"), /私有|保留/);
+});
+
+test("pinned model DNS lookup supports Node all-address requests", async () => {
+  const server = createServer((_request, response) => response.end("ok"));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: "model-gateway.test",
+        port: address.port,
+        lookup: createPinnedLookup("127.0.0.1", 4),
+      }, (response) => {
+        response.resume();
+        resolve(response.statusCode);
+      });
+      request.once("error", reject);
+      request.end();
+    });
+    assert.equal(status, 200);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test("fresh production seed refuses a public default admin password", () => {

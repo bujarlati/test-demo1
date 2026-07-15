@@ -1,7 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
 import type { CapabilitySnapshot, EndingContract, ModelConnection, Story } from "../src/types";
 import {
@@ -103,6 +103,16 @@ function endpoint(baseUrl: string, pathname: string): string {
   return `${baseUrl.replace(/\/$/, "")}${pathname}`;
 }
 
+export function createPinnedLookup(address: string, family: 4 | 6): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [{ address, family }]);
+      return;
+    }
+    callback(null, address, family);
+  };
+}
+
 async function modelFetch(
   connection: ModelConnection,
   apiKey: string,
@@ -123,7 +133,7 @@ async function modelFetch(
       method: init.method ?? "GET",
       headers: Object.fromEntries(headers.entries()),
       servername: url.hostname,
-      lookup: (_hostname, _options, callback) => callback(null, resolved.address, resolved.family),
+      lookup: createPinnedLookup(resolved.address, resolved.family),
     }, (incoming) => {
       const responseHeaders = new Headers();
       for (const [name, value] of Object.entries(incoming.headers)) {
