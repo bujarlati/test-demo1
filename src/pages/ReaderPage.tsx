@@ -43,6 +43,7 @@ import { Logo } from "../components/Logo";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
 import { currentRevision } from "../storyDomain";
+import { CHAPTER_LENGTH_PRESETS, type ChapterLengthMode } from "../storyConfig";
 import type { Chapter, ContentReport, ConversationMessage, Story } from "../types";
 import { formatDateTime } from "../utils";
 
@@ -54,7 +55,7 @@ interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
   width: number;
-  chapterLength: "compact" | "standard" | "immersive";
+  chapterLength: ChapterLengthMode;
 }
 
 const defaultSettings: ReaderSettings = { theme: "paper", fontSize: 20, lineHeight: 1.95, width: 720, chapterLength: "standard" };
@@ -228,6 +229,7 @@ export function ReaderPage() {
         }
       }, { chapterLength: settings.chapterLength, idempotencyKey: generationIdempotencyKey.current });
       setStory(result.story);
+      progressVersion.current = result.story.readingProgress.progressVersion;
       generationIdempotencyKey.current = crypto.randomUUID();
       const next = result.story.chapters.at(-1);
       if (next) { restorePosition.current = false; setChapterId(next.id); }
@@ -373,7 +375,7 @@ export function ReaderPage() {
           <section><label>正文字号 <strong>{settings.fontSize}px</strong></label><div className="stepper"><button type="button" aria-label="减小字号" onClick={() => setSettings({ ...settings, fontSize: Math.max(16, settings.fontSize - 1) })}><Minus size={16} /></button><span style={{ fontSize: `${settings.fontSize}px` }}>读</span><button type="button" aria-label="增大字号" onClick={() => setSettings({ ...settings, fontSize: Math.min(26, settings.fontSize + 1) })}><Plus size={16} /></button></div></section>
           <section><label htmlFor="line-height">行间距 <strong>{settings.lineHeight.toFixed(2)}</strong></label><input id="line-height" type="range" min="1.6" max="2.3" step="0.05" value={settings.lineHeight} onChange={(event) => setSettings({ ...settings, lineHeight: Number(event.target.value) })} /></section>
           <section><label htmlFor="text-width">正文宽度 <strong>{settings.width}px</strong></label><input id="text-width" type="range" min="600" max="820" step="20" value={settings.width} onChange={(event) => setSettings({ ...settings, width: Number(event.target.value) })} /></section>
-          <section><label>下一章长度</label><div className="theme-options"><button type="button" className={settings.chapterLength === "compact" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "compact" })}><span>精简</span></button><button type="button" className={settings.chapterLength === "standard" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "standard" })}><span>标准</span></button><button type="button" className={settings.chapterLength === "immersive" ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: "immersive" })}><span>沉浸</span></button></div></section>
+          <section><label>下一章篇幅</label><div className="theme-options chapter-length-options">{(["compact", "standard", "immersive"] as const).map((mode) => <button type="button" key={mode} className={settings.chapterLength === mode ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: mode })}><strong>{CHAPTER_LENGTH_PRESETS[mode].name}</strong><small>{CHAPTER_LENGTH_PRESETS[mode].note}</small></button>)}</div></section>
           {reports.length > 0 && <section className="reader-reports"><label>我的内容复核</label>{reports.slice(0, 4).map((report) => <article key={report.id}><span><strong>第 {story.chapters.find((item) => item.id === report.chapterId)?.number ?? "?"} 章</strong><small>{report.status === "submitted" ? "已提交" : report.status === "reviewing" ? "审核中" : report.status === "resolved" ? "已处理" : "申诉复核中"}</small></span>{report.status === "resolved" && <button type="button" className="text-link" onClick={() => void appeal(report.id)}>申诉</button>}</article>)}</section>}
           <button type="button" className="text-link reset-settings" onClick={() => setSettings(defaultSettings)}>恢复默认阅读设置</button>
         </div>

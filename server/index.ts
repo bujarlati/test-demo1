@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
+import { STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
 import { audit, authenticate, login, publicUser, requireAdmin, type AuthLocals } from "./auth";
 import {
   assertSafeEndpoint,
@@ -17,6 +18,7 @@ import {
   buildChapterPrompt,
   generateLocalChapter,
   planNextChapter,
+  validateGeneratedChapter,
   type GenerationPlan,
   type GeneratedChapter,
   type ExtractedChapterState,
@@ -26,6 +28,7 @@ import { loadStore, saveStore } from "./storage";
 import {
   commitNextChapter,
   createStory,
+  finalizeStoryIfTargetReached,
   summarizeStory,
   toggleCharacterProtection,
 } from "./storyService";
@@ -235,10 +238,13 @@ function calculateQualityBreakdown(): OpsQualityBucket[] {
   return [...buckets.values()].sort((a, b) => b.jobs - a.jobs).slice(0, 20);
 }
 
+const storyGenreValues = STORY_GENRES.map((option) => option.label) as [StoryGenre, ...StoryGenre[]];
+const storyLengthPlanValues = STORY_LENGTH_OPTIONS.map((option) => option.id) as [StoryLengthPlanId, ...StoryLengthPlanId[]];
+
 const createStorySchema = z.object({
-  genre: z.string().min(1).max(30),
+  genre: z.enum(storyGenreValues),
   tone: z.string().max(40).optional(),
-  length: z.string().max(40).optional(),
+  lengthPlan: z.enum(storyLengthPlanValues).optional(),
   inspiration: z.string().max(180).optional(),
   idempotencyKey: z.string().min(8).max(120).optional(),
 });
@@ -388,6 +394,14 @@ async function generateChapter(
   emit: (event: string, payload: unknown) => void,
 ): Promise<GenerationResult> {
   const storedStory = storyOrThrow(storyId, user);
+  if (storedStory.status === "active" && storedStory.chapters.length >= storedStory.targetChapterCount) {
+    if (!finalizeStoryIfTargetReached(storedStory)) {
+      const error = new Error("故事已达到目标章数，但结局契约尚未完整兑现；已阻止继续追加章节，请先修订终章。");
+      Object.assign(error, { status: 409 });
+      throw error;
+    }
+    await persist();
+  }
   if (storedStory.status !== "active") {
     const error = new Error(storedStory.status === "paused" ? "故事已暂停；恢复连载后才能生成下一章。" : "这个故事已结束或归档，不能继续生成。");
     Object.assign(error, { status: 409 });
@@ -466,6 +480,9 @@ async function generateChapter(
     await persist();
     emit("stage", { stage: 0, label: "组装当前正史与相关记忆" });
     const runGenerationPipeline = async () => {
+      plan = undefined;
+      generated = undefined;
+      extracted = undefined;
       const candidateBatch = isManagedLocal
         ? undefined
         : await generateCandidateDraftsWithConnection(effectiveConnection, story);
@@ -530,8 +547,9 @@ async function generateChapter(
         usageEstimated ||= generated.usageEstimated ?? true;
       }
       const extractionInputEstimate = Math.ceil((generated.title.length + generated.paragraphs.join("\n").length) / 2);
-      if (!isManagedLocal && usedTokens + extractionInputEstimate + 1_500 <= JOB_TOKEN_BUDGET) {
-        extracted = await extractChapterStateWithConnection(effectiveConnection, generated);
+      const isTerminalPlannedChapter = story.chapters.length + 1 >= story.targetChapterCount;
+      if (!isManagedLocal && (isTerminalPlannedChapter || usedTokens + extractionInputEstimate + 1_500 <= JOB_TOKEN_BUDGET)) {
+        extracted = await extractChapterStateWithConnection(effectiveConnection, generated, isTerminalPlannedChapter ? story.endingContract : undefined);
         usedTokens += extracted.usageTokens ?? 0;
         usageEstimated ||= extracted.usageEstimated ?? true;
       } else if (!isManagedLocal) {
@@ -539,6 +557,7 @@ async function generateChapter(
         budgetDegraded = true;
       }
       if (usedTokens > JOB_TOKEN_BUDGET) throw new Error("本次作业超过 12,000 Token 上限，未提交正史。");
+      validateGeneratedChapter(story, generated, plan, extracted);
     };
     try {
       await runGenerationPipeline();
@@ -590,6 +609,7 @@ async function generateChapter(
       if (isManagedLocal) await new Promise((resolve) => setTimeout(resolve, 90));
     }
     const chapter = commitNextChapter(story, plan, generated, extracted);
+    finalizeStoryIfTargetReached(story);
     emit("stage", { stage: 4, label: "事件已提取并提交为不可变 Revision" });
     Object.assign(job, {
       chapterNumber: chapter.number,

@@ -3,10 +3,14 @@ import test from "node:test";
 import { assertSafeEndpoint } from "../server/modelGateway";
 import {
   applyExtractedCharacterState,
+  buildChapterPrompt,
   buildConversationContext,
+  endingContractSatisfied,
   eventFromChapter,
+  generateLocalChapter,
   planNextChapter,
   retrieveRelevantMemory,
+  storyArcPhase,
   validateGeneratedChapter,
 } from "../server/narrativeEngine";
 import { replayBranchState } from "../server/canonState";
@@ -14,7 +18,74 @@ import { handleReaderMessage, rollbackRetcon } from "../server/retconService";
 import { safetyCategories } from "../server/safetyService";
 import { recordSafetyDecision } from "../server/safetyService";
 import { createSeedStore } from "../server/seed";
+import { commitNextChapter, createStory, finalizeStoryIfTargetReached } from "../server/storyService";
+import { STORY_GENRES, STORY_LENGTH_OPTIONS } from "../src/storyConfig";
 import { currentRevision } from "../src/storyDomain";
+
+test("new stories expose broad web-fiction genres and serial-scale chapter plans", () => {
+  assert.ok(STORY_GENRES.length >= 20);
+  assert.deepEqual(STORY_LENGTH_OPTIONS.map((option) => option.chapterCount), [80, 200, 500, 1000]);
+
+  const xianxia = createStory({
+    genre: "仙侠",
+    lengthPlan: STORY_LENGTH_OPTIONS[1].id,
+    inspiration: "一个杂役弟子发现宗门飞升的秘密",
+  }, "user_test");
+  const system = createStory({
+    genre: "系统流",
+    lengthPlan: STORY_LENGTH_OPTIONS[3].id,
+  }, "user_test");
+
+  assert.equal(xianxia.targetChapterCount, 200);
+  assert.equal(system.targetChapterCount, 1000);
+  assert.match(JSON.stringify(xianxia.storyGene), /宗门|灵根|飞升|问道/);
+  assert.match(JSON.stringify(system.storyGene), /系统|任务|奖励|权限/);
+
+  const genreStories = STORY_GENRES.map((option) => createStory({ genre: option.label }, "user_test"));
+  assert.equal(new Set(genreStories.map((story) => story.storyGene.creativeAxes.join("|"))).size, STORY_GENRES.length);
+  assert.ok(genreStories.every((story) => story.targetChapterCount === 200));
+  assert.ok(genreStories.every((story) => currentRevision(story.chapters[0])!.paragraphs.join("").length >= 2_400));
+  const sports = genreStories.find((story) => story.genre === "体育")!;
+  assert.match(currentRevision(sports.chapters[0])!.paragraphs.join(""), /训练馆|赛程|队友|竞技/);
+  assert.match(currentRevision(xianxia.chapters[0])!.paragraphs.join(""), /山门|灵气|宗门|修炼/);
+});
+
+test("a newly created story opens with a substantial first chapter", () => {
+  const story = createStory({
+    genre: "玄幻",
+    lengthPlan: STORY_LENGTH_OPTIONS[1].id,
+    inspiration: "被废去修为的少年在矿山里听见远古心跳",
+  }, "user_test");
+  const revision = currentRevision(story.chapters[0])!;
+
+  assert.ok(revision.paragraphs.length >= 18);
+  assert.ok(revision.paragraphs.join("").length >= 2_400);
+  assert.ok(story.chapters[0].estimatedMinutes >= 10);
+});
+
+test("chapter plans enforce novel-sized prose instead of paragraph-count padding", () => {
+  const story = structuredClone(createSeedStore().stories[0]);
+  const compact = planNextChapter(story, undefined, "compact");
+  const standard = planNextChapter(story, undefined, "standard");
+  const immersive = planNextChapter(story, undefined, "immersive");
+
+  assert.ok(compact.targetCharacters < standard.targetCharacters);
+  assert.ok(standard.targetCharacters < immersive.targetCharacters);
+  assert.ok(standard.targetCharacters >= 2_400);
+
+  for (const plan of [compact, standard, immersive]) {
+    const generated = generateLocalChapter(story, plan);
+    const characterCount = generated.paragraphs.join("").replace(/\s/g, "").length;
+    assert.ok(characterCount >= plan.minCharacters);
+    assert.ok(characterCount <= plan.maxCharacters);
+    assert.doesNotThrow(() => validateGeneratedChapter(story, generated, plan));
+  }
+  assert.throws(() => validateGeneratedChapter(story, {
+    title: "被填空的短章",
+    paragraphs: Array.from({ length: standard.targetParagraphs }, (_, index) => `第 ${index + 1} 段。`),
+    model: "test",
+  }, standard), /字数/);
+});
 
 test("chapter planning honors terminal length and hard character protection", () => {
   const store = createSeedStore();
@@ -22,10 +93,58 @@ test("chapter planning honors terminal length and hard character protection", ()
   const compact = planNextChapter(story, undefined, "compact");
   const immersive = planNextChapter(story, undefined, "immersive");
   assert.ok(compact.targetParagraphs < immersive.targetParagraphs);
+  assert.equal(compact.storyArc.id, storyArcPhase(story.chapters.length, story.targetChapterCount).id);
+  assert.match(buildChapterPrompt(story, compact), new RegExp(`${story.chapters.length + 1} / ${story.targetChapterCount}`));
+  const firstVolumeOpening = storyArcPhase(0, 1_000);
+  const firstVolumeTurn = storyArcPhase(49, 1_000);
+  const secondVolumeOpening = storyArcPhase(50, 1_000);
+  const finalVolumeEnding = storyArcPhase(990, 1_000);
+  assert.equal(firstVolumeOpening.totalVolumes, 20);
+  assert.equal(firstVolumeOpening.volumeNumber, 1);
+  assert.equal(firstVolumeTurn.id, "convergence");
+  assert.equal(secondVolumeOpening.id, "opening");
+  assert.equal(secondVolumeOpening.volumeNumber, 2);
+  assert.equal(finalVolumeEnding.id, "finale");
+  assert.match(buildChapterPrompt(story, compact), /第 1 \/ 8 卷/);
+
+  const sports = createStory({ genre: "体育", lengthPlan: "standard" }, "user_test");
+  const sportsCandidates = planNextChapter(sports).candidates.map((candidate) => candidate.event).join("；");
+  assert.match(sportsCandidates, /训练|赛程|首发|队友|竞技/);
+  assert.doesNotMatch(sportsCandidates, /追踪线索与救下证人/);
+
+  const terminalStory = structuredClone(sports);
+  terminalStory.targetChapterCount = terminalStory.chapters.length + 1;
+  const terminalDrafts = [
+    { creativeAxis: "新世界", event: "开启一片全新大陆并引入新的大型势力", cause: "旧地图之外出现入口", cost: "暂别原有同伴", impact: "开始下一阶段冒险", novelty: "全新世界" },
+    { creativeAxis: "契约兑现", event: `兑现结局契约：${terminalStory.endingContract.targetEnding}`, cause: "长期因果汇合", cost: terminalStory.storyGene.recurringCost, impact: "完成角色弧", novelty: "胜负与成长同时落地" },
+    { creativeAxis: "代价落地", event: "承担持续代价并完成最后选择", cause: "所有阶段选择已经汇合", cost: terminalStory.storyGene.recurringCost, impact: "世界进入稳定新状态", novelty: "不抹除既有损失" },
+  ];
+  const terminalPlan = planNextChapter(terminalStory, terminalDrafts);
+  assert.equal(terminalPlan.storyArc.id, "finale");
+  assert.equal(terminalPlan.candidates[0].score, 0);
+  assert.match(terminalPlan.candidates[0].reasons.join(" "), /终局/);
+  for (const mode of ["compact", "standard", "immersive"] as const) {
+    const sizedPlan = planNextChapter(terminalStory, terminalDrafts, mode);
+    const sizedEnding = generateLocalChapter(terminalStory, sizedPlan);
+    assert.equal(endingContractSatisfied(terminalStory, sizedEnding.paragraphs.join("\n"), sizedEnding.endingResolution), true);
+    assert.doesNotThrow(() => validateGeneratedChapter(terminalStory, sizedEnding, sizedPlan));
+  }
+  const terminalGenerated = generateLocalChapter(terminalStory, terminalPlan);
+  assert.match(terminalGenerated.title, /终章/);
+  assert.equal(endingContractSatisfied(terminalStory, terminalGenerated.paragraphs.join("\n"), terminalGenerated.endingResolution), true);
+  assert.equal(endingContractSatisfied(terminalStory, terminalGenerated.paragraphs.join("\n")), false);
+  assert.doesNotMatch(terminalGenerated.paragraphs.join(""), /下一章|未完待续/);
+  commitNextChapter(terminalStory, terminalPlan, terminalGenerated);
+  assert.equal(finalizeStoryIfTargetReached(terminalStory), true);
+  assert.equal(terminalStory.status, "completed");
 
   const activeLead = story.characters.find((character) => character.lifecycle === "alive")!;
   activeLead.protected = true;
-  const protectedPlan = planNextChapter(story);
+  const protectedPlan = planNextChapter(story, [
+    { creativeAxis: "视角移交", event: `${activeLead.name}暂时死亡以迫使同伴接替目标`, cause: "冲突升级", cost: "主角死亡", impact: "改变后续大纲", novelty: "视角空缺" },
+    { creativeAxis: "关系代价", event: "团队公开一次判断分歧", cause: "阶段目标变化", cost: "失去部分信任", impact: "重订合作边界", novelty: "公开分歧" },
+    { creativeAxis: "资源变化", event: "关键资源被重新分配", cause: "旧承诺到期", cost: "放弃优势", impact: "形成新分工", novelty: "资源推动关系" },
+  ]);
   const deathCandidate = protectedPlan.candidates.find((candidate) => /死亡/.test(candidate.event));
   assert.equal(deathCandidate?.score, 0);
   assert.match(deathCandidate?.reasons.join(" ") ?? "", /保护/);

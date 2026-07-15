@@ -1,6 +1,16 @@
+import type { StoryGenre, StoryLengthPlanId } from "./storyConfig";
+
 export type StoryStatus = "active" | "paused" | "completed" | "archived";
 
 export type UserRole = "reader" | "admin";
+
+export interface EndingResolution {
+  targetEndingSatisfied: boolean;
+  targetEndingEvidence: string;
+  satisfiedPrerequisiteIndices: number[];
+  prerequisiteEvidence: Array<{ prerequisiteIndex: number; evidence: string }>;
+  noContinuationHook: boolean;
+}
 
 export type CoverTheme = "tide" | "fog" | "moon" | "ember" | "forest";
 export type CharacterLifecycle = "alive" | "dead" | "missing" | "presumed_dead";
@@ -16,6 +26,7 @@ export interface ChapterRevision {
   promptVersion: string;
   changeSummary?: string;
   branchId?: string;
+  endingResolution?: EndingResolution;
 }
 
 export interface Chapter {
@@ -589,9 +600,9 @@ export interface AuthPayload {
 }
 
 export interface CreateStoryInput {
-  genre: string;
+  genre: StoryGenre;
   tone?: string;
-  length?: string;
+  lengthPlan?: StoryLengthPlanId;
   inspiration?: string;
 }
 

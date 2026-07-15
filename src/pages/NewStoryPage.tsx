@@ -5,50 +5,32 @@ import { api } from "../api";
 import { BookCover } from "../components/BookCover";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
-import type { CoverTheme } from "../types";
+import { DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
 
-const genres = [
-  { label: "悬疑", note: "秘密与因果" },
-  { label: "科幻", note: "未来与选择" },
-  { label: "奇幻", note: "规则与代价" },
-  { label: "治愈", note: "日常与相遇" },
-];
 const tones = ["冷冽 · 克制", "温暖 · 轻盈", "诡谲 · 梦境", "明快 · 冒险"];
-const lengths = ["短篇 · 预计 12 章", "中篇 · 预计 24 章", "长篇 · 预计 60 章"];
-const themeByGenre: Record<string, CoverTheme> = {
-  悬疑: "tide",
-  科幻: "moon",
-  奇幻: "fog",
-  治愈: "ember",
-};
-const titleByGenre: Record<string, string> = {
-  悬疑: "潮汐背面",
-  科幻: "第七次日落",
-  奇幻: "灯塔之外",
-  治愈: "风从面包房来",
-};
 
 export function NewStoryPage() {
   const navigate = useNavigate();
   const toast = useToast();
   const { refresh } = useApp();
-  const [genre, setGenre] = useState("悬疑");
+  const [genre, setGenre] = useState<StoryGenre>("悬疑");
   const [tone, setTone] = useState(tones[0]);
-  const [length, setLength] = useState(lengths[1]);
+  const [lengthPlan, setLengthPlan] = useState<StoryLengthPlanId>(DEFAULT_STORY_LENGTH.id);
   const [inspiration, setInspiration] = useState("");
   const [creating, setCreating] = useState(false);
   const [stage, setStage] = useState(0);
   const creationIdempotencyKey = useRef(crypto.randomUUID());
 
-  const preview = useMemo(
-    () => ({ title: titleByGenre[genre], theme: themeByGenre[genre] }),
-    [genre],
+  const preview = useMemo(() => getGenreOption(genre), [genre]);
+  const selectedLength = useMemo(
+    () => STORY_LENGTH_OPTIONS.find((option) => option.id === lengthPlan) ?? DEFAULT_STORY_LENGTH,
+    [lengthPlan],
   );
 
   const randomize = () => {
-    setGenre(genres[Math.floor(Math.random() * genres.length)].label);
+    setGenre(STORY_GENRES[Math.floor(Math.random() * STORY_GENRES.length)].label);
     setTone(tones[Math.floor(Math.random() * tones.length)]);
-    setLength(lengths[Math.floor(Math.random() * lengths.length)]);
+    setLengthPlan(STORY_LENGTH_OPTIONS[Math.floor(Math.random() * STORY_LENGTH_OPTIONS.length)].id);
     setInspiration("");
   };
 
@@ -57,7 +39,7 @@ export function NewStoryPage() {
     setStage(0);
     const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 420);
     try {
-      const story = await api.createStory({ genre, tone, length, inspiration }, creationIdempotencyKey.current);
+      const story = await api.createStory({ genre, tone, lengthPlan, inspiration }, creationIdempotencyKey.current);
       await refresh();
       toast("第一章已经写好，故事开始了。");
       navigate(`/story/${story.id}`);
@@ -75,8 +57,8 @@ export function NewStoryPage() {
         <div>
           <Link className="back-link" to="/"><ArrowLeft size={16} /> 返回书架</Link>
           <span className="eyebrow">一键开书</span>
-          <h1>给故事一点方向，剩下的交给它。</h1>
-          <p>只有题材必选。你无需写大纲，也不会在下一页被追问情节。</p>
+          <h1>选一个世界，开始一部长篇连载。</h1>
+          <p>覆盖 21 种主流网文题材，默认从 200 章起步。你无需写大纲，也不会被追问情节。</p>
         </div>
         <button className="button button--ghost" type="button" onClick={randomize}>
           <Dices size={18} /> 完全随机
@@ -88,7 +70,7 @@ export function NewStoryPage() {
           <fieldset>
             <legend><span>01</span> 你想先走进哪种故事？ <em>必选</em></legend>
             <div className="choice-grid choice-grid--genres">
-              {genres.map((item) => (
+              {STORY_GENRES.map((item) => (
                 <label key={item.label} className={genre === item.label ? "selected" : ""}>
                   <input type="radio" name="genre" value={item.label} checked={genre === item.label} onChange={() => setGenre(item.label)} />
                   <span><strong>{item.label}</strong><small>{item.note}</small></span>
@@ -108,10 +90,14 @@ export function NewStoryPage() {
           </fieldset>
 
           <fieldset>
-            <legend><span>03</span> 想陪它走多久？ <small>可跳过</small></legend>
-            <div className="pill-options">
-              {lengths.map((item) => (
-                <button type="button" key={item} className={length === item ? "selected" : ""} onClick={() => setLength(item)}>{item}</button>
+            <legend><span>03</span> 规划多长的连载？ <small>后续可自然收束</small></legend>
+            <div className="choice-grid choice-grid--lengths">
+              {STORY_LENGTH_OPTIONS.map((item) => (
+                <label key={item.id} className={lengthPlan === item.id ? "selected" : ""}>
+                  <input type="radio" name="length" value={item.id} checked={lengthPlan === item.id} onChange={() => setLengthPlan(item.id)} />
+                  <span><strong>{item.name}</strong><small>{item.chapterCount} 章 · {item.note}</small></span>
+                  {lengthPlan === item.id && <Check size={16} />}
+                </label>
               ))}
             </div>
           </fieldset>
@@ -137,15 +123,15 @@ export function NewStoryPage() {
         <aside className="story-builder__preview" aria-label="新故事预览">
           <span className="eyebrow">你的下一本书</span>
           <BookCover
-            title={preview.title}
+            title={preview.previewTitle}
             subtitle={inspiration || "标题与故事仍会在生成时变化"}
-            theme={preview.theme}
+            theme={preview.coverTheme}
             size="large"
           />
           <dl>
             <div><dt>题材</dt><dd>{genre}</dd></div>
             <div><dt>氛围</dt><dd>{tone}</dd></div>
-            <div><dt>长度</dt><dd>{length.split(" · ")[0]}</dd></div>
+            <div><dt>规模</dt><dd>{selectedLength.chapterCount} 章</dd></div>
           </dl>
           <p>第一章生成后直接进入阅读，不展示大纲确认页。</p>
         </aside>

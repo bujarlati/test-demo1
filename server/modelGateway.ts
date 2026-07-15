@@ -3,16 +3,22 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { Readable } from "node:stream";
-import type { CapabilitySnapshot, ModelConnection, Story } from "../src/types";
-import type {
-  CandidateDraft,
-  ExtractedChapterState,
-  ExtractedEventDraft,
-  GeneratedChapter,
+import type { CapabilitySnapshot, EndingContract, ModelConnection, Story } from "../src/types";
+import {
+  storyArcPhase,
+  type CandidateDraft,
+  type ExtractedChapterState,
+  type ExtractedEventDraft,
+  type GeneratedChapter,
 } from "./narrativeEngine";
 import { readSecret } from "./vault";
 
 const itemStatuses = new Set(["available", "held", "lost", "destroyed", "consumed"] as const);
+const chapterWriterInstruction = "你是中文长篇连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。必须同时满足用户提示中的中文字符区间与目标段落数；每段包含完整场景动作、感官细节或人物反应，不能用短句凑段。";
+
+function chapterWriterSystemPrompt(streaming: boolean) {
+  return `${chapterWriterInstruction}${streaming ? "先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。" : "保持因果与克制。"}`;
+}
 
 function isPrivateIpv4(address: string): boolean {
   const parts = address.split(".").map(Number);
@@ -350,6 +356,7 @@ export async function generateCandidateDraftsWithConnection(
   connection: ModelConnection,
   story: Story,
 ): Promise<{ candidates: CandidateDraft[]; usageTokens: number; usageEstimated: boolean }> {
+  const storyArc = storyArcPhase(story.chapters.length, story.targetChapterCount);
   const activeKnowledgeLedger = story.characters.map((character) => ({
     characterName: character.name,
     facts: character.knowledgeSources.slice(-12).map((fact) => ({ fact: fact.fact, sourceRevisionId: fact.sourceRevisionId })),
@@ -362,7 +369,7 @@ export async function generateCandidateDraftsWithConnection(
     connection,
     connection.routes.planner,
     "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty,participantNames,storyTime,dependsOnEventIds,knowledgeClaims,itemTransitions。knowledgeClaims 每项含 characterName/fact/sourceRevisionId；itemTransitions 每项含 itemName/actorName/fromStatus/toStatus。只给短剧情胶囊，不写正文。",
-    `故事：${story.title}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；下一章编号：${story.chapters.length + 1}。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 5 个结构不同的候选。`,
+    `故事：${story.title}；题材：${story.genre}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；题材创意轴：${story.storyGene.creativeAxes.join("、")}；篇幅：第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，第 ${storyArc.volumeNumber} / ${storyArc.totalVolumes} 卷，本卷第 ${storyArc.chapterInVolume} / ${storyArc.volumeChapterCount} 章，阶段=${storyArc.label}；阶段要求：${storyArc.guidance}；结局契约：${story.endingContract.targetEnding}；必要前置条件：${story.endingContract.prerequisites.join("；")}。所有候选的核心事件、资源、两难与代价都必须属于“${story.genre}”的典型叙事，不得把非悬疑题材统一写成追踪线索、救证人或查案；终卷不得开启新世界、新势力或大型支线，目标章候选必须明确兑现结局契约及至少一项必要前置条件。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 5 个结构不同的候选。`,
     40_000,
     1_800,
   );
@@ -435,7 +442,7 @@ export async function generateChapterWithConnection(
   const completion = await completeJson<{ title?: string; paragraphs?: string[] }>(
     connection,
     connection.routes.writer,
-    "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。严格按用户提示中的目标段落数生成，保持因果与克制。",
+    chapterWriterSystemPrompt(false),
     prompt,
     120_000,
     maxTokens,
@@ -504,7 +511,7 @@ export async function streamChapterWithConnection(
     messages: [
       {
         role: "system",
-        content: "你是中文连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。严格按用户提示中的目标段落数生成。先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。",
+        content: chapterWriterSystemPrompt(true),
       },
       { role: "user", content: prompt },
     ],
@@ -578,11 +585,18 @@ export async function streamChapterWithConnection(
 export async function extractChapterStateWithConnection(
   connection: ModelConnection,
   chapter: GeneratedChapter,
+  endingContract?: EndingContract,
 ): Promise<ExtractedChapterState> {
+  const endingSchema = endingContract
+    ? `，"endingResolution":{"targetEndingSatisfied":true,"targetEndingEvidence":"正文中的原句","satisfiedPrerequisiteIndices":[0],"prerequisiteEvidence":[{"prerequisiteIndex":0,"evidence":"正文中的原句"}],"noContinuationHook":true}`
+    : "";
+  const endingInstruction = endingContract
+    ? ` 独立判断结局是否在剧情行动中真实完成。结局目标=${endingContract.targetEnding}；前置条件（按下标）=${endingContract.prerequisites.map((item, index) => `${index}:${item}`).join("；")}。evidence 必须逐字引用正文中至少 8 个字的连续原句；仅复述后台契约、不对应行动结果时必须判为 false。`
+    : "";
   const completion = await completeJson<Partial<ExtractedChapterState>>(
     connection,
     connection.routes.extractor,
-    "你是正史状态抽取器。只返回 JSON：{\"events\":[{\"type\":\"choice\",\"title\":\"\",\"cause\":\"\",\"outcome\":\"\",\"participantNames\":[],\"location\":\"\"}],\"characterUpdates\":[{\"name\":\"\",\"status\":\"\",\"location\":\"\",\"goal\":\"\",\"knowledgeGained\":[]}],\"itemUpdates\":[{\"name\":\"\",\"status\":\"held\",\"holderName\":\"\",\"location\":\"\"}]}; 不得新增正文没有的事实。",
+    `你是独立的正史状态抽取器。只返回 JSON：{"events":[{"type":"choice","title":"","cause":"","outcome":"","participantNames":[],"location":""}],"characterUpdates":[{"name":"","status":"","location":"","goal":"","knowledgeGained":[]}],"itemUpdates":[{"name":"","status":"held","holderName":"","location":""}]${endingSchema}}；不得新增正文没有的事实。${endingInstruction}`,
     `${chapter.title}\n${chapter.paragraphs.join("\n")}`,
     30_000,
     1_500,
@@ -630,10 +644,34 @@ export async function extractChapterStateWithConnection(
       holderName: typeof item.holderName === "string" ? item.holderName.slice(0, 80) : undefined,
       location: typeof item.location === "string" ? item.location.slice(0, 120) : undefined,
     }));
+  let endingResolution: ExtractedChapterState["endingResolution"];
+  if (endingContract) {
+    const resolution = parsed.endingResolution;
+    if (
+      !resolution ||
+      typeof resolution.targetEndingSatisfied !== "boolean" ||
+      typeof resolution.targetEndingEvidence !== "string" ||
+      !Array.isArray(resolution.satisfiedPrerequisiteIndices) ||
+      !resolution.satisfiedPrerequisiteIndices.every((index) => Number.isInteger(index)) ||
+      !Array.isArray(resolution.prerequisiteEvidence) ||
+      !resolution.prerequisiteEvidence.every((item) => item && Number.isInteger(item.prerequisiteIndex) && typeof item.evidence === "string") ||
+      typeof resolution.noContinuationHook !== "boolean"
+    ) {
+      throw new Error("终章抽取没有返回有效的结构化结局证据。");
+    }
+    endingResolution = {
+      targetEndingSatisfied: resolution.targetEndingSatisfied,
+      targetEndingEvidence: resolution.targetEndingEvidence.slice(0, 500),
+      satisfiedPrerequisiteIndices: resolution.satisfiedPrerequisiteIndices.slice(0, endingContract.prerequisites.length),
+      prerequisiteEvidence: resolution.prerequisiteEvidence.slice(0, endingContract.prerequisites.length).map((item) => ({ prerequisiteIndex: item.prerequisiteIndex, evidence: item.evidence.slice(0, 500) })),
+      noContinuationHook: resolution.noContinuationHook,
+    };
+  }
   return {
     events,
     characterUpdates,
     itemUpdates,
+    endingResolution,
     usageTokens: completion.usageTokens,
     usageEstimated: completion.usageEstimated,
   };

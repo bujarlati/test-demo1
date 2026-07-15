@@ -6,11 +6,13 @@ import type {
   Story,
   StorySummary,
 } from "../src/types";
+import { getGenreOption, getStoryLengthOption } from "../src/storyConfig";
 import {
   applyExtractedCharacterState,
   applyPlannedItemTransitions,
   assertStoryStateIntegrity,
   eventFromChapter,
+  endingContractSatisfied,
   generateLocalChapter,
   type GeneratedChapter,
   type ExtractedChapterState,
@@ -18,6 +20,7 @@ import {
   validateGeneratedChapter,
 } from "./narrativeEngine";
 import { captureCanonState, deriveStateEffects } from "./canonState";
+import { narrativeProfileForGenre, sceneKitForGenre } from "./genreProfiles";
 
 export function summarizeStory(story: Story): StorySummary {
   const activeChapter =
@@ -43,6 +46,18 @@ export function summarizeStory(story: Story): StorySummary {
     chapterCount: story.chapters.length,
     progress: Math.min(1, (latest?.number ?? 1) / story.targetChapterCount),
   };
+}
+
+export function finalizeStoryIfTargetReached(story: Story): boolean {
+  if (story.chapters.length < Math.max(1, story.targetChapterCount)) return false;
+  const chapter = story.chapters.at(-1);
+  const revision = chapter?.revisions.find((item) => item.id === chapter.currentRevisionId);
+  if (!revision || !endingContractSatisfied(story, revision.paragraphs.join("\n"), revision.endingResolution)) return false;
+  if (story.status === "active" || story.status === "paused") {
+    story.status = "completed";
+    story.updatedAt = new Date().toISOString();
+  }
+  return true;
 }
 
 export function rebuildBranchSummaries(story: Story): void {
@@ -238,45 +253,43 @@ const storyTemplates: Record<string, StoryTemplate> = {
   },
 };
 
-function targetChapterCount(length: string | undefined) {
-  if (length?.includes("短")) return 12;
-  if (length?.includes("长")) return 60;
-  return Number(length?.match(/\d+/)?.[0]) || 24;
-}
-
 function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput, id: string) {
+  const profile = narrativeProfileForGenre(input.genre);
+  const sceneKit = sceneKitForGenre(input.genre);
   const inspiration = input.inspiration?.trim() || template.subtitle;
   const tone = input.tone || "克制而有余韵";
   const seed = Number.parseInt(
     createHash("sha256").update(`${id}:${input.genre}:${tone}:${inspiration}`).digest("hex").slice(0, 8),
     16,
   );
-  const titles: Record<string, string[]> = {
-    悬疑: ["潮线失真", "无人认领的明天", "雾钟之后", "证词沉入海面"],
-    科幻: ["第七次日落", "零点之后的回声", "第二颗沉默行星", "明天拒绝重启"],
-    奇幻: ["灯塔之外", "影子保管局", "无岸海图", "借来的月光"],
-    治愈: ["风从面包房来", "替清晨留一盏灯", "失物慢慢归来", "今天的香气"],
-  };
-  const names: Record<string, string[]> = {
-    悬疑: ["程野", "闻溪", "纪临", "沈鸥"],
-    科幻: ["许澄", "陆弦", "季遥", "程霁"],
-    奇幻: ["顾遥", "迟萤", "闻舟", "祝岚"],
-    治愈: ["苏禾", "林葵", "乔安", "夏栀"],
-  };
-  const openings = ["异常第一次留下证据", "被提前写下的清晨", "没有归属的来信", "风向改变以前"];
-  const titlePool = titles[input.genre] ?? [template.title];
-  const namePool = names[input.genre] ?? [template.lead];
+  const openings = ["异象留下痕迹", "被提前写下的清晨", "来路不明的回信", "风向改变以前"];
+  const titlePool = profile.titles;
+  const namePool = profile.names;
   const title = titlePool[seed % titlePool.length];
   const lead = namePool[(seed >>> 3) % namePool.length];
   const firstTitle = openings[(seed >>> 6) % openings.length];
   const motif = inspiration.replace(/[。！？!?]/g, "").slice(0, 46);
   const paragraphs = [
-    `${tone}的天光落下来时，${lead}发现一件本不该出现在这里的东西。它与“${motif}”有关，却比任何解释都更像一份尚未发生的证据。`,
-    `${lead}先检查了时间、位置和自己的记忆。三者只有两项能够同时成立；剩下的那一项，正安静地改变周围人对昨天的说法。`,
-    `第一位证人拒绝承认异常，却准确说出了${lead}从未公开的细节。这个矛盾把可见目标变得清楚：必须在天黑以前找到证据的来源。`,
-    `追查不是免费的。${lead}为了留下线索，主动放弃了一条最安全的退路，也让一个原本愿意相信自己的人开始迟疑。`,
-    `当场景里最普通的物件第二次出现时，它的位置向左偏了一格。变化很小，却足以证明故事并没有重复——有人正在重排因果。`,
-    `${lead}没有向任何人询问下一步该怎么走。门在身后合上，第一条可追溯的事件已经成立，而真正的代价才刚刚开始。`,
+    `${tone}的天光慢慢落下来，${sceneKit.setting}。${lead}原本准备照常完成今天的安排，却发现一个反常细节正与“${motif}”指向同一方向。它并不喧闹，只是让熟悉的节奏错开了半步，仿佛生活提前递来一项无法继续回避的选择。`,
+    `${lead}并不是容易被一时情绪说服的人。作为${profile.protagonistPosition}，过去的经验早已教会自己先确认身体状态、周围环境和相关人物的反应，再判断眼前变化是否值得冒险。可这一次，自己的感受、既定安排与他人的说法只有两项能够同时成立，剩下那一项正在安静地改变今天的局面。`,
+    `变化留下了可以触摸和复核的痕迹。${lead}没有急着给它命名，而是把发生前后的差异逐项记下，并用${sceneKit.action}的方式做了第一次验证。谨慎没有让事情变简单，它只是保证接下来失去某样东西时，至少还有一条清楚的路径，能够证明损失从何处开始。`,
+    `第一位与此事有关的人坚称一切如常，转身时却准确说出了${lead}从未公开的细节。${lead}叫住对方，对方的神情先是茫然，继而像想起了某个不能提及的决定。那一瞬间的迟疑比完整解释更可靠，也把原本只属于个人的困惑推向了${sceneKit.pressure}。`,
+    `追问没有得到答案，只换来一句含混的劝告：放下这件事，照既定安排继续走。对方离开后，一处被匆忙改动的细节恰好对应“${profile.creativeAxes[0]}”。${lead}把变化保存下来，第一次意识到，今天的转折不是偶然闯入生活，而是早已沿着某条看不见的路径寻找自己。`,
+    `回到熟悉的地方后，${lead}把过往经历逐项核对。一次无人关注的失误、一个被匆忙撤回的决定，以及最近反复出现的相同模式，在此刻形成了清晰但危险的连线。若这条线成立，${profile.conflictEngine}，而原本以为牢固的秩序，其实一直有人在付出维持它的代价。`,
+    `真正困难的是，继续向目标前进意味着主动走回那段最想避开的过去。${lead}曾经以为只要完成眼前的任务、守住有限的生活，就能与更大的冲突保持距离；然而“${motif}”已经把选择送到门前。退后当然安全，却会让另一个毫不知情的人替自己支付后果。`,
+    `短暂的犹豫以后，${lead}给自己定下了第一个可验证的目标：${profile.visibleGoal}。目标被拆成三步，先确认变化从何处开始，再了解关键人物各自掌握什么，最后在既有规则反应以前完成一次无法被轻易否定的行动。每一步都不宏大，却比凭一腔冲动向前更接近真正的改变。`,
+    `准备过程暴露出第一个阻碍。原本能够提供帮助的人突然改口，既定安排也在几分钟内被换成另一套版本，仿佛有人始终领先半步。${lead}没有争辩，只把前后差异逐项记下；越是急于掩饰的变化，越可能指向对方真正害怕失去的部分。`,
+    `傍晚前，事情把${lead}带到压力最集中的场域。${sceneKit.setting}，而“${profile.creativeAxes[1]}”正在这里变成具体阻力。周围每个人都按自己的立场行动，没有谁愿意先承认局面已经改变；越是平静的表面，越能看出即将到来的碰撞。`,
+    `能决定关键资源的人在那里等着，只提出一个看似公平的交换：停止追问，接受已经安排好的位置，今天的生活便可以恢复原样。${lead}听完条件，反而确认对方无法直接完成目的，否则便不必谈判。双方没有揭开底牌，沉默却让力量边界第一次显形。`,
+    `${lead}故意提出一个只有真正参与者才会理解的问题。对方避开核心，却说出了尚未公开的细节，这个失误足以证明此前的判断。趁注意力被问题牵走，${lead}保留真实意图，只展示一套风险更低的表面方案。计划并不完美，但它争取到继续行动所需的第一段时间。`,
+    `交换完成的瞬间，代价也随之落下。${profile.recurringCost}。变化并不轰烈，甚至没有人立刻察觉，只有${lead}知道某个原本自然存在的细节已经从生活里松动。想把它重新抓紧已经来不及；规则以最安静的方式证明，往后每一次推进都必须留下真实损失。`,
+    `回程途中，那位先前改口的人再次出现，悄悄递来一段没有署名的消息。上面没有解释，只有三个可以立即核实的细节和一句“别相信第一次结果”。这份迟来的帮助并未消除怀疑，却说明对方也受制于某种压力。两个人尚未成为同盟，但至少在同一个困局里各自撬开了一条缝。`,
+    `三个细节中的第一处与早晨留下的痕迹完全吻合，第二处却指向${lead}自己的过往，第三处只留下“${profile.creativeAxes[2]}”几个字。${lead}终于看见事件更深的一层：眼前的冲突不是为了争夺一次结果，而是为了阻止某个本应被规则淘汰的人继续拥有选择。这个人很可能正是自己。`,
+    `恐惧没有消失，只是被更具体的问题压到一旁。${lead}想起自己真正缺少的并非更多勇气，而是${profile.hiddenNeed}。如果仍按过去的方式独自承担，所有关系最终都会变成阻碍合作的盲点。于是，${lead}第一次把完整计划和真实状态交给可信的人，并明确约定：一旦局面变化，不要等待允许，立刻按共同确认的边界行动。`,
+    `夜色完全落下时，早晨留下的标记被人改动了，旁边却多出一道更清楚的新痕。对方来过，也知道${lead}没有接受交换。${sceneKit.consequence}已经开始显现，这不是单纯的威胁，而是一份倒计时。${lead}收好全部记录，明白下一次行动必须赶在局面彻底锁死以前。`,
+    `回到仍愿意等待自己的人身边，${lead}第一次完整说出今天发生了什么。${sceneKit.relationship}没有因为坦白立刻变得牢固，反而暴露出新的分歧；但每个人终于能在同一组事实上作出选择。这样的共同承担，比毫无裂缝的表面一致更可靠，也让下一步不再只属于一个人。`,
+    `${lead}随后再次尝试${sceneKit.action}。结果没有解决总目标，却证明“${profile.creativeAxes[3]}”能够被观察、被影响，也会留下反作用。${lead}把这次结果连同失败部分一起保存，不允许胜利的叙述删掉损失；一部长篇真正需要的，正是这些会在后来继续生长的后果。`,
+    `熟悉的空间重新安静下来，早晨那场变化却以另一种形式再次出现。几秒以后，新的安排、消息或规则把矛头清楚指向${lead}，也带来一项尚未到来的考验。第一条可追溯的因果已经成立，真正的故事在这一刻开始向更远处生长。`,
   ];
   return {
     title,
@@ -285,21 +298,29 @@ function personalizedBlueprint(template: StoryTemplate, input: CreateStoryInput,
     paragraphs,
     subtitle: inspiration,
     gene: {
-      ...template.gene,
-      protagonistPosition: `${template.gene.protagonistPosition}；故事起点由“${motif}”触发`,
-      conflictEngine: `${template.gene.conflictEngine}；所有推进保持“${tone}”的叙事温度`,
-      recurringCost: `${template.gene.recurringCost}；每次选择必须在人物关系或身份上留下可追溯损失`,
+      protagonistPosition: `${profile.protagonistPosition}；故事起点由“${motif}”触发`,
+      visibleGoal: profile.visibleGoal,
+      hiddenNeed: profile.hiddenNeed,
+      conflictEngine: `${profile.conflictEngine}；所有推进保持“${tone}”的叙事温度`,
+      recurringCost: `${profile.recurringCost}；每次选择必须留下可追溯损失`,
+      endingShape: profile.endingShape,
+      creativeAxes: profile.creativeAxes,
     },
     ending: {
-      ...template.ending,
-      targetEnding: `${template.ending.targetEnding}；结局必须回应开篇意象“${motif}”`,
-      prerequisites: [...template.ending.prerequisites, `开篇灵感“${motif}”在结局前获得因果解释`],
+      targetEnding: `${profile.endingShape}；结局必须回应开篇意象“${motif}”`,
+      characterArc: `从受困于既有处境，到真正理解“${profile.hiddenNeed}”`,
+      prerequisites: [
+        `${profile.creativeAxes[0]}至少完成一次可验证回收`,
+        `${profile.creativeAxes[1]}对人物关系造成不可逆影响`,
+        `开篇灵感“${motif}”在结局前获得因果解释`,
+      ],
     },
   };
 }
 
 export function createStory(input: CreateStoryInput, ownerId: string): Story {
-  const template = storyTemplates[input.genre] ?? storyTemplates.悬疑;
+  const genreOption = getGenreOption(input.genre);
+  const template = storyTemplates[genreOption.templateKey];
   const id = `story_${randomUUID().slice(0, 8)}`;
   const createdAt = new Date().toISOString();
   const revisionId = `rev_${id}_1_1`;
@@ -307,7 +328,8 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
   const characterId = `char_${id}_lead`;
   const branchId = `branch_${id}_main`;
   const threadId = `thread_${id}_main`;
-  const length = input.length || "中篇 · 预计 24 章";
+  const lengthPlan = getStoryLengthOption(input.lengthPlan);
+  const length = lengthPlan.label;
   const blueprint = personalizedBlueprint(template, input, id);
   const story: Story = {
     id,
@@ -317,9 +339,9 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     genre: input.genre,
     tone: input.tone || "由故事决定",
     length,
-    targetChapterCount: targetChapterCount(length),
+    targetChapterCount: lengthPlan.chapterCount,
     inspiration: input.inspiration?.trim() || "",
-    coverTheme: template.coverTheme,
+    coverTheme: genreOption.coverTheme,
     status: "active",
     activeBranchId: branchId,
     branches: [{
@@ -402,7 +424,7 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
             branchId,
           },
         ],
-        estimatedMinutes: 6,
+        estimatedMinutes: Math.max(10, Math.round(blueprint.paragraphs.join("").length / 260)),
       },
     ],
     characters: [
@@ -481,7 +503,7 @@ export function commitNextChapter(
   extracted?: ExtractedChapterState,
 ): Chapter {
   const result = generated ?? generateLocalChapter(story, plan);
-  validateGeneratedChapter(story, result, plan);
+  validateGeneratedChapter(story, result, plan, extracted);
   const number = (story.chapters.at(-1)?.number ?? 0) + 1;
   const createdAt = new Date().toISOString();
   const chapterId = `chapter_${story.id}_${number}`;
@@ -502,6 +524,7 @@ export function commitNextChapter(
         modelName: result.model,
         promptVersion: "story-v8",
         branchId: story.activeBranchId,
+        endingResolution: result.endingResolution ?? extracted?.endingResolution,
       },
     ],
     estimatedMinutes: Math.max(5, Math.round(result.paragraphs.join("").length / 160)),
