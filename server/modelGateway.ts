@@ -150,6 +150,7 @@ async function modelFetch(
   pathname: string,
   init: RequestInit,
   timeout = 12_000,
+  overallTimeout = timeout,
 ) {
   const resolved = await resolveSafeEndpoint(connection.baseUrl);
   const url = new URL(endpoint(resolved.url.toString(), pathname));
@@ -160,6 +161,17 @@ async function modelFetch(
     ...init.headers,
   });
   return new Promise<Response>((resolve, reject) => {
+    let idleTimer: ReturnType<typeof setTimeout>;
+    let overallTimer: ReturnType<typeof setTimeout> | undefined;
+    const destroyForTimeout = () => request.destroy(new Error("模型连接超时。"));
+    const resetIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(destroyForTimeout, timeout);
+    };
+    const clearTimers = () => {
+      clearTimeout(idleTimer);
+      if (overallTimer) clearTimeout(overallTimer);
+    };
     const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, {
       method: init.method ?? "GET",
       headers: Object.fromEntries(headers.entries()),
@@ -173,10 +185,14 @@ async function modelFetch(
       }
       const status = incoming.statusCode ?? 502;
       const body = status === 204 || status === 304 ? null : Readable.toWeb(incoming) as ReadableStream;
+      incoming.on("data", resetIdleTimer);
+      incoming.once("end", clearTimers);
+      incoming.once("close", clearTimers);
       resolve(new Response(body, { status, statusText: incoming.statusMessage, headers: responseHeaders }));
     });
-    const timer = setTimeout(() => request.destroy(new Error("模型连接超时。")), timeout);
-    request.once("close", () => clearTimeout(timer));
+    idleTimer = setTimeout(destroyForTimeout, timeout);
+    overallTimer = setTimeout(destroyForTimeout, Math.max(timeout, overallTimeout));
+    request.once("close", clearTimers);
     request.once("error", reject);
     if (init.signal) {
       if (init.signal.aborted) request.destroy(new Error("模型请求已取消。"));
@@ -199,7 +215,22 @@ async function discardResponse(response: Response) {
   }
 }
 
-async function readProviderError(response: Response, maxBytes = 4_096): Promise<string> {
+function redactProviderDiagnostic(value: string, sensitiveValues: string[]): string {
+  let redacted = value;
+  for (const sensitiveValue of sensitiveValues) {
+    if (sensitiveValue.length >= 4) redacted = redacted.replaceAll(sensitiveValue, "[已隐藏]");
+  }
+  return redacted
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [已隐藏]")
+    .replace(/\b(?:sk|sf)[-_][A-Za-z0-9._-]{8,}\b/gi, "[已隐藏]")
+    .replace(/(["']?(?:api[_-]?key|authorization|access[_-]?token|secret)["']?\s*[:=]\s*["']?)[^"',\s}]{6,}/gi, "$1[已隐藏]");
+}
+
+async function readProviderError(
+  response: Response,
+  maxBytes = 4_096,
+  sensitiveValues: string[] = [],
+): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Buffer[] = [];
@@ -224,11 +255,27 @@ async function readProviderError(response: Response, maxBytes = 4_096): Promise<
   try {
     const payload = JSON.parse(raw) as { error?: { message?: unknown }; message?: unknown };
     const detail = payload.error?.message ?? payload.message;
-    if (typeof detail === "string") return detail.replace(/\s+/g, " ").slice(0, 300);
+    if (typeof detail === "string") {
+      return redactProviderDiagnostic(detail.replace(/\s+/g, " "), sensitiveValues).slice(0, 300);
+    }
   } catch {
     // Fall back to a bounded plain-text diagnostic.
   }
-  return raw.replace(/\s+/g, " ").slice(0, 300);
+  return redactProviderDiagnostic(raw.replace(/\s+/g, " "), sensitiveValues).slice(0, 300);
+}
+
+async function providerResponseError(response: Response, subject: string, apiKey: string): Promise<Error> {
+  const detail = await readProviderError(response, 4_096, [apiKey]);
+  const rawTraceId = response.headers.get("x-siliconcloud-trace-id")?.trim();
+  const traceId = rawTraceId
+    ? redactProviderDiagnostic(rawTraceId.replace(/\s+/g, " "), [apiKey]).slice(0, 160)
+    : "";
+  return new Error([
+    `${subject} 返回 ${response.status}`,
+    detail ? `：${detail}` : "",
+    traceId ? `（追踪 ID：${traceId}）` : "",
+    "；未启用静默回退。",
+  ].join(""));
 }
 
 async function probeJson(connection: ModelConnection, apiKey: string) {
@@ -297,7 +344,7 @@ async function assertOpeningRouteCompletion(
     }
 
     if (!response.ok) {
-      const detail = await readProviderError(response);
+      const detail = await readProviderError(response, 4_096, [apiKey]);
       throw new Error(`${route}返回 ${response.status}${detail ? `：${detail}` : ""}。`);
     }
 
@@ -434,7 +481,7 @@ export async function testConnection(
   const startedAt = performance.now();
   const response = await modelFetch(connection, apiKey, "/models", { method: "GET" }, 10_000);
   if (!response.ok) {
-    const detail = await readProviderError(response);
+    const detail = await readProviderError(response, 4_096, [apiKey]);
     throw new Error(`连接返回 ${response.status}${detail ? `：${detail}` : ""}，请检查地址、Key 与访问权限。`);
   }
   const payload = (await response.json()) as { data?: Array<{ id?: string; context_window?: number; max_context_length?: number }> };
@@ -479,6 +526,7 @@ export type CompletionModelFetcher = (
   pathname: string,
   init: RequestInit,
   timeout?: number,
+  overallTimeout?: number,
 ) => Promise<Response>;
 
 export interface CompleteJsonDependencies {
@@ -507,6 +555,91 @@ function reportedCompletionUsage(payload: unknown): number | undefined {
   return rounded > 0 ? rounded : undefined;
 }
 
+function isSiliconFlowConnection(connection: ModelConnection): boolean {
+  try {
+    const hostname = new URL(connection.baseUrl).hostname.toLowerCase();
+    return hostname === "siliconflow.cn" || hostname.endsWith(".siliconflow.cn");
+  } catch {
+    return false;
+  }
+}
+
+function streamedCompletionOverallTimeout(timeout: number, maxTokens: number): number {
+  return timeout * (maxTokens >= 4_000 ? 3 : 2);
+}
+
+interface ChatCompletionStreamOptions {
+  onContent?: (content: string) => void;
+  onUsage?: (usageTokens: number) => void;
+}
+
+const MAX_STREAM_CONTENT_BYTES = 1_000_000;
+const MAX_STREAM_FRAME_BUFFER_BYTES = 4_000_000;
+
+async function readChatCompletionStream(
+  response: Response,
+  options: ChatCompletionStreamOptions = {},
+): Promise<{
+  content: string;
+  reportedTokens: number | undefined;
+}> {
+  if (!response.body) throw new Error("模型流式响应没有可读取的正文。");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let eventBuffer = "";
+  let content = "";
+  let reportedTokens: number | undefined;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      const decoded = decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+      if (eventBuffer.endsWith("\r") && decoded.startsWith("\n")) {
+        eventBuffer = `${eventBuffer.slice(0, -1)}\n${decoded.slice(1)}`;
+      } else {
+        eventBuffer += decoded;
+      }
+      const frames = eventBuffer.split("\n\n");
+      eventBuffer = frames.pop() ?? "";
+      if (Buffer.byteLength(eventBuffer, "utf8") > MAX_STREAM_FRAME_BUFFER_BYTES) {
+        throw new Error("模型流式响应的未完成帧超过 4 MB 安全上限。");
+      }
+      if (done && eventBuffer.trim()) {
+        frames.push(eventBuffer);
+        eventBuffer = "";
+      }
+      for (const frame of frames) {
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          const payload = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+            usage?: { total_tokens?: number };
+          };
+          const delta = payload.choices?.[0]?.delta?.content;
+          if (typeof delta === "string") {
+            content += delta;
+            if (Buffer.byteLength(content, "utf8") > MAX_STREAM_CONTENT_BYTES) {
+              throw new Error("模型流式响应超过 1 MB 安全上限。");
+            }
+            options.onContent?.(content);
+          }
+          const currentReportedTokens = reportedCompletionUsage(payload);
+          if (currentReportedTokens !== undefined) {
+            reportedTokens = currentReportedTokens;
+            options.onUsage?.(currentReportedTokens);
+          }
+        }
+      }
+      if (done) break;
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+  return { content, reportedTokens };
+}
+
 export async function completeJson<T>(
   connection: ModelConnection,
   model: string,
@@ -519,6 +652,7 @@ export async function completeJson<T>(
   const secretReader = dependencies.secretReader ?? readSecret;
   const completionFetcher = dependencies.modelFetcher ?? modelFetch;
   const apiKey = await secretReader(connection.id, connection.secretVersion);
+  const streamStructuredResponse = isSiliconFlowConnection(connection) && connection.capabilities?.streaming === true;
   const body: Record<string, unknown> = {
     model,
     messages: [
@@ -526,7 +660,7 @@ export async function completeJson<T>(
       { role: "user", content: prompt },
     ],
     temperature: 0.7,
-    stream: false,
+    stream: streamStructuredResponse,
     max_tokens: maxTokens,
   };
   if (connection.capabilities?.jsonSchema && model === connection.routes.writer) {
@@ -541,36 +675,56 @@ export async function completeJson<T>(
       "/chat/completions",
       { method: "POST", body: JSON.stringify(body) },
       timeout,
+      streamStructuredResponse ? streamedCompletionOverallTimeout(timeout, maxTokens) : timeout,
     );
   } catch (error) {
     throw attachModelUsage(error, conservativeFailureTokens, true);
   }
   if (!response.ok) {
-    await discardResponse(response);
     throw attachModelUsage(
-      new Error(`模型 ${model} 返回 ${response.status}；未启用静默回退。`),
+      await providerResponseError(response, `模型 ${model}`, apiKey),
       conservativeFailureTokens,
       true,
     );
   }
-  let payload: {
-    choices?: Array<{ message?: { content?: string } }>;
-    usage?: { total_tokens?: number };
-  };
-  try {
-    payload = (await response.json()) as typeof payload;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "未知响应错误";
-    throw attachModelUsage(
-      new Error(`模型 ${model} 返回的响应不是有效 JSON：${reason.slice(0, 160)}。`),
-      conservativeFailureTokens,
-      true,
-    );
+  let content: string | undefined;
+  let reportedTokens: number | undefined;
+  if (streamStructuredResponse) {
+    let streamedFailureTokens: number | undefined;
+    try {
+      const streamed = await readChatCompletionStream(response, {
+        onUsage: (usageTokens) => { streamedFailureTokens = usageTokens; },
+      });
+      content = streamed.content;
+      reportedTokens = streamed.reportedTokens;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "未知流式响应错误";
+      throw attachModelUsage(
+        new Error(`模型 ${model} 的流式响应无效：${reason.slice(0, 160)}。`),
+        streamedFailureTokens ?? conservativeFailureTokens,
+        streamedFailureTokens === undefined,
+      );
+    }
+  } else {
+    let payload: {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { total_tokens?: number };
+    };
+    try {
+      payload = (await response.json()) as typeof payload;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "未知响应错误";
+      throw attachModelUsage(
+        new Error(`模型 ${model} 返回的响应不是有效 JSON：${reason.slice(0, 160)}。`),
+        conservativeFailureTokens,
+        true,
+      );
+    }
+    content = payload.choices?.[0]?.message?.content;
+    reportedTokens = reportedCompletionUsage(payload);
   }
-  const reportedTokens = reportedCompletionUsage(payload);
   const failureTokens = reportedTokens ?? conservativeFailureTokens;
   const failureUsageEstimated = reportedTokens === undefined;
-  const content = payload.choices?.[0]?.message?.content;
   if (typeof content !== "string" || !content.trim()) {
     throw attachModelUsage(
       new Error(`模型 ${model} 没有返回可用内容。`),
@@ -1141,55 +1295,45 @@ export async function streamChapterWithConnection(
       "/chat/completions",
       { method: "POST", body: JSON.stringify(body) },
       GENERATION_STAGE_TIMEOUT_MS.writer,
+      isSiliconFlowConnection(connection)
+        ? streamedCompletionOverallTimeout(GENERATION_STAGE_TIMEOUT_MS.writer, maxTokens)
+        : GENERATION_STAGE_TIMEOUT_MS.writer,
     );
   } catch (error) {
     throw attachModelUsage(error, conservativeFailureTokens, true);
   }
-  if (!response.ok || !response.body) {
-    await discardResponse(response);
+  if (!response.ok) {
     throw attachModelUsage(
-      new Error(`正文模型流式调用返回 ${response.status}；未启用静默回退。`),
+      await providerResponseError(response, "正文模型流式调用", apiKey),
       conservativeFailureTokens,
       true,
     );
   }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let eventBuffer = "";
+  if (!response.body) {
+    throw attachModelUsage(
+      new Error("正文模型流式调用没有可读取的响应正文。"),
+      conservativeFailureTokens,
+      true,
+    );
+  }
   let content = "";
   let emitted = 0;
   let reportedTokens: number | undefined;
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      eventBuffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
-      const frames = eventBuffer.split("\n\n");
-      eventBuffer = frames.pop() ?? "";
-      for (const frame of frames) {
-        for (const line of frame.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          const payload = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string } }>;
-            usage?: { total_tokens?: number };
-          };
-          content += payload.choices?.[0]?.delta?.content ?? "";
-          reportedTokens = reportedCompletionUsage(payload) ?? reportedTokens;
-          if (content.length > 1_000_000) {
-            throw new Error("流式正文超过 1 MB 安全上限，已中止且不会提交正史。");
-          }
-        }
-        const fields = completedChapterFields(content);
+    const streamed = await readChatCompletionStream(response, {
+      onContent: (nextContent) => {
+        content = nextContent;
+        const fields = completedChapterFields(nextContent);
         while (emitted < fields.paragraphs.length) {
           onParagraph(fields.paragraphs[emitted], emitted, fields.title);
           emitted += 1;
         }
-      }
-      if (done) break;
-    }
+      },
+      onUsage: (usageTokens) => { reportedTokens = usageTokens; },
+    });
+    content = streamed.content;
+    reportedTokens = streamed.reportedTokens;
   } catch (error) {
-    await reader.cancel().catch(() => undefined);
     throw attachModelUsage(
       error,
       reportedTokens ?? conservativeFailureTokens,

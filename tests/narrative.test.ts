@@ -219,6 +219,32 @@ function budgetTestConnection(id: string): ModelConnection {
   };
 }
 
+function siliconFlowStreamingTestConnection(id: string): ModelConnection {
+  const connection = budgetTestConnection(id);
+  return {
+    ...connection,
+    name: "SiliconFlow streaming JSON",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    routes: {
+      planner: "deepseek-ai/DeepSeek-V4-Pro",
+      writer: "deepseek-ai/DeepSeek-V4-Pro",
+      extractor: "Qwen/Qwen3-14B",
+      embedding: "Qwen/Qwen3-Embedding-8B",
+    },
+    capabilities: {
+      streaming: true,
+      jsonSchema: true,
+      embedding: true,
+      promptCache: false,
+      toolCalling: false,
+      maxContextTokens: null,
+      testedAt: new Date().toISOString(),
+      latencyMs: 40_039,
+      models: ["deepseek-ai/DeepSeek-V4-Pro", "Qwen/Qwen3-14B"],
+    },
+  };
+}
+
 function openingBudgetFixture() {
   const base = createStory({ genre: "都市", tone: "机械 · 奶爸" }, "user_test");
   return {
@@ -799,7 +825,7 @@ test("completeJson preserves call-local usage for every provider failure shape",
   };
   const assertFailureUsage = async (
     response: Response,
-    expected: { tokens?: number; estimated: boolean; message: RegExp },
+    expected: { tokens?: number; estimated: boolean; message: RegExp; redacted?: RegExp },
   ) => {
     await assert.rejects(
       () => completeJson(
@@ -813,6 +839,7 @@ test("completeJson preserves call-local usage for every provider failure shape",
       ),
       (error: Error & { usageTokens?: number; usageEstimated?: boolean }) => {
         assert.match(error.message, expected.message);
+        if (expected.redacted) assert.doesNotMatch(error.message, expected.redacted);
         if (expected.tokens === undefined) assert.ok((error.usageTokens ?? 0) >= 40);
         else assert.equal(error.usageTokens, expected.tokens);
         assert.equal(error.usageEstimated, expected.estimated);
@@ -829,8 +856,15 @@ test("completeJson preserves call-local usage for every provider failure shape",
     { estimated: true, message: /429/ },
   );
   await assertFailureUsage(
-    new Response("upstream unavailable", { status: 503 }),
-    { estimated: true, message: /503/ },
+    new Response("upstream unavailable; test-key; sk-provider-leak-123; Authorization: Bearer bearer-secret-123", {
+      status: 503,
+      headers: { "x-siliconcloud-trace-id": "ti_test_503" },
+    }),
+    {
+      estimated: true,
+      message: /503.*upstream unavailable.*ti_test_503/,
+      redacted: /test-key|sk-provider-leak-123|bearer-secret-123/,
+    },
   );
   await assertFailureUsage(
     new Response("{not-json", { status: 200, headers: { "Content-Type": "application/json" } }),
@@ -899,6 +933,103 @@ test("JSON response mode is only reused by routes backed by the tested writer mo
 
   assert.equal(requestBodies[0].response_format, undefined);
   assert.deepEqual(requestBodies[1].response_format, { type: "json_object" });
+});
+
+test("SiliconFlow structured completions stream long reasoning responses within bounded deadlines", async () => {
+  const connection = siliconFlowStreamingTestConnection("conn_siliconflow_streaming_json");
+  const frames = [
+    { choices: [{ delta: { reasoning_content: "先构造故事规划，但不要把思考混进 JSON。" } }] },
+    { choices: [{ delta: { content: "{\"ok\":\"" } }] },
+    { choices: [{ delta: { content: "完成\"}" } }] },
+    { choices: [], usage: { total_tokens: 321 } },
+  ];
+  const responseBody = `${frames.map((frame) => `data: ${JSON.stringify(frame)}`).join("\r\n\r\n")}\r\n\r\ndata: [DONE]`;
+  let requestBody: Record<string, unknown> | undefined;
+  let idleTimeout: number | undefined;
+  let overallTimeout: number | undefined;
+
+  const result = await completeJson<{ ok: string }>(
+    connection,
+    connection.routes.planner,
+    "只返回 JSON",
+    "生成开篇规划",
+    180_000,
+    2_600,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, _pathname, init, timeout, overall) => {
+        requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        idleTimeout = timeout;
+        overallTimeout = overall;
+        const encoded = new TextEncoder().encode(responseBody);
+        const fragmentedBody = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const byte of encoded) controller.enqueue(Uint8Array.of(byte));
+            controller.close();
+          },
+        });
+        return new Response(fragmentedBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    },
+  );
+
+  assert.deepEqual(result, { value: { ok: "完成" }, usageTokens: 321, usageEstimated: false });
+  assert.equal(requestBody?.stream, true);
+  assert.equal(idleTimeout, 180_000);
+  assert.equal(overallTimeout, 360_000);
+});
+
+test("SiliconFlow structured streams cancel malformed input and enforce the UTF-8 byte cap", async () => {
+  const connection = siliconFlowStreamingTestConnection("conn_siliconflow_stream_safety");
+  let cancelled = false;
+  const malformedBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: {not-json}\n\n"));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  await assert.rejects(
+    () => completeJson(connection, connection.routes.planner, "system", "prompt", 180_000, 2_600, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => new Response(malformedBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    }),
+    /流式响应无效/,
+  );
+  assert.equal(cancelled, true);
+
+  const oversizedContent = JSON.stringify({ value: "汉".repeat(333_334) });
+  const oversizedFrame = `data: ${JSON.stringify({ choices: [{ delta: { content: oversizedContent } }] })}\n\n`;
+  await assert.rejects(
+    () => completeJson(connection, connection.routes.planner, "system", "prompt", 180_000, 2_600, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => new Response(oversizedFrame, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    }),
+    /1 MB/,
+  );
+
+  const unterminatedFrame = `data: ${"x".repeat(4_000_001)}`;
+  await assert.rejects(
+    () => completeJson(connection, connection.routes.planner, "system", "prompt", 180_000, 2_600, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => new Response(unterminatedFrame, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    }),
+    /未完成帧超过 4 MB/,
+  );
 });
 
 test("a paid chapter completion retains usage when its schema is rejected", async () => {
@@ -1055,30 +1186,17 @@ test("a paid state-extraction completion retains usage when its schema is reject
 });
 
 test("streaming ignores non-positive provider usage and falls back to a positive estimate", async () => {
-  const connection: ModelConnection = {
-    id: "conn_stream_usage",
-    name: "Stream usage",
-    ownerScope: "personal",
-    ownerId: "user_test",
-    protocol: "openai_compatible",
-    baseUrl: "https://example.test/v1",
-    maskedKey: "sk••••test",
-    secretRef: "vault://stream-usage",
-    secretVersion: 1,
-    status: "active",
-    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
-    fallbackPolicy: "none",
-    capabilities: { streaming: true, jsonSchema: false, embedding: false, promptCache: false, toolCalling: false, maxContextTokens: null, testedAt: new Date().toISOString(), latencyMs: 1, models: ["writer"] },
-    updatedAt: new Date().toISOString(),
-  };
+  const connection = siliconFlowStreamingTestConnection("conn_stream_usage");
   const content = JSON.stringify({ title: "chapter", paragraphs: ["one", "two", "three", "four"] });
   const responseBody = `data: ${JSON.stringify({ choices: [{ delta: { content } }], usage: { total_tokens: -500 } })}\n\ndata: [DONE]\n\n`;
   let observedStreamTimeout: number | undefined;
+  let observedStreamOverallTimeout: number | undefined;
 
-  const result = await streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
+  const result = await streamChapterWithConnection(connection, "prompt", () => undefined, 6_500, {
     secretReader: async () => "test-key",
-    modelFetcher: async (_connection, _apiKey, _pathname, _init, timeout) => {
+    modelFetcher: async (_connection, _apiKey, _pathname, _init, timeout, overallTimeout) => {
       observedStreamTimeout = timeout;
+      observedStreamOverallTimeout = overallTimeout;
       return new Response(responseBody, {
         status: 200,
         headers: { "Content-Type": "text/event-stream" },
@@ -1089,6 +1207,18 @@ test("streaming ignores non-positive provider usage and falls back to a positive
   assert.ok(result.usageTokens && result.usageTokens > 0);
   assert.equal(result.usageEstimated, true);
   assert.equal(observedStreamTimeout, 300_000);
+  assert.equal(observedStreamOverallTimeout, 900_000);
+
+  await assert.rejects(
+    () => streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => new Response("writer overloaded", {
+        status: 503,
+        headers: { "x-siliconcloud-trace-id": "ti_writer_503" },
+      }),
+    }),
+    /503.*writer overloaded.*ti_writer_503/,
+  );
 
   await assert.rejects(
     () => streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
@@ -1105,6 +1235,47 @@ test("streaming ignores non-positive provider usage and falls back to a positive
       return true;
     },
   );
+});
+
+test("streaming emits paragraphs before a byte-fragmented CRLF response closes", async () => {
+  const connection = siliconFlowStreamingTestConnection("conn_stream_crlf_fragments");
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  const responseBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
+  });
+  const emittedParagraphs: string[] = [];
+  const completion = streamChapterWithConnection(
+    connection,
+    "prompt",
+    (paragraph) => emittedParagraphs.push(paragraph),
+    6_500,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => new Response(responseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    },
+  );
+  const chapterPayload = JSON.stringify({
+    title: "第一章 流式边界",
+    paragraphs: ["第一段。", "第二段。", "第三段。", "第四段。"],
+  });
+  const firstFrame = new TextEncoder().encode(
+    `data: ${JSON.stringify({ choices: [{ delta: { content: chapterPayload } }] })}\r\n\r\n`,
+  );
+  for (const byte of firstFrame) streamController.enqueue(Uint8Array.of(byte));
+  for (let turn = 0; turn < 5; turn += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  const emittedBeforeClose = emittedParagraphs.length;
+
+  streamController.enqueue(new TextEncoder().encode("data: [DONE]\r\n\r\n"));
+  streamController.close();
+  const result = await completion;
+
+  assert.equal(emittedBeforeClose, 4);
+  assert.deepEqual(result.paragraphs, ["第一段。", "第二段。", "第三段。", "第四段。"]);
 });
 
 test("continuation fallback with only 500 tokens remaining starts neither planner nor audit", async () => {
