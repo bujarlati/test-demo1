@@ -718,6 +718,35 @@ test("opening generation retries a draft outside the required paragraph range be
   assert.deepEqual(calledModels, ["planner-route", "writer-route", "writer-route", "reviewer-route"]);
 });
 
+test("opening generation gives slow reasoning routes stage-appropriate deadlines", async () => {
+  const { context, connection, plan, paragraph } = openingBudgetFixture();
+  const requests: Array<{ model: string; timeout: number }> = [];
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      requests.push({ model: request.model, timeout: request.timeout });
+      if (request.model === connection.routes.planner) {
+        return { value: plan, usageTokens: 100, usageEstimated: false };
+      }
+      if (request.model === connection.routes.writer) {
+        return {
+          value: { title: "第一章 修好的机械臂", paragraphs: Array.from({ length: 16 }, () => paragraph) },
+          usageTokens: 1_000,
+          usageEstimated: false,
+        };
+      }
+      throw new Error("reviewer stop after deadline capture");
+    }),
+    /reviewer stop after deadline capture/,
+  );
+
+  assert.deepEqual(requests.slice(0, 3), [
+    { model: connection.routes.planner, timeout: 180_000 },
+    { model: connection.routes.writer, timeout: 300_000 },
+    { model: connection.routes.extractor, timeout: 120_000 },
+  ]);
+});
+
 test("opening gateway failures expose consumed model usage", async () => {
   const base = createStory({ genre: "都市", tone: "机械 · 奶爸" }, "user_test");
   const connection: ModelConnection = {
@@ -1044,17 +1073,22 @@ test("streaming ignores non-positive provider usage and falls back to a positive
   };
   const content = JSON.stringify({ title: "chapter", paragraphs: ["one", "two", "three", "four"] });
   const responseBody = `data: ${JSON.stringify({ choices: [{ delta: { content } }], usage: { total_tokens: -500 } })}\n\ndata: [DONE]\n\n`;
+  let observedStreamTimeout: number | undefined;
 
   const result = await streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
     secretReader: async () => "test-key",
-    modelFetcher: async () => new Response(responseBody, {
-      status: 200,
-      headers: { "Content-Type": "text/event-stream" },
-    }),
+    modelFetcher: async (_connection, _apiKey, _pathname, _init, timeout) => {
+      observedStreamTimeout = timeout;
+      return new Response(responseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
   });
 
   assert.ok(result.usageTokens && result.usageTokens > 0);
   assert.equal(result.usageEstimated, true);
+  assert.equal(observedStreamTimeout, 300_000);
 
   await assert.rejects(
     () => streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
@@ -1222,8 +1256,10 @@ test("a real seed continuation budget admits planner, audit, writer, and extract
     itemTransitions: [],
   };
   let pipelineCalls = 0;
-  const candidates = await generateCandidateDraftsWithConnection(connection, story, async <T>(_connection, model) => {
+  const stageTimeouts: Array<{ model: string; timeout: number | undefined }> = [];
+  const candidates = await generateCandidateDraftsWithConnection(connection, story, async <T>(_connection, model, _system, _prompt, timeout) => {
     pipelineCalls += 1;
+    stageTimeouts.push({ model, timeout });
     if (model === connection.routes.planner) {
       return {
         value: { candidates: Array.from({ length: 5 }, (_, index) => ({ ...candidate, creativeAxis: `${candidate.creativeAxis}${index}` })) } as T,
@@ -1245,8 +1281,9 @@ test("a real seed continuation budget admits planner, audit, writer, and extract
     CONTINUATION_JOB_TOKEN_BUDGET - candidates.usageTokens - writerInput - CHAPTER_EXTRACTION_ADMISSION_RESERVE,
   );
   assert.ok(writerMaxTokens >= 2_000, `real seed writer allowance was only ${writerMaxTokens}`);
-  const admittedChapter = await generateChapterWithConnection(connection, prompt, writerMaxTokens, async <T>() => {
+  const admittedChapter = await generateChapterWithConnection(connection, prompt, writerMaxTokens, async <T>(_connection, model, _system, _prompt, timeout) => {
     pipelineCalls += 1;
+    stageTimeouts.push({ model, timeout });
     return {
       value: { title: "第2章 潮门断流", paragraphs: ["行动落地。", "局势改变。", "众人回应。", "代价显现。"] } as T,
       usageTokens: 500,
@@ -1260,8 +1297,9 @@ test("a real seed continuation budget admits planner, audit, writer, and extract
     representativeChapter,
     undefined,
     story.readingExperience,
-    async <T>() => {
+    async <T>(_connection, model, _system, _prompt, timeout) => {
       pipelineCalls += 1;
+      stageTimeouts.push({ model, timeout });
       return {
         value: { events: [], characterUpdates: [], itemUpdates: [], experienceEvidence: [] } as T,
         usageTokens: 400,
@@ -1271,6 +1309,12 @@ test("a real seed continuation budget admits planner, audit, writer, and extract
     CHAPTER_EXTRACTION_ADMISSION_RESERVE,
   );
   assert.equal(pipelineCalls, 4);
+  assert.deepEqual(stageTimeouts, [
+    { model: connection.routes.planner, timeout: 180_000 },
+    { model: connection.routes.extractor, timeout: 120_000 },
+    { model: connection.routes.writer, timeout: 300_000 },
+    { model: connection.routes.extractor, timeout: 120_000 },
+  ]);
 });
 
 test("opening planner admission uses its full request before the first completer call", async () => {

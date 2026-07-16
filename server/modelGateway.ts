@@ -32,6 +32,11 @@ import { addModelUsage, attachedModelUsage, attachModelUsage } from "./modelUsag
 import { readSecret } from "./vault";
 
 const itemStatuses = new Set(["available", "held", "lost", "destroyed", "consumed"] as const);
+const GENERATION_STAGE_TIMEOUT_MS = {
+  planner: 180_000,
+  writer: 300_000,
+  reviewer: 120_000,
+} as const;
 const chapterWriterInstruction = `你是原创中文长篇连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。必须同时满足用户提示中的中文字符区间与目标段落数；每段包含完整场景动作、感官细节或人物反应，不能用短句凑段。${IMMERSIVE_NARRATION_PROMPT}`;
 
 function chapterWriterSystemPrompt(streaming: boolean) {
@@ -705,7 +710,7 @@ export async function generateStoryOpeningWithConnection(
       `本地基础契约仅供参考：${JSON.stringify(context.contract)}`,
       "规划必须使两个词在同一故事机制中兼容；体验硬承诺优先于题材默认套路。",
     ].join("\n"),
-    timeout: 60_000,
+    timeout: GENERATION_STAGE_TIMEOUT_MS.planner,
     maxTokens: 2_600,
   };
   assertModelCallTokenBudget({
@@ -763,7 +768,7 @@ export async function generateStoryOpeningWithConnection(
       model: connection.routes.writer,
       system: writerSystem,
       prompt: attemptPrompt,
-      timeout: 120_000,
+      timeout: GENERATION_STAGE_TIMEOUT_MS.writer,
       maxTokens: 6_500,
     };
     try {
@@ -817,7 +822,7 @@ export async function generateStoryOpeningWithConnection(
         `正文：${normalizedChapterTitle}\n${content}`,
         "逐轴返回正文中的连续原句证据以及命中的 signalIds；证据必须具体对应所申报模型信号中的人物、动作、对象与结果，并在同一句 quote 中逐字包含该模型信号 evidenceAnchors 中至少两个相互独立的短语。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，不能把标签、人物称谓共词或无关动作冒充兑现。两个轴必须提供不同原句，不能把同一句泛化动作重复标给两轴。event.persistentFacts 返回 2—8 条正文连续原句，保存主角已经获得的能力、奖励、权限、资源、关系或世界状态，供下一章直接继承。返回 {experienceEvidence:[{axisId,word,signalIds,quote}],event:{title,cause,outcome,location,persistentFacts}}。任一轴没有真实证据时仍返回空 evidence，让本稿失败重写。",
       ].join("\n"),
-      timeout: 45_000,
+      timeout: GENERATION_STAGE_TIMEOUT_MS.reviewer,
       maxTokens: 1_400,
     };
     try {
@@ -911,7 +916,7 @@ export async function generateCandidateDraftsWithConnection(
     connection.routes.planner,
     plannerSystem,
     plannerPrompt,
-    40_000,
+    GENERATION_STAGE_TIMEOUT_MS.planner,
     1_800,
   );
   const payload = completion.value;
@@ -971,7 +976,7 @@ export async function generateCandidateDraftsWithConnection(
       connection.routes.extractor,
       auditSystem,
       auditPrompt,
-      40_000,
+      GENERATION_STAGE_TIMEOUT_MS.reviewer,
       1_800,
     );
   } catch (error) {
@@ -1025,7 +1030,7 @@ export async function generateChapterWithConnection(
     connection.routes.writer,
     systemPrompt,
     prompt,
-    120_000,
+    GENERATION_STAGE_TIMEOUT_MS.writer,
     maxTokens,
   );
   const parsed = completion.value;
@@ -1135,7 +1140,7 @@ export async function streamChapterWithConnection(
       apiKey,
       "/chat/completions",
       { method: "POST", body: JSON.stringify(body) },
-      120_000,
+      GENERATION_STAGE_TIMEOUT_MS.writer,
     );
   } catch (error) {
     throw attachModelUsage(error, conservativeFailureTokens, true);
@@ -1253,7 +1258,7 @@ export async function extractChapterStateWithConnection(
     connection.routes.extractor,
     extractorSystem,
     extractorPrompt,
-    30_000,
+    GENERATION_STAGE_TIMEOUT_MS.reviewer,
     1_500,
   );
   const parsed = completion.value;
