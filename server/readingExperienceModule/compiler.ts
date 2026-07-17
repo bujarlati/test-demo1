@@ -177,7 +177,10 @@ function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIn
   if (!validStructuralDimension(draft.dimensions[0]) || !validStructuralDimension(draft.dimensions[1])) return { ok: false, kind: "invalid_model_output" };
   const dimensions = draft.dimensions as [InterpretationDimensionDraft, InterpretationDimensionDraft];
   const expected = intent.descriptors.map((descriptor) => descriptor.text);
-  if (dimensions.some((dimension, index) => normalizedText(dimension.descriptor) !== expected[index] || normalizedText(dimension.interpretation).length < 8 || normalizedText(dimension.interpretation).length > 500 || !Number.isFinite(dimension.confidence) || dimension.confidence < 0.65 || dimension.confidence > 1)) {
+  if (dimensions.some((dimension, index) => normalizedText(dimension.descriptor) !== expected[index] || !Number.isFinite(dimension.confidence) || dimension.confidence < 0 || dimension.confidence > 1)) {
+    return { ok: false, kind: "invalid_model_output" };
+  }
+  if (dimensions.some((dimension) => normalizedText(dimension.interpretation).length < 8 || normalizedText(dimension.interpretation).length > 500 || dimension.confidence < 0.65)) {
     return { ok: false, kind: "domain", outcome: { status: "needs_resolution", code: "unknown_intent", message: "这组词的含义还不够明确，无法编译为可验证的阅读体验，请换一组词或补充说明。" } };
   }
   const roles = draft.synthesis.dimensionRoles;
@@ -192,27 +195,69 @@ function alternativeCategory(category: ExperienceCategory): ExperienceCategory {
   return categories[(categories.indexOf(category) + 1) % categories.length];
 }
 
+function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
+  if (policy.kind === "event_slots") return { ...policy, requiredSlots: [...policy.requiredSlots] };
+  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds] };
+  return { ...policy };
+}
+
+function cloneSemanticSlots(slots: InterpretationDimensionDraft["observableSignals"][number]["semanticSlots"]): InterpretationDimensionDraft["observableSignals"][number]["semanticSlots"] {
+  return slots ? { ...slots } : undefined;
+}
+
+function shiftedAnchorCount(value: number): number {
+  return value >= 12 ? value - 1 : value + 1;
+}
+
+function complementaryEvidencePolicy(primary: EvidencePolicy, fallbackCategory: ExperienceCategory): EvidencePolicy {
+  if (primary.kind === "event_slots") {
+    return {
+      kind: "event_slots",
+      requiredSlots: Array.from(new Set([...primary.requiredSlots, "reaction", "object"])),
+      minimumAnchors: shiftedAnchorCount(primary.minimumAnchors),
+    };
+  }
+  if (primary.kind === "distribution") {
+    return {
+      kind: "distribution",
+      metricIds: Array.from(new Set([...primary.metricIds, "repeated_dimension_continuity"])),
+      minimumAnchors: shiftedAnchorCount(primary.minimumAnchors),
+      requireSemanticJudge: true,
+    };
+  }
+  const policy = evidencePolicyFor(fallbackCategory);
+  if (policy.kind === "distribution") {
+    return { ...policy, metricIds: [...policy.metricIds, "repeated_dimension_continuity"], minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
+  }
+  if (policy.kind === "event_slots") {
+    return { ...policy, requiredSlots: Array.from(new Set([...policy.requiredSlots, "reaction"])), minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
+  }
+  return { kind: "event_slots", requiredSlots: ["actor", "action", "outcome", "reaction"], minimumAnchors: 3 };
+}
+
 function splitAndNormalizeDimensions(
   drafts: [InterpretationDimensionDraft, InterpretationDimensionDraft],
   intent: ReadingExperienceIntent,
 ): [ExperienceDimension, ExperienceDimension] {
   const duplicate = intent.descriptors[0].text === intent.descriptors[1].text;
+  const primaryPolicy = cloneEvidencePolicy(drafts[0].observableSignals[0].verification);
   return drafts.map((draft, index) => {
     const dimensionId = `dimension_${index + 1}_${stableToken(`${index}:${intent.descriptors[index].text}`)}`;
     const splitCategory = alternativeCategory(draft.categories[0]);
     const secondaryRepeatedDimension = duplicate && index === 1;
+    const secondaryPolicy = complementaryEvidencePolicy(primaryPolicy, splitCategory);
     const signals: ObservableSignalV2[] = secondaryRepeatedDimension
       ? [
-        { id: `${dimensionId}_signal_1`, dimensionId, kind: splitCategory, description: "当前行动造成的持续状态变化必须绑定具体人物、对象和结果。", verification: evidencePolicyFor(splitCategory), persistence: "cross_chapter" },
-        { id: `${dimensionId}_signal_2`, dimensionId, kind: splitCategory, description: "后续事件必须显示该状态如何改变人物选择、环境反应或冲突走向。", verification: evidencePolicyFor(splitCategory), persistence: "cross_chapter" },
+        { id: `${dimensionId}_signal_1`, dimensionId, kind: splitCategory, description: "当前行动造成的持续状态变化必须绑定具体人物、对象和结果。", verification: cloneEvidencePolicy(secondaryPolicy), persistence: "cross_chapter" },
+        { id: `${dimensionId}_signal_2`, dimensionId, kind: splitCategory, description: "后续事件必须显示该状态如何改变人物选择、环境反应或冲突走向。", verification: cloneEvidencePolicy(secondaryPolicy), persistence: "cross_chapter" },
       ]
       : draft.observableSignals.map((signal, signalIndex) => ({
         id: `${dimensionId}_signal_${signalIndex + 1}`,
         dimensionId,
         kind: signal.kind,
         description: normalizedText(signal.description),
-        ...(signal.semanticSlots ? { semanticSlots: signal.semanticSlots } : {}),
-        verification: signal.verification,
+        ...(signal.semanticSlots ? { semanticSlots: cloneSemanticSlots(signal.semanticSlots) } : {}),
+        verification: cloneEvidencePolicy(signal.verification),
         persistence: signal.persistence,
       }));
     const prohibitions: ExperienceProhibition[] = draft.prohibitions.map((prohibition, prohibitionIndex) => ({
@@ -276,6 +321,14 @@ function stableToken(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 function freezeContractRevision(
   request: CompileExperienceRequest,
   intent: ReadingExperienceIntent,
@@ -292,7 +345,7 @@ function freezeContractRevision(
     minimumSignals: 1,
     carryRuleIds: dimension.observableSignals.filter((signal) => signal.persistence === "cross_chapter" || signal.persistence === "whole_story").map((signal) => signal.id),
   }));
-  return {
+  return deepFreeze({
     id: `experience_revision_${request.requestedRevision}_${stableToken(intent.descriptors.map((descriptor) => descriptor.text).join("\u001f"))}`,
     schemaVersion: 2,
     revision: request.requestedRevision,
@@ -305,7 +358,7 @@ function freezeContractRevision(
     ruleGraphVersion: "reading-experience-v2-rules-1",
     provenance,
     createdAt: createdAt.toISOString(),
-  };
+  });
 }
 
 export async function compileExperience(request: CompileExperienceRequest, port: ExperienceInterpretationPort, now: () => Date): Promise<ExperienceOperationResult<CompileOutcome>> {

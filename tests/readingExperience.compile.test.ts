@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compileExperience } from "../server/readingExperienceModule/compiler";
+import type { InterpretationDraft } from "../server/readingExperienceModule/types";
 import { scriptedExperiencePorts } from "./fixtures/readingExperienceFixtures";
 
 test("compile accepts curated, conflict, repeated and novel descriptor pairs", async () => {
@@ -55,6 +56,62 @@ test("compile gives repeated descriptors independent semantic responsibilities",
   assert.notEqual(first.interpretation, second.interpretation);
   assert.notDeepEqual(first.observableSignals.map((signal) => signal.description), second.observableSignals.map((signal) => signal.description));
   assert.notDeepEqual(first.observableSignals.map((signal) => signal.verification), second.observableSignals.map((signal) => signal.verification));
+});
+
+test("compile gives repeated curated and model descriptors complementary evidence policies", async () => {
+  for (const descriptors of [["系统", "系统"], ["轻盈", "轻盈"], ["赛博禅意", "赛博禅意"]] as const) {
+    const { deps } = scriptedExperiencePorts();
+    const result = await compileExperience({
+      intent: { descriptors: [{ text: descriptors[0] }, { text: descriptors[1] }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `repeated_policy_${descriptors[0]}`,
+    }, deps.interpretationPort, deps.now);
+    assert.equal(result.ok, true);
+    if (!result.ok || result.value.status !== "ready") continue;
+    const [first, second] = result.value.revision.dimensions;
+    assert.notDeepEqual(first.observableSignals[0].verification, second.observableSignals[0].verification);
+    assert.notEqual(first.observableSignals[0].description, second.observableSignals[0].description);
+    assert.notEqual(result.value.revision.synthesis.dimensionRoles[0], result.value.revision.synthesis.dimensionRoles[1]);
+  }
+});
+
+test("compile classifies malformed confidence and descriptor protocol values as invalid model output", async () => {
+  for (const mutation of [
+    (draft: InterpretationDraft) => { draft.dimensions[0].confidence = Number.NaN; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].confidence = Infinity; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].confidence = -0.1; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].confidence = 1.1; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].descriptor = "错误描述"; },
+  ]) {
+    const { deps } = scriptedExperiencePorts();
+    const result = await compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意" }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "invalid_protocol",
+    }, { interpret: async (input) => {
+      const draft = await deps.interpretationPort.interpret(input);
+      mutation(draft);
+      return draft;
+    } }, deps.now);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+  }
+});
+
+test("compile freezes independent nested revisions", async () => {
+  const { deps } = scriptedExperiencePorts();
+  const request = {
+    intent: { descriptors: [{ text: "系统" }, { text: "系统" }] as [{ text: string }, { text: string }], locale: "zh-CN" as const },
+    context: { genre: "玄幻", inspiration: "旧城" }, parentRevisionId: null, requestedRevision: 1, jobId: "frozen_revision",
+  };
+  const first = await compileExperience(request, deps.interpretationPort, deps.now);
+  assert.equal(first.ok, true);
+  if (!first.ok || first.value.status !== "ready") return;
+  const revision = first.value.revision;
+  assert.equal(Object.isFrozen(revision), true);
+  assert.equal(Object.isFrozen(revision.dimensions), true);
+  assert.equal(Object.isFrozen(revision.dimensions[0].observableSignals[0].verification), true);
+  assert.throws(() => { revision.dimensions[0].observableSignals[0].description = "污染"; }, TypeError);
+  const second = await compileExperience(request, deps.interpretationPort, deps.now);
+  assert.deepEqual(second, first);
 });
 
 test("compile treats malformed interpretation responses as an invalid-model-output operation error", async () => {

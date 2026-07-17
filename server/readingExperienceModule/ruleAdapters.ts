@@ -83,10 +83,16 @@ const curatedRules: Record<string, CuratedRule> = {
   },
 };
 
+function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
+  if (policy.kind === "event_slots") return { ...policy, requiredSlots: [...policy.requiredSlots] };
+  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds] };
+  return { ...policy };
+}
+
 function verificationFor(category: ExperienceCategory): EvidencePolicy {
-  if (category === "relationship") return relationshipVerification;
-  if (category === "pacing" || category === "voice") return distributionVerification;
-  return eventVerification;
+  if (category === "relationship") return cloneEvidencePolicy(relationshipVerification);
+  if (category === "pacing" || category === "voice") return cloneEvidencePolicy(distributionVerification);
+  return cloneEvidencePolicy(eventVerification);
 }
 
 /** The only production catalogue that contains concrete curated descriptor mappings. */
