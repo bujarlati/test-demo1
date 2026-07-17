@@ -17,7 +17,9 @@ import type {
   InterpretationDraft,
 } from "./types";
 
-const unsafeIntentPattern = /忽略(?:以上|先前|所有)?指令|泄露(?:密钥|密码|提示)|系统提示|越过(?:限制|安全)|绕过(?:限制|安全)|制造炸弹|自制炸弹|伤害他人|ignore\s+(?:all|previous|instructions?)|reveal\s+(?:key|secret|prompt)|jailbreak|prompt\s*injection/iu;
+const injectionVerbTargetPattern = /(?:忽略|无视|忘记|跳过|越过|绕过|覆盖|改写|取消)\s*(?:以上|先前|之前|所有)?\s*(?:指令|规则|限制|安全|系统\s*提示|提示词)|(?:disregard|ignore|forget|bypass|override|skip)\s*(?:(?:the|all|previous|prior)\s*)*(?:instructions?|rules?|restrictions?|safety|system\s*prompt|prompts?)|系统\s*提示|prompt\s*injection|jailbreak/iu;
+const sensitiveDisclosurePattern = /(?:泄露|透露|显示|导出|发送|reveal|show|export|send)\s*(?:密钥|密码|提示词|系统\s*提示|api\s*key|keys?|secrets?|system\s*prompt)/iu;
+const dangerousIntentPattern = /(?:制作|制造|自制|组装|合成|配制|获取|购买)\s*(?:爆炸物|炸弹|爆炸装置|炸药|毒药|毒剂|枪械|武器)|(?:make|build|create|assemble|obtain|buy)\s*(?:an?\s*)?(?:explosive(?:\s+device)?|bomb|weapon|poison)|(?:伤害|杀害|袭击|毒害)\s*(?:他人|别人|人员|目标)|(?:harm|kill|attack|poison)\s*(?:people|someone|a\s+person|targets?)/iu;
 const descriptorPattern = /^[\p{L}\p{N}]{1,24}$/u;
 const supplementalPattern = /^[\p{L}\p{N}\p{Zs}，。！？、：；“”‘’（）()《》〈〉—\-·]+$/u;
 const categories: ExperienceCategory[] = ["mechanic", "protagonist_action", "conflict_outcome", "world_reaction", "relationship", "pacing", "voice"];
@@ -52,6 +54,11 @@ function normalizedText(value: string): string {
   return value.normalize("NFKC").trim();
 }
 
+function isUnsafeIntentText(value: string): boolean {
+  const normalized = normalizedText(value);
+  return injectionVerbTargetPattern.test(normalized) || sensitiveDisclosurePattern.test(normalized) || dangerousIntentPattern.test(normalized);
+}
+
 function unsafeOutcome(): RejectedOutcome {
   return { status: "rejected", code: "unsafe_intent", message: "这组词包含指令或越权要求，请只填写希望阅读时感受到的两个词。" };
 }
@@ -63,7 +70,7 @@ function invalidOutcome(): RejectedOutcome {
 function normalizeSupplemental(value: unknown, maximumLength: number, allowEmpty = false): { ok: true; value: string } | { ok: false; outcome: RejectedOutcome } {
   if (typeof value !== "string") return { ok: false, outcome: invalidOutcome() };
   const normalized = normalizedText(value);
-  if (unsafeIntentPattern.test(normalized)) return { ok: false, outcome: unsafeOutcome() };
+  if (isUnsafeIntentText(normalized)) return { ok: false, outcome: unsafeOutcome() };
   if ((!allowEmpty && !normalized) || normalized.length > maximumLength || (normalized && !supplementalPattern.test(normalized))) {
     return { ok: false, outcome: invalidOutcome() };
   }
@@ -78,7 +85,7 @@ function preflightRequest(request: CompileExperienceRequest): Preflight {
   const descriptors = intent.descriptors.map((candidate) => {
     if (!isRecord(candidate) || typeof candidate.text !== "string") return { ok: false as const, outcome: invalidOutcome() };
     const text = normalizedText(candidate.text);
-    if (unsafeIntentPattern.test(text)) return { ok: false as const, outcome: unsafeOutcome() };
+    if (isUnsafeIntentText(text)) return { ok: false as const, outcome: unsafeOutcome() };
     if (!descriptorPattern.test(text)) return { ok: false as const, outcome: invalidOutcome() };
     if (candidate.clarification === undefined) return { ok: true as const, value: { text } };
     const clarification = normalizeSupplemental(candidate.clarification, 240, true);
