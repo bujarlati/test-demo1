@@ -17,8 +17,8 @@ import type {
   InterpretationDraft,
 } from "./types";
 
-const injectionVerbTargetPattern = /(?:忽略|无视|忘记|跳过|越过|绕过|覆盖|改写|取消)\s*(?:以上|先前|之前|所有)?\s*(?:指令|规则|限制|安全|系统\s*提示|提示词)|(?:disregard|ignore|forget|bypass|override|skip)\s*(?:(?:the|all|previous|prior)\s*)*(?:instructions?|rules?|restrictions?|safety|system\s*prompt|prompts?)|系统\s*提示|prompt\s*injection|jailbreak/iu;
-const sensitiveDisclosurePattern = /(?:泄露|透露|显示|导出|发送|reveal|show|export|send)\s*(?:密钥|密码|提示词|系统\s*提示|api\s*key|keys?|secrets?|system\s*prompt)/iu;
+const injectionVerbTargetPattern = /(?:忽略|无视|忘记|跳过|越过|绕过|覆盖|改写|取消)\s*(?:以上|先前|之前|所有)?\s*(?:指令|规则|限制|安全|系统\s*提示(?!音|声|器|灯|模块)|提示词)|(?:disregard|ignore|forget|bypass|override|skip)\s*(?:(?:the|all|previous|prior)\s*)*(?:instructions?|rules?|restrictions?|safety|system\s*prompt|prompts?)\b|系统\s*提示(?!音|声|器|灯|模块)|prompt\s*injection|jailbreak/iu;
+const sensitiveDisclosurePattern = /(?:泄露|透露|显示|导出|发送|reveal|show|export|send)\s*(?:(?:密钥|提示词|系统\s*提示(?!音|声|器|灯|模块)|密码(?!学))|api\s*key\b|keys?\b|secrets?\b|system\s*prompt\b)/iu;
 const dangerousIntentPattern = /(?:制作|制造|自制|组装|合成|配制|获取|购买)\s*(?:爆炸物|炸弹|爆炸装置|炸药|毒药|毒剂|枪械|武器)|(?:make|build|create|assemble|obtain|buy)\s*(?:an?\s*)?(?:explosive(?:\s+device)?|bomb|weapon|poison)|(?:伤害|杀害|袭击|毒害)\s*(?:他人|别人|人员|目标)|(?:harm|kill|attack|poison)\s*(?:people|someone|a\s+person|targets?)/iu;
 const descriptorPattern = /^[\p{L}\p{N}]{1,24}$/u;
 const supplementalPattern = /^[\p{L}\p{N}\p{Zs}，。！？、：；“”‘’（）()《》〈〉—\-·]+$/u;

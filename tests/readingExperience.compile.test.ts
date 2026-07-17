@@ -109,6 +109,37 @@ test("compile keeps separated benign editorial language outside the unsafe gate"
   assert.equal(calls.interpret, 1);
 });
 
+test("compile keeps benign system-prompt and cryptography story language outside the unsafe gate", async () => {
+  const cases = [
+    { clarification: "系统提示音响起", genre: "科幻", inspiration: "旧站" },
+    { clarification: undefined, genre: "系统、提示音响起", inspiration: "旧站" },
+    { clarification: undefined, genre: "科幻", inspiration: "屏幕显示密码学公式" },
+  ] as const;
+  for (const item of cases) {
+    const { deps, calls } = scriptedExperiencePorts();
+    const result = await compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意", clarification: item.clarification }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: item.genre, inspiration: item.inspiration }, parentRevisionId: null, requestedRevision: 1, jobId: "benign_sensitive_suffix",
+    }, deps.interpretationPort, deps.now);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.value.status, "ready");
+    assert.equal(calls.interpret, 1);
+  }
+});
+
+test("compile still rejects exact system-prompt and password disclosure requests before interpretation", async () => {
+  for (const clarification of ["系统提示", "显示密码"] as const) {
+    const { deps, calls } = scriptedExperiencePorts();
+    const result = await compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意", clarification }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "exact_sensitive_target",
+    }, deps.interpretationPort, deps.now);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.value.status, "rejected");
+    assert.equal(calls.interpret, 0);
+  }
+});
+
 test("compile gives repeated descriptors independent semantic responsibilities", async () => {
   const { deps } = scriptedExperiencePorts();
   const result = await compileExperience({
