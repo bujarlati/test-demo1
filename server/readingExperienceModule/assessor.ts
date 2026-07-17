@@ -1,136 +1,110 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, createHash, timingSafeEqual } from "node:crypto";
 import type { CanonFactReferenceV2, ObservableSignalV2 } from "../../src/types";
 import { evidenceFromClaim, groundClaim, hashArtifact, sourceForArtifact, type EvidenceFinding, type GroundedClaim } from "./evidence";
 import { canonicalAuthorizationPayload, sameMac, signExperiencePlan, verifyExperienceStageTicket } from "./scheduler";
-import type { AssessExperienceRequest, AssessorDependencies, ExperienceAssessment, ExperienceLedgerPatch, ExperienceOperationResult, ExperiencePublicationPermit, ExperienceStagePlan, SemanticEvidenceClaim } from "./types";
+import type { AssessExperienceRequest, AssessmentState, AssessorDependencies, ExperienceAssessment, ExperienceLedgerPatch, ExperienceOperationResult, ExperiencePublicationPermit, ExperienceRepairToken, ExperienceStagePlan, PublicationPermitContext, SemanticEvidenceClaim } from "./types";
 import { runRuleAdapter } from "./ruleAdapters";
 
-function assessment(result: ExperienceAssessment): ExperienceOperationResult<ExperienceAssessment> { return { ok: true, value: result }; }
-function unique(values: string[]): string[] { return [...new Set(values)]; }
-function nowIso(deps: AssessorDependencies, ttl: number): string { return new Date(deps.now().getTime() + ttl).toISOString(); }
-function sign(value: unknown, secret: string): string { return createHmac("sha256", secret).update(canonicalAuthorizationPayload(value)).digest("base64url"); }
-function token(request: AssessExperienceRequest, failedRuleIds: string[], deps: AssessorDependencies): string {
-  const expiry = nowIso(deps, deps.repairTtlMs ?? 5 * 60_000);
-  const payload = { version: 1, ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId, attempt: request.plan.ticket.attempt, artifactHash: safeHash(request), failedRuleIds: [...failedRuleIds].sort(), expiresAt: expiry };
-  return `${Buffer.from(canonicalAuthorizationPayload(payload)).toString("base64url")}.${sign(payload, deps.ticketSecret)}`;
-}
-function safeHash(request: AssessExperienceRequest): string { try { return hashArtifact(request.artifact); } catch { return "invalid-artifact"; } }
-function rewrite(request: AssessExperienceRequest, findings: EvidenceFinding[] | string[], deps: AssessorDependencies): ExperienceAssessment {
-  const ids = unique(findings.map((item) => typeof item === "string" ? item : item.ruleId));
-  return { status: "rewrite", artifactKind: request.artifact.kind, failedRuleIds: ids, repairToken: token(request, ids, deps), message: "Evidence must be grounded in the submitted artifact." };
-}
-function rejected(request: AssessExperienceRequest, ruleId: string): ExperienceAssessment { return { status: "rejected", artifactKind: request.artifact.kind, failedRuleIds: [ruleId], message: "Assessment authorization is invalid." }; }
+const permitDomain = "reading-experience:permit:v1";
+const repairDomain = "reading-experience:repair:v1";
+const invalidModel = (jobId: string): ExperienceOperationResult<never> => ({ ok: false, error: { code: "invalid_model_output", message: "Semantic judge returned an invalid verdict.", stage: "assessment", retryable: false, jobId } });
+const unavailable = (jobId: string): ExperienceOperationResult<never> => ({ ok: false, error: { code: "model_unavailable", message: "Semantic judge is unavailable.", stage: "assessment", retryable: true, jobId } });
+const freeze = <T>(value: T): T => { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value as object)) freeze(child); Object.freeze(value); } return value; };
+const snapshot = <T>(value: T): T | undefined => { try { return freeze(structuredClone(value)); } catch { return undefined; } };
+const sign = (domain: string, payload: unknown, secret: string): string => createHmac("sha256", secret).update(domain).update("\u001f").update(canonicalAuthorizationPayload(payload)).digest("base64url");
+const equal = (left: string, right: string): boolean => { const a = Buffer.from(left, "base64url"); const b = Buffer.from(right, "base64url"); return a.length === b.length && timingSafeEqual(a, b); };
+const artifactHashSafe = (request: AssessExperienceRequest): string => { try { return hashArtifact(request.artifact); } catch { return "invalid-artifact"; } };
+const failure = (request: AssessExperienceRequest, id: string): ExperienceOperationResult<ExperienceAssessment> => ({ ok: true, value: { status: "rejected", artifactKind: request.artifact.kind, failedRuleIds: [id], message: "Assessment authorization is invalid." } });
+const unique = (ids: string[]): string[] => [...new Set(ids)].sort();
 
-function expectedStage(kind: AssessExperienceRequest["artifact"]["kind"], stage: string): boolean {
-  return kind === "blueprint" ? stage === "blueprint" : kind === "retcon_revision" ? stage === "retcon" : stage === "opening" || stage === "continuation" || stage === "rewrite";
+function validArtifact(value: unknown): value is AssessExperienceRequest["artifact"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  if (item.kind === "blueprint") return Object.keys(item).every((key) => key === "kind" || key === "value") && item.value !== null && typeof item.value === "object" && !Array.isArray(item.value) && Object.keys(item.value as object).length > 0;
+  if (item.kind !== "chapter" && item.kind !== "retcon_revision") return false;
+  if (Object.keys(item).some((key) => !["kind", "chapterId", "revisionId", "title", "paragraphs"].includes(key))) return false;
+  return typeof item.chapterId === "string" && !!item.chapterId.trim() && typeof item.revisionId === "string" && !!item.revisionId.trim() && typeof item.title === "string" && !!item.title.trim() && Array.isArray(item.paragraphs) && item.paragraphs.length > 0 && item.paragraphs.every((paragraph) => typeof paragraph === "string" && paragraph.length > 0);
 }
-function authenticate(request: AssessExperienceRequest, deps: AssessorDependencies): string | undefined {
-  const { plan } = request;
-  if (!verifyExperienceStageTicket(plan.ticket, deps)) return "ticket_tampered";
-  const expires = Date.parse(plan.ticket.expiresAt);
-  if (!Number.isFinite(expires)) return "ticket_tampered";
-  if (expires <= deps.now().getTime()) return "ticket_expired";
+function stageMatches(plan: ExperienceStagePlan, artifact: AssessExperienceRequest["artifact"]): boolean {
+  if (artifact.kind === "blueprint") return plan.stage === "blueprint";
+  if (artifact.kind === "retcon_revision") return plan.stage === "retcon";
+  return plan.stage === "opening" || plan.stage === "continuation" || plan.stage === "rewrite";
+}
+function stateMatches(plan: ExperienceStagePlan, state: AssessmentState): boolean {
+  return plan.ticket.activationId === state.activationId && plan.ticket.branchId === state.branchId && plan.ticket.expectedCanonVersion === state.canonVersion && plan.ticket.ledgerRevision === state.ledgerRevision && plan.ticket.attempt === state.attempt && !state.consumedTicketIds.includes(plan.ticket.id);
+}
+function authenticate(request: AssessExperienceRequest, deps: AssessorDependencies, state: AssessmentState): string | undefined {
+  if (!validArtifact(request.artifact)) return "invalid_artifact";
+  const plan = request.plan;
+  if (!verifyExperienceStageTicket(plan.ticket, deps) || !Number.isFinite(Date.parse(plan.ticket.expiresAt))) return "ticket_tampered";
+  if (Date.parse(plan.ticket.expiresAt) <= deps.now().getTime()) return "ticket_expired";
   const { authorizationMac, ...unsigned } = plan;
   if (!sameMac(authorizationMac, signExperiencePlan(unsigned, deps.ticketSecret))) return "plan_mismatch";
-  if (plan.stage !== plan.ticket.stage || plan.artifactKind !== plan.ticket.artifactKind || plan.artifactKind !== request.artifact.kind || !expectedStage(request.artifact.kind, plan.stage)) return "stage_mismatch";
-  if (request.artifact.kind !== "blueprint" && (!plan.chapterId || plan.chapterId !== request.artifact.chapterId)) return "chapter_mismatch";
-  if (plan.ticket.contractRevisionId !== deps.contract.id || plan.ticket.ruleGraphVersion !== deps.contract.ruleGraphVersion) return "contract_mismatch";
-  if (!Number.isInteger(plan.chapterNumber) || plan.chapterNumber < 1 || plan.ticket.attempt < 0 || !plan.ticket.jobId) return "plan_mismatch";
+  if (plan.stage !== plan.ticket.stage || plan.artifactKind !== plan.ticket.artifactKind || plan.artifactKind !== request.artifact.kind || !stageMatches(plan, request.artifact)) return "stage_mismatch";
+  if (plan.ticket.contractRevisionId !== deps.contract.id || plan.ticket.ruleGraphVersion !== deps.contract.ruleGraphVersion || !stateMatches(plan, state)) return "state_mismatch";
+  if (request.artifact.kind !== "blueprint" && (!plan.chapterId || !plan.revisionId || plan.chapterId !== request.artifact.chapterId || plan.revisionId !== request.artifact.revisionId || state.chapterId !== request.artifact.chapterId || state.revisionId !== request.artifact.revisionId)) return "artifact_binding_mismatch";
   return undefined;
 }
-function signalsForPlan(plan: ExperienceStagePlan, deps: AssessorDependencies): ObservableSignalV2[] | undefined {
-  const contractById = new Map(deps.contract.dimensions.flatMap((dimension) => dimension.observableSignals.map((signal) => [signal.id, signal] as const)));
-  const out: ObservableSignalV2[] = [];
-  for (const dimension of plan.promptProjection.dimensions) {
-    for (const id of dimension.signalIds) {
-      const signal = contractById.get(id);
-      if (!signal || signal.dimensionId !== dimension.id || out.some((value) => value.id === signal.id)) return undefined;
-      out.push(signal);
-    }
-  }
-  return out.length && plan.evidenceSchema.length === out.length && plan.evidenceSchema.every((policy, index) => canonicalAuthorizationPayload(policy) === canonicalAuthorizationPayload(out[index].verification)) ? out : undefined;
+function selectedSignals(plan: ExperienceStagePlan, deps: AssessorDependencies): ObservableSignalV2[] | undefined {
+  const map = new Map(deps.contract.dimensions.flatMap((dimension) => dimension.observableSignals.map((signal) => [signal.id, signal] as const)));
+  const signals: ObservableSignalV2[] = [];
+  for (const dimension of plan.promptProjection.dimensions) for (const id of dimension.signalIds) { const signal = map.get(id); if (!signal || signal.dimensionId !== dimension.id || signals.some((candidate) => candidate.id === id)) return undefined; signals.push(signal); }
+  if (!signals.length || plan.evidenceSchema.length !== signals.length) return undefined;
+  return plan.evidenceSchema.every((policy, index) => canonicalAuthorizationPayload(policy) === canonicalAuthorizationPayload(signals[index].verification)) ? signals : undefined;
 }
-const unrealized = /\b(?:not|never|no|cannot|can't|did not|didn't|plan(?:s|ned)?|intend(?:s|ed)?|attempt(?:s|ed)?|try|tries|dream(?:s|ed)?|simulation|predict(?:s|ed)?|would|could|might|hearsay|rumou?r|label|descriptor)\b|(?:不|未|没有|计划|打算|试图|梦境|模拟|预测|据说|标签|描述词)/i;
-function claimText(source: string, grounded: GroundedClaim): string { return grounded.anchors.map((anchor) => source.slice(anchor.start, anchor.end)).join(" "); }
-function localFinding(source: string, claim: SemanticEvidenceClaim, grounded: GroundedClaim, signal: ObservableSignalV2): EvidenceFinding | undefined {
-  const text = claimText(source, grounded);
-  if (unrealized.test(text)) return { ruleId: "evidence.not_realized", severity: "rewrite", dimensionId: signal.dimensionId };
-  const slots = claim.slots ?? {};
-  const present = (name: string): boolean => typeof slots[name as keyof typeof slots] === "string" && !!slots[name as keyof typeof slots]?.trim() && text.toLocaleLowerCase().includes((slots[name as keyof typeof slots] as string).toLocaleLowerCase());
-  const categorySlots: Partial<Record<ObservableSignalV2["kind"], Array<"actor" | "action" | "outcome" | "reaction">>> = {
-    mechanic: ["actor", "action", "outcome"], protagonist_action: ["actor", "action"], conflict_outcome: ["actor", "action", "outcome"], world_reaction: ["actor", "reaction"],
-  };
-  const required = signal.verification.kind === "event_slots" ? [...signal.verification.requiredSlots, ...(categorySlots[signal.kind] ?? [])] : [];
-  if (required.some((slot) => !present(slot))) return { ruleId: "evidence.required_slot_missing", severity: "rewrite", dimensionId: signal.dimensionId };
-  if (signal.semanticSlots && Object.entries(signal.semanticSlots).some(([slot, expected]) => slots[slot as keyof typeof slots] !== expected)) return { ruleId: "evidence.binding_mismatch", severity: "rewrite", dimensionId: signal.dimensionId };
-  if (signal.kind === "relationship" && (!present("actor") || !present("action") || !present("reciprocalAction") || !present("relationshipChange"))) return { ruleId: "evidence.relationship_not_reciprocal", severity: "rewrite", dimensionId: signal.dimensionId };
+const unrealized = /\b(?:not|never|cannot|can't|did not|didn't|plan(?:s|ned)?|intend(?:s|ed)?|attempt(?:s|ed)?|fail(?:s|ed)?|dream(?:s|ed)?|simulation|predict(?:s|ed)?|would|could|might|hearsay|rumou?r|label|descriptor|helper)\b|(?:不|未|没有|计划|打算|试图|失败|梦境|模拟|预测|据说|标签|描述词|他人代做)/i;
+function deterministicUnrealized(source: string): boolean { return unrealized.test(source); }
+function localFinding(source: string, claim: SemanticEvidenceClaim, grounded: GroundedClaim, signal: ObservableSignalV2, protagonistId: string): EvidenceFinding | undefined {
+  const text = grounded.anchors.map((anchor) => source.slice(anchor.start, anchor.end)).join(" "); const slots = claim.slots ?? {};
+  const present = (slot: string) => typeof slots[slot as keyof typeof slots] === "string" && (slots[slot as keyof typeof slots] as string).trim() && text.toLocaleLowerCase().includes((slots[slot as keyof typeof slots] as string).toLocaleLowerCase());
+  const required: Record<string, string[]> = { mechanic: ["actor", "action", "object", "outcome"], protagonist_action: ["actor", "action", "outcome"], conflict_outcome: ["actor", "action", "outcome"], world_reaction: ["actor", "reaction", "outcome"], relationship: ["actor", "action", "reciprocalAction", "relationshipChange"] };
+  const policyRequired = signal.verification.kind === "event_slots" ? signal.verification.requiredSlots : [];
+  if ([...policyRequired, ...(required[signal.kind] ?? [])].some((slot) => !present(slot))) return { ruleId: "evidence.required_slot_missing", severity: "rewrite", dimensionId: signal.dimensionId };
+  if (["protagonist_action", "conflict_outcome", "mechanic"].includes(signal.kind) && (!protagonistId || slots.actor !== protagonistId)) return { ruleId: "evidence.helper_substitution", severity: "rewrite", dimensionId: signal.dimensionId };
+  if (signal.semanticSlots && Object.entries(signal.semanticSlots).some(([name, expected]) => slots[name as keyof typeof slots] !== expected)) return { ruleId: "evidence.binding_mismatch", severity: "rewrite", dimensionId: signal.dimensionId };
   return undefined;
 }
-function adapterFindings(source: string, deps: AssessorDependencies): EvidenceFinding[] {
-  return deps.contract.prohibitions.flatMap((prohibition) => prohibition.ruleAdapterId && runRuleAdapter(prohibition.ruleAdapterId, source) ? [{ ruleId: prohibition.id, severity: prohibition.severity === "block" ? "rejected" as const : "rewrite" as const }] : []);
+function validVerdict(value: unknown): value is { version: 1; claims: SemanticEvidenceClaim[] } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false; const record = value as Record<string, unknown>;
+  if (record.version !== 1 || !Array.isArray(record.claims) || Object.keys(record).some((key) => !["version", "claims"].includes(key))) return false;
+  return record.claims.every((value) => { if (!value || typeof value !== "object" || Array.isArray(value)) return false; const claim = value as Record<string, unknown>; if (Object.keys(claim).some((key) => !["version", "dimensionId", "signalId", "supported", "confidence", "anchors", "slots", "metrics"].includes(key)) || claim.version !== 1 || typeof claim.dimensionId !== "string" || typeof claim.signalId !== "string" || typeof claim.supported !== "boolean" || typeof claim.confidence !== "number" || !Number.isFinite(claim.confidence) || !Array.isArray(claim.anchors)) return false; if (claim.metrics !== undefined && (!claim.metrics || typeof claim.metrics !== "object" || Array.isArray(claim.metrics) || Object.values(claim.metrics as Record<string, unknown>).some((metric) => typeof metric !== "number" || !Number.isFinite(metric)))) return false; if (claim.slots !== undefined && (!claim.slots || typeof claim.slots !== "object" || Array.isArray(claim.slots) || Object.keys(claim.slots as Record<string, unknown>).some((key) => !["actor", "action", "object", "feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange"].includes(key)) || Object.values(claim.slots as Record<string, unknown>).some((slot) => typeof slot !== "string"))) return false; return claim.anchors.every((anchor) => anchor && typeof anchor === "object" && typeof (anchor as Record<string, unknown>).start === "number" && typeof (anchor as Record<string, unknown>).end === "number" && typeof (anchor as Record<string, unknown>).quote === "string"); });
 }
-function permit(request: AssessExperienceRequest, hash: string, deps: AssessorDependencies): ExperiencePublicationPermit {
-  if (request.artifact.kind === "blueprint") throw new Error("blueprint has no permit");
-  const expiresAt = nowIso(deps, deps.permitTtlMs ?? 10 * 60_000);
-  const unsigned = { version: 1 as const, ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId, attempt: request.plan.ticket.attempt, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, chapterId: request.artifact.chapterId, revisionId: request.artifact.revisionId, artifactHash: hash, expiresAt };
-  return { ...unsigned, signature: sign(unsigned, deps.ticketSecret) };
+function ledgerHash(patch: ExperienceLedgerPatch): string { return createHash("sha256").update(canonicalAuthorizationPayload(patch)).digest("hex"); }
+function permit(request: AssessExperienceRequest, artifactHash: string, evidenceIds: string[], patch: ExperienceLedgerPatch, deps: AssessorDependencies): ExperiencePublicationPermit {
+  const artifact = request.artifact; if (artifact.kind === "blueprint") throw new Error("invalid permit artifact"); const expiresAt = new Date(deps.now().getTime() + (deps.permitTtlMs ?? 600_000)).toISOString();
+  const unsigned = { version: 1 as const, ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId, attempt: request.plan.ticket.attempt, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, chapterId: artifact.chapterId, revisionId: artifact.revisionId, artifactHash, stage: request.plan.stage, artifactKind: request.plan.artifactKind, ruleGraphVersion: request.plan.ticket.ruleGraphVersion, expectedCanonVersion: request.plan.ticket.expectedCanonVersion, ledgerRevision: request.plan.ticket.ledgerRevision, evidenceIds: [...evidenceIds].sort(), ledgerPatchHash: ledgerHash(patch), permitId: `permit_${createHash("sha256").update(`${request.plan.ticket.id}\u001f${artifactHash}\u001f${expiresAt}`).digest("base64url")}`, expiresAt };
+  return { ...unsigned, signature: sign(permitDomain, unsigned, deps.ticketSecret) };
 }
-export function verifyPublicationPermit(value: ExperiencePublicationPermit, secret: string, now: Date): boolean {
-  const { signature, ...unsigned } = value; const actual = Buffer.from(signature, "base64url"); const expected = Buffer.from(sign(unsigned, secret), "base64url");
-  return actual.length === expected.length && timingSafeEqual(actual, expected) && Date.parse(value.expiresAt) > now.getTime();
+export function verifyPublicationPermit(value: unknown, context: PublicationPermitContext, secret: string, now: Date): boolean {
+  try { if (!value || typeof value !== "object") return false; const permit = value as ExperiencePublicationPermit; const { signature, ...unsigned } = permit; if (permit.version !== 1 || typeof signature !== "string" || !permit.permitId || !Number.isFinite(Date.parse(permit.expiresAt)) || Date.parse(permit.expiresAt) <= now.getTime()) return false; if (!equal(signature, sign(permitDomain, unsigned, secret))) return false; return Object.entries(context).every(([key, expected]) => canonicalAuthorizationPayload((permit as unknown as Record<string, unknown>)[key]) === canonicalAuthorizationPayload(expected)); } catch { return false; }
 }
-function patch(request: AssessExperienceRequest, signals: ObservableSignalV2[], evidence: ReturnType<typeof evidenceFromClaim>[], deps: AssessorDependencies): { ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactReferenceV2[] } {
-  const deliveredSignalIdsByDimension: Record<string, string[]> = Object.fromEntries(request.plan.promptProjection.dimensions.map((dimension) => [dimension.id, dimension.signalIds.slice()]));
-  const persistentResultsByDimension: Record<string, CanonFactReferenceV2[]> = {};
-  for (const dimension of request.plan.promptProjection.dimensions) {
-    const persistent = signals.filter((signal) => signal.dimensionId === dimension.id && (signal.kind === "mechanic" || signal.kind === "relationship") && (signal.persistence === "cross_chapter" || signal.persistence === "whole_story") && evidence.some((item) => item.signalId === signal.id));
-    if (persistent.length) persistentResultsByDimension[dimension.id] = dimension.factReferences.map((fact) => ({ ...fact }));
-  }
-  const newDebtsByDimension: Record<string, { promiseId: string; dueByChapter: number }[]> = Object.fromEntries(request.plan.promptProjection.dimensions.map((dimension) => [dimension.id, request.plan.newDebts.filter((debt) => debt.dimensionId === dimension.id).map(({ promiseId, dueByChapter }) => ({ promiseId, dueByChapter }))]));
-  return { ledgerPatch: { ticket: { ...request.plan.ticket }, expectedRevision: request.plan.ticket.ledgerRevision, nextRevision: request.plan.ticket.ledgerRevision + 1, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, expectedCanonVersion: request.plan.ticket.expectedCanonVersion, chapterNumber: request.plan.chapterNumber, deliveredSignalIdsByDimension, persistentResultsByDimension, newDebtsByDimension, deliveredPromiseIds: request.plan.duePromiseIds.slice(), evidenceIds: evidence.map((item) => item.id) }, canonFactCandidates: Object.values(persistentResultsByDimension).flat() };
-}
+export async function consumePublicationPermit(value: unknown, context: PublicationPermitContext, deps: AssessorDependencies): Promise<boolean> { if (!verifyPublicationPermit(value, context, deps.ticketSecret, deps.now())) return false; const permit = value as ExperiencePublicationPermit; const state = await deps.statePort.read({ ticketId: permit.ticketId, jobId: permit.jobId }); if (state.consumedPermitIds.includes(permit.permitId)) return false; return !!await deps.statePort.consumePermit({ permitId: permit.permitId, ticketId: permit.ticketId }); }
+function repair(request: AssessExperienceRequest, ids: string[], deps: AssessorDependencies): ExperienceRepairToken { const artifact = request.artifact; const expiresAt = new Date(deps.now().getTime() + (deps.repairTtlMs ?? 300_000)).toISOString(); const unsigned = { version: 1 as const, repairId: `repair_${createHash("sha256").update(`${request.plan.ticket.id}\u001f${artifactHashSafe(request)}\u001f${expiresAt}`).digest("base64url")}`, ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId, attempt: request.plan.ticket.attempt, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, stage: request.plan.stage, artifactKind: request.plan.artifactKind, expectedCanonVersion: request.plan.ticket.expectedCanonVersion, ledgerRevision: request.plan.ticket.ledgerRevision, ...(artifact.kind === "blueprint" ? {} : { chapterId: artifact.chapterId, revisionId: artifact.revisionId }), artifactHash: artifactHashSafe(request), failedRuleIds: unique(ids), expiresAt }; return { ...unsigned, signature: sign(repairDomain, unsigned, deps.ticketSecret) }; }
+export function verifyRepairToken(value: unknown, context: Omit<PublicationPermitContext, "ruleGraphVersion" | "evidenceIds" | "ledgerPatchHash"> & { failedRuleIds: readonly string[] }, secret: string, now: Date): boolean { try { if (!value || typeof value !== "object") return false; const token = value as ExperienceRepairToken; const { signature, ...unsigned } = token; if (token.version !== 1 || typeof signature !== "string" || !token.repairId || Date.parse(token.expiresAt) <= now.getTime() || !equal(signature, sign(repairDomain, unsigned, secret))) return false; return Object.entries(context).every(([key, expected]) => canonicalAuthorizationPayload((token as unknown as Record<string, unknown>)[key]) === canonicalAuthorizationPayload(expected)); } catch { return false; } }
+export async function consumeRepairToken(value: unknown, context: Omit<PublicationPermitContext, "ruleGraphVersion" | "evidenceIds" | "ledgerPatchHash"> & { failedRuleIds: readonly string[] }, deps: AssessorDependencies): Promise<boolean> { if (!verifyRepairToken(value, context, deps.ticketSecret, deps.now())) return false; const token = value as ExperienceRepairToken; const state = await deps.statePort.read({ ticketId: token.ticketId, jobId: token.jobId }); if (state.consumedRepairIds.includes(token.repairId)) return false; return !!await deps.statePort.consumeRepair({ repairId: token.repairId, ticketId: token.ticketId }); }
+function rewrite(request: AssessExperienceRequest, findings: EvidenceFinding[], deps: AssessorDependencies): ExperienceOperationResult<ExperienceAssessment> { const blocking = findings.find((finding) => finding.severity === "rejected"); if (blocking) return failure(request, blocking.ruleId); const ids = unique(findings.map((finding) => finding.ruleId)); return { ok: true, value: { status: "rewrite", artifactKind: request.artifact.kind, failedRuleIds: ids, repairToken: repair(request, ids, deps), message: "Evidence must be grounded in the submitted artifact." } }; }
+function patch(request: AssessExperienceRequest, signals: ObservableSignalV2[], evidence: ReturnType<typeof evidenceFromClaim>[]): ExperienceLedgerPatch { const deliveredSignalIdsByDimension = Object.fromEntries(request.plan.promptProjection.dimensions.map((dimension) => [dimension.id, dimension.signalIds.slice()])); const newDebtsByDimension = Object.fromEntries(request.plan.promptProjection.dimensions.map((dimension) => [dimension.id, request.plan.newDebts.filter((debt) => debt.dimensionId === dimension.id).map(({ promiseId, dueByChapter }) => ({ promiseId, dueByChapter }))])); return { ticket: { ...request.plan.ticket }, expectedRevision: request.plan.ticket.ledgerRevision, nextRevision: request.plan.ticket.ledgerRevision + 1, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, expectedCanonVersion: request.plan.ticket.expectedCanonVersion, chapterNumber: request.plan.chapterNumber, deliveredSignalIdsByDimension, persistentResultsByDimension: {}, newDebtsByDimension, deliveredPromiseIds: request.plan.duePromiseIds.slice(), evidenceIds: evidence.map((item) => item.id) }; }
 
-function hasValidVerdictShape(value: unknown): value is { version: 1; claims: SemanticEvidenceClaim[] } {
-  if (!value || typeof value !== "object") return false;
-  const verdict = value as Record<string, unknown>;
-  if (verdict.version !== 1 || !Array.isArray(verdict.claims) || Object.keys(verdict).some((key) => key !== "version" && key !== "claims")) return false;
-  return verdict.claims.every((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-    const claim = item as Record<string, unknown>;
-    if (claim.version !== 1 || typeof claim.dimensionId !== "string" || typeof claim.signalId !== "string" || typeof claim.supported !== "boolean" || typeof claim.confidence !== "number" || !Number.isFinite(claim.confidence) || !Array.isArray(claim.anchors)) return false;
-    if (Object.keys(claim).some((key) => !["version", "dimensionId", "signalId", "supported", "confidence", "anchors", "slots", "metrics"].includes(key))) return false;
-    if (claim.slots !== undefined && (!claim.slots || typeof claim.slots !== "object" || Array.isArray(claim.slots) || Object.keys(claim.slots as Record<string, unknown>).some((key) => !["actor", "action", "object", "outcome", "reaction", "reciprocalAction", "relationshipChange"].includes(key)) || Object.values(claim.slots as Record<string, unknown>).some((slot) => typeof slot !== "string"))) return false;
-    if (claim.metrics !== undefined && (!claim.metrics || typeof claim.metrics !== "object" || Array.isArray(claim.metrics) || Object.values(claim.metrics as Record<string, unknown>).some((metric) => typeof metric !== "number" || !Number.isFinite(metric)))) return false;
-    return claim.anchors.every((anchor) => anchor && typeof anchor === "object" && !Array.isArray(anchor) && typeof (anchor as Record<string, unknown>).start === "number" && typeof (anchor as Record<string, unknown>).end === "number" && typeof (anchor as Record<string, unknown>).quote === "string" && Object.keys(anchor as Record<string, unknown>).every((key) => key === "start" || key === "end" || key === "quote"));
-  });
-}
-
-export async function assessExperience(request: AssessExperienceRequest, deps: AssessorDependencies): Promise<ExperienceOperationResult<ExperienceAssessment>> {
-  const auth = authenticate(request, deps); if (auth) return assessment(rejected(request, auth));
-  const signals = signalsForPlan(request.plan, deps); if (!signals) return assessment(rejected(request, "plan_mismatch"));
-  let source: string; let artifactHash: string;
-  try { source = sourceForArtifact(request.artifact); artifactHash = hashArtifact(request.artifact); } catch { return assessment(rejected(request, "invalid_artifact")); }
-  const deterministic = adapterFindings(source, deps); if (deterministic.length) return assessment(deterministic.some((item) => item.severity === "rejected") ? rejected(request, deterministic[0].ruleId) : rewrite(request, deterministic, deps));
-  if (request.artifact.kind === "blueprint") return assessment({ status: "accepted", artifactKind: "blueprint", artifactHash });
+export async function assessExperience(input: AssessExperienceRequest, inputDeps: AssessorDependencies): Promise<ExperienceOperationResult<ExperienceAssessment>> {
+  const request = snapshot(input); const contract = snapshot(inputDeps.contract); if (!request || !contract || !validArtifact(request.artifact)) return failure(input, "invalid_artifact");
+  const deps = { ...inputDeps, contract }; const read = inputDeps.statePort?.read?.bind(inputDeps.statePort); const consumeTicket = inputDeps.statePort?.consumeTicket?.bind(inputDeps.statePort); if (!read || !consumeTicket) return failure(request, "state_unavailable");
+  let before: AssessmentState; try { before = freeze(snapshot(await read({ ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId }))!); } catch { return failure(request, "state_unavailable"); }
+  const auth = authenticate(request, deps, before); if (auth) return failure(request, auth); const signals = selectedSignals(request.plan, deps); if (!signals) return failure(request, "plan_mismatch");
+  let source: string; let artifactHash: string; try { source = sourceForArtifact(request.artifact); artifactHash = hashArtifact(request.artifact); } catch { return failure(request, "invalid_artifact"); }
+  if (before.expectedArtifactDigest && before.expectedArtifactDigest !== artifactHash || request.plan.expectedArtifactDigest && request.plan.expectedArtifactDigest !== artifactHash) return failure(request, "artifact_digest_mismatch");
+  if (request.artifact.kind === "blueprint") { const blueprint = request.artifact.value as Record<string, unknown>; if (!Object.keys(blueprint).some((key) => ["title", "summary", "chapters", "meta"].includes(key))) return rewrite(request, [{ ruleId: "blueprint.invalid_manifest", severity: "rewrite" }], deps); return { ok: true, value: { status: "accepted", artifactKind: "blueprint", artifactHash } }; }
+  if (deterministicUnrealized(source)) return rewrite(request, [{ ruleId: "evidence.not_realized", severity: "rewrite" }], deps);
+  const adapterFinding = contract.prohibitions.find((prohibition) => prohibition.ruleAdapterId && runRuleAdapter(prohibition.ruleAdapterId, source)); if (adapterFinding) return rewrite(request, [{ ruleId: adapterFinding.id, severity: adapterFinding.severity === "block" ? "rejected" : "rewrite" }], deps);
+  const judgeCase = freeze(snapshot({ version: 1 as const, contractRevisionId: contract.id, stage: request.plan.stage, artifactKind: request.artifact.kind, source, sourceHash: artifactHash, signals: signals.map((signal) => ({ dimensionId: signal.dimensionId, signalId: signal.id, kind: signal.kind, policy: snapshot(signal.verification)! })) }))!;
+  let verdict: unknown; try { const timeout = inputDeps.judgeTimeoutMs ?? 15_000; let timer: ReturnType<typeof setTimeout> | undefined; const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), timeout); timer.unref?.(); }); verdict = await Promise.race([inputDeps.semanticJudgePort.judge(judgeCase), deadline]); if (timer) clearTimeout(timer); } catch { return unavailable(request.plan.ticket.jobId); }
+  if (!validVerdict(verdict)) return invalidModel(request.plan.ticket.jobId);
+  let after: AssessmentState; try { after = freeze(snapshot(await read({ ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId }))!); } catch { return failure(request, "state_unavailable"); } if (!stateMatches(request.plan, after) || canonicalAuthorizationPayload(before) !== canonicalAuthorizationPayload(after)) return failure(request, "state_changed");
   const artifact = request.artifact;
-  let verdict;
-  try { verdict = await deps.semanticJudgePort.judge({ version: 1, contractRevisionId: deps.contract.id, stage: request.plan.stage, artifactKind: request.artifact.kind, source, sourceHash: artifactHash, signals: signals.map((signal) => ({ dimensionId: signal.dimensionId, signalId: signal.id, kind: signal.kind, policy: signal.verification })) }); }
-  catch (error) { return { ok: false, error: { code: "model_unavailable", message: error instanceof Error ? error.message : "semantic judge unavailable", stage: "assessment", retryable: true, jobId: request.plan.ticket.jobId } }; }
-  if (!hasValidVerdictShape(verdict)) return { ok: false, error: { code: "invalid_model_output", message: "Semantic judge returned an invalid verdict.", stage: "assessment", retryable: false, jobId: request.plan.ticket.jobId } };
-  const claimedIds = new Set<string>(); const findings: EvidenceFinding[] = []; const grounded: Array<{ signal: ObservableSignalV2; value: GroundedClaim }> = [];
-  for (const claim of verdict.claims) {
-    const signal = signals.find((candidate) => candidate.id === claim.signalId && candidate.dimensionId === claim.dimensionId);
-    if (!signal || claimedIds.has(`${claim.dimensionId}:${claim.signalId}`)) { findings.push({ ruleId: "invalid_model_output", severity: "rewrite" }); continue; }
-    claimedIds.add(`${claim.dimensionId}:${claim.signalId}`); if (!claim.supported) { findings.push({ ruleId: "evidence.judge_unsupported", severity: "rewrite", dimensionId: claim.dimensionId }); continue; }
-    const value = groundClaim(source, claim, signal); if ("ruleId" in value) { findings.push(value); continue; }
-    const local = localFinding(source, claim, value, signal); if (local) { findings.push(local); continue; }
-    grounded.push({ signal, value });
-  }
-  if (claimedIds.size !== signals.length) findings.push({ ruleId: "evidence.missing_signal", severity: "rewrite" });
-  const ownership = new Map<string, string>();
-  for (const { signal, value } of grounded) for (const anchor of value.anchors) { const key = `${anchor.start}:${anchor.end}`; const prior = ownership.get(key); if (prior && prior !== signal.dimensionId) findings.push({ ruleId: "evidence.double_counted_span", severity: "rewrite", dimensionId: signal.dimensionId }); else ownership.set(key, signal.dimensionId); }
-  if (findings.length) return assessment(rewrite(request, findings, deps));
-  const evidence = grounded.map(({ signal, value }) => evidenceFromClaim({ id: deps.createEvidenceId?.({ ticketId: request.plan.ticket.id, signalId: signal.id, chapterId: artifact.chapterId, revisionId: artifact.revisionId }) ?? `${request.plan.ticket.id}:${signal.id}:${artifact.revisionId}`, contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, chapterId: artifact.chapterId, revisionId: artifact.revisionId, sourceHash: artifactHash, grounded: value }));
-  const result = patch(request, signals, evidence, deps);
-  return assessment({ status: "accepted", artifactKind: request.artifact.kind, artifactHash, permit: permit(request, artifactHash, deps), evidence, ...result });
+  const claims = verdict.claims; if (claims.length !== signals.length || new Set(claims.map((claim) => `${claim.dimensionId}:${claim.signalId}`)).size !== claims.length) return invalidModel(request.plan.ticket.jobId);
+  const findings: EvidenceFinding[] = []; const grounded: Array<{ signal: ObservableSignalV2; value: GroundedClaim }> = []; const spans: Array<{ dimensionId: string; start: number; end: number }> = [];
+  for (const claim of claims) { const signal = signals.find((candidate) => candidate.id === claim.signalId && candidate.dimensionId === claim.dimensionId); if (!signal) return invalidModel(request.plan.ticket.jobId); if (!claim.supported) { findings.push({ ruleId: "evidence.judge_unsupported", severity: "rewrite" }); continue; } const value = groundClaim(source, claim, signal); if ("ruleId" in value) { if (value.ruleId === "invalid_model_output") return invalidModel(request.plan.ticket.jobId); findings.push(value); continue; } const role = request.plan.promptProjection.dimensions.find((dimension) => dimension.id === signal.dimensionId)?.roleBindings.protagonistId ?? ""; const local = localFinding(source, claim, value, signal, role); if (local) { findings.push(local); continue; } for (const anchor of value.anchors) { if (spans.some((span) => span.dimensionId !== signal.dimensionId && anchor.start < span.end && span.start < anchor.end)) findings.push({ ruleId: "evidence.double_counted_span", severity: "rewrite" }); spans.push({ dimensionId: signal.dimensionId, start: anchor.start, end: anchor.end }); } grounded.push({ signal, value }); }
+  if (findings.length) return rewrite(request, findings, deps);
+  const evidence = grounded.map(({ signal, value }) => evidenceFromClaim({ id: inputDeps.createEvidenceId?.({ ticketId: request.plan.ticket.id, signalId: signal.id, chapterId: artifact.chapterId, revisionId: artifact.revisionId }) ?? createHash("sha256").update(canonicalAuthorizationPayload([request.plan.ticket.id, request.plan.ticket.jobId, request.plan.ticket.attempt, request.plan.ticket.contractRevisionId, request.plan.ticket.activationId, request.plan.ticket.branchId, request.plan.stage, artifact.kind, artifact.chapterId, artifact.revisionId, artifactHash, signal.dimensionId, signal.id])).digest("base64url"), contractRevisionId: request.plan.ticket.contractRevisionId, activationId: request.plan.ticket.activationId, branchId: request.plan.ticket.branchId, chapterId: artifact.chapterId, revisionId: artifact.revisionId, sourceHash: artifactHash, grounded: value }));
+  if (new Set(evidence.map((item) => item.id)).size !== evidence.length) return invalidModel(request.plan.ticket.jobId); const ledgerPatch = patch(request, signals, evidence); const issued = permit(request, artifactHash, evidence.map((item) => item.id), ledgerPatch, deps); if (!await consumeTicket({ ticketId: request.plan.ticket.id, artifactHash, permitId: issued.permitId })) return failure(request, "ticket_reused");
+  return { ok: true, value: { status: "accepted", artifactKind: request.artifact.kind, artifactHash, permit: issued, evidence, ledgerPatch, canonFactCandidates: [] as CanonFactReferenceV2[] } };
 }

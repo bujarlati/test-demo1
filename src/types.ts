@@ -327,7 +327,7 @@ export type ExperienceCategory = "mechanic" | "protagonist_action" | "conflict_o
 export type EvidencePolicy =
   | { kind: "event_slots"; requiredSlots: Array<"actor" | "action" | "object" | "outcome" | "reaction">; minimumAnchors: number }
   | { kind: "relationship_change"; requireReciprocalAction: true; minimumAnchors: number }
-  | { kind: "distribution"; metricIds: string[]; minimumAnchors: number; requireSemanticJudge: true };
+  | { kind: "distribution"; metricIds: string[]; minimumAnchors: number; requireSemanticJudge: true; requiredRegions?: Array<"opening" | "middle" | "ending">; regionSemantics?: "proportional" | "paragraph"; metricThresholds?: Record<string, number> };
 
 export interface ObservableSignalV2 {
   id: string;
@@ -432,7 +432,7 @@ export interface ExperienceEvidenceV2 {
   chapterRevisionId: string;
   sourceHash: string;
   anchors: TextAnchorV2[];
-  observation: { action?: string; outcome?: string; reaction?: string; distributionMetrics?: Record<string, number> };
+  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; distributionMetrics?: Record<string, number> };
   confidence: number;
   status: "supported" | "insufficient" | "contradicted";
 }

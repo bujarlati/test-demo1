@@ -15,14 +15,21 @@ export function hashArtifact(artifact: { kind: string; value?: unknown; title?: 
   return createHash("sha256").update(sourceForArtifact(artifact), "utf8").digest("hex");
 }
 
-function regions(source: string, anchors: TextAnchorV2[]): boolean {
+function regionFor(source: string, anchor: TextAnchorV2, policy: Extract<EvidencePolicy, { kind: "distribution" }>): "opening" | "middle" | "ending" {
+  if (policy.regionSemantics === "paragraph") {
+    const before = source.slice(0, anchor.start).split("\n").length - 1;
+    const total = Math.max(source.split("\n").length, 1);
+    return before < total / 3 ? "opening" : before < (total * 2) / 3 ? "middle" : "ending";
+  }
   const length = Math.max(source.length, 1);
-  const seen = new Set(anchors.map((anchor) => anchor.start < length / 3 ? "opening" : anchor.start < (length * 2) / 3 ? "middle" : "ending"));
-  return seen.size === 3;
+  return anchor.start < length / 3 ? "opening" : anchor.start < (length * 2) / 3 ? "middle" : "ending";
 }
 
-function finiteMetrics(policy: EvidencePolicy, metrics: Record<string, number> | undefined): boolean {
-  return policy.kind !== "distribution" || !!metrics && policy.metricIds.every((id) => Number.isFinite(metrics[id]));
+function localMetrics(source: string, anchors: TextAnchorV2[], policy: Extract<EvidencePolicy, { kind: "distribution" }>): Record<string, number> {
+  const regions = new Set(anchors.map((anchor) => regionFor(source, anchor, policy)));
+  const starts = anchors.map((anchor) => anchor.start); const spread = anchors.length < 2 ? 0 : (Math.max(...starts) - Math.min(...starts)) / Math.max(source.length, 1);
+  const values: Record<string, number> = { anchor_spread: spread, scene_coverage: regions.size / 3 };
+  return Object.fromEntries(policy.metricIds.map((id) => [id, values[id] ?? 0]));
 }
 
 function hasDuplicateOrOverlap(anchors: TextAnchorV2[]): boolean {
@@ -37,8 +44,15 @@ export function groundClaim(source: string, claim: SemanticEvidenceClaim, signal
   const anchors = claim.anchors.map(({ start, end, quote }: SemanticEvidenceAnchor) => ({ start, end, text: quote }));
   if (anchors.some((anchor) => !Number.isInteger(anchor.start) || !Number.isInteger(anchor.end) || anchor.start < 0 || anchor.end <= anchor.start || anchor.end > source.length || source.slice(anchor.start, anchor.end) !== anchor.text)) return { ruleId: "evidence.anchor_not_grounded", severity: "rewrite", dimensionId: signal.dimensionId };
   if (hasDuplicateOrOverlap(anchors)) return { ruleId: "evidence.anchor_overlap", severity: "rewrite", dimensionId: signal.dimensionId };
-  if (signal.verification.kind === "distribution" && (!regions(source, anchors) || !finiteMetrics(signal.verification, claim.metrics))) return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };
-  return { claim, anchors, metrics: claim.metrics ? { ...claim.metrics } : undefined };
+  if (signal.verification.kind === "distribution") {
+    const policy = signal.verification as Extract<EvidencePolicy, { kind: "distribution" }>;
+    const metricKeys = Object.keys(claim.metrics ?? {}).sort(); const expected = [...policy.metricIds].sort();
+    if (metricKeys.join("\u001f") !== expected.join("\u001f")) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+    const metrics = localMetrics(source, anchors, policy); const required = policy.requiredRegions ?? ["opening", "middle", "ending"]; const present = new Set(anchors.map((anchor) => regionFor(source, anchor, policy)));
+    if (required.some((region) => !present.has(region)) || Object.entries(policy.metricThresholds ?? {}).some(([id, threshold]) => !Number.isFinite(threshold) || (metrics[id] ?? -Infinity) < threshold)) return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };
+    return { claim, anchors, metrics };
+  }
+  return { claim, anchors };
 }
 
 export function evidenceFromClaim(input: { id: string; contractRevisionId: string; activationId: string; branchId: string; chapterId: string; revisionId: string; sourceHash: string; grounded: GroundedClaim }): ExperienceEvidenceV2 {
@@ -48,7 +62,7 @@ export function evidenceFromClaim(input: { id: string; contractRevisionId: strin
     id: binding.id, contractRevisionId: binding.contractRevisionId, activationId: binding.activationId, branchId: binding.branchId,
     dimensionId: grounded.claim.dimensionId, signalId: grounded.claim.signalId, chapterId: binding.chapterId, chapterRevisionId: binding.revisionId,
     sourceHash: binding.sourceHash, anchors: grounded.anchors.map((anchor) => ({ ...anchor })),
-    observation: { action: slots.action, outcome: slots.outcome, reaction: slots.reaction, distributionMetrics: grounded.metrics ? { ...grounded.metrics } : undefined },
+    observation: { actor: slots.actor, action: slots.action, object: slots.object, feedback: slots.feedback, outcome: slots.outcome, reaction: slots.reaction, reciprocalAction: slots.reciprocalAction, relationshipOrStateChange: slots.relationshipChange, slots: { ...slots }, distributionMetrics: grounded.metrics ? { ...grounded.metrics } : undefined },
     confidence: grounded.claim.confidence, status: "supported",
   };
 }

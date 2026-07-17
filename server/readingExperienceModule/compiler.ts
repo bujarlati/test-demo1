@@ -159,7 +159,10 @@ function validVerification(value: unknown): value is EvidencePolicy {
   }
   if (value.kind === "relationship_change") return hasOnlyKeys(value, ["kind", "requireReciprocalAction", "minimumAnchors"]) && value.requireReciprocalAction === true;
   if (value.kind === "distribution") {
-    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge"]) && value.requireSemanticJudge === true && Array.isArray(value.metricIds) && value.metricIds.length > 0 && value.metricIds.every((metric) => typeof metric === "string" && normalizedText(metric).length > 0) && new Set(value.metricIds).size === value.metricIds.length;
+    const regions = value.requiredRegions;
+    const thresholds = value.metricThresholds;
+    const metricIds = Array.isArray(value.metricIds) ? value.metricIds : [];
+    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && normalizedText(metric).length > 0) && new Set(metricIds).size === metricIds.length && (regions === undefined || Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length) && (value.regionSemantics === undefined || value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && (thresholds === undefined || isRecord(thresholds) && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold)));
   }
   return false;
 }
@@ -280,6 +283,7 @@ function splitAndNormalizeDimensions(
       kind: prohibition.kind,
       description: normalizedText(prohibition.description),
       severity: prohibition.severity,
+      ...(prohibition.kind === "shortcut" ? { ruleAdapterId: "contains-pasted-label" } : {}),
     }));
     if (secondaryRepeatedDimension) {
       prohibitions.push({ id: `${dimensionId}_prohibition_independence`, dimensionId, kind: "shortcut", description: "不得把第一维已经采用的泛化叙述重复计为持续后果证据。", severity: "rewrite" });

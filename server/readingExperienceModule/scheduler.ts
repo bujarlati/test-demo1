@@ -265,10 +265,12 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
   const unsignedPlan: Omit<ExperienceStagePlan, "authorizationMac"> = {
     chapterNumber: chapter,
     ...(request.chapterId ? { chapterId: request.chapterId } : {}),
+    ...(request.revisionId ? { revisionId: request.revisionId } : {}),
+    ...(request.expectedArtifactDigest ? { expectedArtifactDigest: request.expectedArtifactDigest } : {}),
     stage,
     artifactKind: request.artifactKind,
     promptProjection: {
-      dimensions: dimensions.map(({ selected, ...projection }) => projection),
+      dimensions: dimensions.map(({ selected, ...projection }) => ({ ...projection, roleBindings: { protagonistId: selected.map((signal) => signal.semanticSlots?.actor).find((actor): actor is string => !!actor) ?? "" } })),
       prohibitions: request.contract.prohibitions.map((prohibition) => prohibition.description),
     },
     evidenceSchema: dimensions.flatMap((dimension) => dimension.selected.map((signal) => signal.verification)),

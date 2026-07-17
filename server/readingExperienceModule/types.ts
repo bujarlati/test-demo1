@@ -79,7 +79,7 @@ export interface SemanticEvidenceClaim {
   supported: boolean;
   confidence: number;
   anchors: SemanticEvidenceAnchor[];
-  slots?: Partial<Record<"actor" | "action" | "object" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", string>>;
+  slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", string>>;
   metrics?: Record<string, number>;
 }
 
@@ -124,6 +124,9 @@ export interface ScheduleExperienceRequest {
   artifactKind: ExperienceArtifactKind;
   /** Required by assessment for chapter/retcon artifacts; signed by the plan MAC. */
   chapterId?: string;
+  revisionId?: string;
+  /** Digest of the pre-approved output manifest, when a producer has one. */
+  expectedArtifactDigest?: string;
   chapterNumber?: number;
   failedRuleIds?: string[];
   jobId: string;
@@ -139,9 +142,11 @@ export interface ExperienceStagePlan {
   /** Bound to the signed ticket through the trusted plan record, not extra ticket payload fields. */
   chapterNumber: number;
   chapterId?: string;
+  revisionId?: string;
+  expectedArtifactDigest?: string;
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
-  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
+  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[]; roleBindings: { protagonistId: string } }>; prohibitions: string[] };
   evidenceSchema: EvidencePolicy[];
   duePromiseIds: string[];
   hardPresencePromiseIds: string[];
@@ -231,6 +236,14 @@ export interface ExperiencePublicationPermit {
   chapterId: string;
   revisionId: string;
   artifactHash: string;
+  stage: ExperienceStage;
+  artifactKind: ExperienceArtifactKind;
+  ruleGraphVersion: string;
+  expectedCanonVersion: number;
+  ledgerRevision: number;
+  evidenceIds: string[];
+  ledgerPatchHash: string;
+  permitId: string;
   expiresAt: string;
   signature: string;
 }
@@ -241,15 +254,49 @@ export interface AssessorDependencies {
   /** The immutable revision resolved from the signed ticket before assessment. */
   contract: CompiledExperienceContractRevision;
   semanticJudgePort: ExperienceSemanticJudgePort;
+  statePort: AssessmentStatePort;
   createEvidenceId?: (input: { ticketId: string; signalId: string; chapterId: string; revisionId: string }) => string;
   repairTtlMs?: number;
   permitTtlMs?: number;
+  judgeTimeoutMs?: number;
+}
+
+export interface AssessmentState {
+  activationId: string;
+  branchId: string;
+  canonVersion: number;
+  ledgerRevision: number;
+  attempt: number;
+  consumedTicketIds: readonly string[];
+  consumedPermitIds: readonly string[];
+  consumedRepairIds: readonly string[];
+  chapterId?: string;
+  revisionId?: string;
+  expectedArtifactDigest?: string;
+}
+
+export interface AssessmentStatePort {
+  read(input: { ticketId: string; jobId: string }): Promise<AssessmentState> | AssessmentState;
+  consumeTicket(input: { ticketId: string; artifactHash: string; permitId: string }): Promise<boolean> | boolean;
+  consumePermit(input: { permitId: string; ticketId: string }): Promise<boolean> | boolean;
+  consumeRepair(input: { repairId: string; ticketId: string }): Promise<boolean> | boolean;
+}
+
+export interface PublicationPermitContext {
+  ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
+  stage: ExperienceStage; artifactKind: ExperienceArtifactKind; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number;
+  chapterId: string; revisionId: string; artifactHash: string; evidenceIds: readonly string[]; ledgerPatchHash: string;
+}
+
+export interface ExperienceRepairToken {
+  version: 1; repairId: string; ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
+  stage: ExperienceStage; artifactKind: ExperienceArtifactKind; expectedCanonVersion: number; ledgerRevision: number; chapterId?: string; revisionId?: string; artifactHash: string; failedRuleIds: string[]; expiresAt: string; signature: string;
 }
 
 export type ExperienceAssessment =
   | { status: "accepted"; artifactKind: "blueprint"; artifactHash: string }
   | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; permit: ExperiencePublicationPermit; evidence: ExperienceEvidenceV2[]; ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactReferenceV2[] }
-  | { status: "rewrite"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; repairToken: string; message: string }
+  | { status: "rewrite"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; repairToken: ExperienceRepairToken; message: string }
   | { status: "rejected"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; message: string };
 
 /** The public deep-module boundary. The factory is intentionally introduced in Task 3. */
