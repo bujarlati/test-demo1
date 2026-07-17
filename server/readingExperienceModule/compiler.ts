@@ -54,9 +54,16 @@ function normalizedText(value: string): string {
   return value.normalize("NFKC").trim();
 }
 
+function compactSafetyText(value: string): string {
+  return normalizedText(value).replace(/[\p{Z}\s，,。.!！?？、:：;；“”"'‘’（）()《》〈〉—–\-·_]+/gu, "");
+}
+
 function isUnsafeIntentText(value: string): boolean {
   const normalized = normalizedText(value);
-  return injectionVerbTargetPattern.test(normalized) || sensitiveDisclosurePattern.test(normalized) || dangerousIntentPattern.test(normalized);
+  const compact = compactSafetyText(normalized);
+  return [normalized, compact].some((candidate) =>
+    injectionVerbTargetPattern.test(candidate) || sensitiveDisclosurePattern.test(candidate) || dangerousIntentPattern.test(candidate),
+  );
 }
 
 function unsafeOutcome(): RejectedOutcome {
