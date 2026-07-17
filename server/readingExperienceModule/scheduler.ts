@@ -1,11 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { CanonFactReferenceV2, DeliveryPromiseV2, ExperienceDebtV2, ExperienceDimension, ObservableSignalV2 } from "../../src/types";
+import type { CanonFactReferenceV2, DeliveryPromiseV2, ExperienceDimension, ObservableSignalV2 } from "../../src/types";
 import type {
   ExperienceSchedulingErrorCode,
   ExperienceStage,
   ExperienceStagePlan,
   ExperienceStageTicket,
   ScheduleExperienceRequest,
+  ScheduledExperienceDebt,
   SchedulerDependencies,
 } from "./types";
 
@@ -150,9 +151,9 @@ function priorDeliveries(request: ScheduleExperienceRequest, promiseId: string):
   return request.ledger.promiseStates.find((state) => state.promiseId === promiseId)?.deliveredChapters ?? [];
 }
 
-function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: Array<ExperienceDebtV2 & { dimensionId: string }>; carried: string[] } {
+function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: ScheduledExperienceDebt[]; carried: string[] } {
   const due: DeliveryPromiseV2[] = [];
-  const debts: Array<ExperienceDebtV2 & { dimensionId: string }> = [];
+  const debts: ScheduledExperienceDebt[] = [];
   const carried: string[] = [];
   for (const promise of request.contract.promises) {
     if (promise.hardness !== "soft") continue;

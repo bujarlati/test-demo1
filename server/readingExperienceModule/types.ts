@@ -106,6 +106,11 @@ export interface ScheduleExperienceRequest {
   attempt: number;
 }
 
+/** A schedule-time debt obligation, bound to the dimension that must carry it. */
+export interface ScheduledExperienceDebt extends ExperienceDebtV2 {
+  dimensionId: string;
+}
+
 export interface ExperienceStagePlan {
   /** Bound to the signed ticket through the trusted plan record, not extra ticket payload fields. */
   chapterNumber: number;
@@ -118,7 +123,7 @@ export interface ExperienceStagePlan {
   softRollingPromiseIds: string[];
   dueSoftPromiseIds: string[];
   carriedDebtPromiseIds: string[];
-  newDebts: Array<ExperienceDebtV2 & { dimensionId: string }>;
+  newDebts: ScheduledExperienceDebt[];
   authorizationMac: string;
   ticket: ExperienceStageTicket;
 }

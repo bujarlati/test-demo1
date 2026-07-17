@@ -3,7 +3,7 @@ import test from "node:test";
 import { createHmac } from "node:crypto";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
 import { canonicalAuthorizationPayload, scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
-import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2 } from "../src/types";
+import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceDebtV2, ExperienceLedgerV2 } from "../src/types";
 
 const secret = "schedule-test-secret";
 const now = () => new Date("2026-07-17T00:00:00.000Z");
@@ -267,7 +267,35 @@ test("CAS rejects an authorization MACed with an attacker-chosen key", () => {
 
 test("authorization canonicalization is strict and deterministic", () => {
   assert.equal(canonicalAuthorizationPayload({ b: [null, 1], a: true }), canonicalAuthorizationPayload({ a: true, b: [null, 1] }));
-  for (const value of [[undefined], [Number.NaN], (() => { const sparse: unknown[] = []; sparse.length = 1; return sparse; })(), new Date(), Object.create({ x: 1 }), Object.defineProperty({}, "x", { get: () => 1, enumerable: true })]) {
+  const shared = { value: "same" };
+  assert.equal(canonicalAuthorizationPayload({ left: shared, right: shared }), canonicalAuthorizationPayload({ left: { value: "same" }, right: { value: "same" } }));
+
+  let arrayGetterCalls = 0;
+  const arrayAccessor: unknown[] = [];
+  Object.defineProperty(arrayAccessor, "0", { enumerable: true, get: () => { arrayGetterCalls += 1; return "unsafe"; } });
+  assert.throws(() => canonicalAuthorizationPayload(arrayAccessor), { code: "invalid_authorization_payload" });
+  assert.equal(arrayGetterCalls, 0);
+
+  let objectGetterCalls = 0;
+  const objectAccessor = Object.defineProperty({}, "value", { enumerable: true, get: () => { objectGetterCalls += 1; return "unsafe"; } });
+  assert.throws(() => canonicalAuthorizationPayload(objectAccessor), { code: "invalid_authorization_payload" });
+  assert.equal(objectGetterCalls, 0);
+
+  const objectWithSymbol = { value: 1 };
+  Object.defineProperty(objectWithSymbol, Symbol("hidden"), { value: 2, enumerable: true });
+  assert.throws(() => canonicalAuthorizationPayload(objectWithSymbol), { code: "invalid_authorization_payload" });
+  const arrayWithSymbol = [1];
+  Object.defineProperty(arrayWithSymbol, Symbol("hidden"), { value: 2, enumerable: false });
+  assert.throws(() => canonicalAuthorizationPayload(arrayWithSymbol), { code: "invalid_authorization_payload" });
+  const arrayWithEnumerableExtra = [1] as unknown[] & { extra?: number };
+  arrayWithEnumerableExtra.extra = 2;
+  assert.throws(() => canonicalAuthorizationPayload(arrayWithEnumerableExtra), { code: "invalid_authorization_payload" });
+  const arrayWithHiddenExtra = [1];
+  Object.defineProperty(arrayWithHiddenExtra, "extra", { value: 2, enumerable: false });
+  assert.throws(() => canonicalAuthorizationPayload(arrayWithHiddenExtra), { code: "invalid_authorization_payload" });
+
+  class ArraySubclass extends Array<unknown> {}
+  for (const value of [[undefined], [Number.NaN], (() => { const sparse: unknown[] = []; sparse.length = 1; return sparse; })(), new Date(), Object.create({ x: 1 }), undefined, () => undefined, Symbol("value"), 1n, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, new ArraySubclass(1)]) {
     assert.throws(() => canonicalAuthorizationPayload(value), { code: "invalid_authorization_payload" });
   }
   const cycle: Record<string, unknown> = {}; cycle.self = cycle;
@@ -283,14 +311,15 @@ test("a due both-dimension rolling promise creates and applies one debt per dime
     { dimensionId: "dimension_action", promiseId: "soft-both", dueByChapter: 6 },
     { dimensionId: "dimension_voice", promiseId: "soft-both", dueByChapter: 6 },
   ]);
+  const debtForPatch = ({ promiseId, dueByChapter }: { promiseId: string; dueByChapter: number }): ExperienceDebtV2 => ({ promiseId, dueByChapter });
   const authorization = createLedgerAuthorization(plan, request().canon, ["evidence-1"], secret);
-  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: [plan.newDebts[0]], dimension_voice: [plan.newDebts[1]] }, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-1"] };
+  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0])], dimension_voice: [debtForPatch(plan.newDebts[1])] }, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-1"] };
   const trusted = { ...deps, contract: revised, authorization, liveCanon: request().canon };
   const updated = applyExperienceLedgerPatch(initial, base, trusted);
   assert.equal(updated.dimensions.flatMap((dimension) => dimension.debts).length, 2);
-  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0]] } }, trusted), { code: "unauthorized_delivery" });
-  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0], plan.newDebts[1]], dimension_voice: [] } }, trusted), { code: "unauthorized_delivery" });
-  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0], plan.newDebts[0]], dimension_voice: [plan.newDebts[1]] } }, trusted), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0])] } }, trusted), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0]), debtForPatch(plan.newDebts[1])], dimension_voice: [] } }, trusted), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0]), debtForPatch(plan.newDebts[0])], dimension_voice: [debtForPatch(plan.newDebts[1])] } }, trusted), { code: "unauthorized_delivery" });
 });
 
 test("fallback ticket ids hash canonical fields rather than delimiter joins", () => {

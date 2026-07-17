@@ -1,4 +1,4 @@
-import type { ExperienceDebtV2, ExperienceLedgerV2 } from "../../src/types";
+import type { ExperienceLedgerV2 } from "../../src/types";
 import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies } from "./types";
 import { ExperienceSchedulingError, sameMac, signExperiencePlan, signLedgerAuthorizationRoot, verifyExperienceStageTicket } from "./scheduler";
 
@@ -143,10 +143,7 @@ export function applyExperienceLedgerPatch(ledger: ExperienceLedgerV2, patch: Ex
   const dimensions = ledger.dimensions.map((dimension) => {
     const delivered = patch.deliveredSignalIdsByDimension[dimension.dimensionId] ?? [];
     const persistent = patch.persistentResultsByDimension[dimension.dimensionId];
-    const additions = (patch.newDebtsByDimension[dimension.dimensionId] ?? []).map((entry) => {
-      const { dimensionId: _ignored, ...debt } = entry as ExperienceDebtV2 & { dimensionId?: string };
-      return debt;
-    });
+    const additions = (patch.newDebtsByDimension[dimension.dimensionId] ?? []).map(({ promiseId, dueByChapter }) => ({ promiseId, dueByChapter }));
     const debts = [
       ...dimension.debts.filter((debt) => !patch.deliveredPromiseIds.includes(debt.promiseId)),
       ...additions,
