@@ -3,7 +3,19 @@ import test from "node:test";
 import {
   assertModelCallTokenBudget,
   estimateModelCallTokenBudget,
+  OPENING_JOB_TOKEN_BUDGET,
 } from "../server/generationBudget";
+
+test("opening budget covers the measured reasoning planner plus one full draft rewrite", () => {
+  const measuredPlannerTokens = 14_848;
+  const twoReasoningWriterAllowances = 2 * 30_000;
+  const repairAndReviewAllowance = 25_000;
+
+  assert.ok(
+    OPENING_JOB_TOKEN_BUDGET >= measuredPlannerTokens + twoReasoningWriterAllowances + repairAndReviewAllowance,
+    `opening budget ${OPENING_JOB_TOKEN_BUDGET} cannot cover the observed reasoning-heavy pipeline`,
+  );
+});
 
 test("Han-heavy model calls reserve a UTF-8 byte upper bound", () => {
   const prompt = "汉".repeat(10_000);

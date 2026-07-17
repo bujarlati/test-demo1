@@ -17,6 +17,7 @@ import {
   applyExtractedCharacterState,
   assertImmersiveNarration,
   assertPersistentExperienceFacts,
+  assertReadingExperienceContent,
   assertReadingExperienceEvidence,
   assertReadingExperienceNegativeInvariants,
   buildChapterPrompt,
@@ -24,6 +25,7 @@ import {
   endingContractSatisfied,
   eventFromChapter,
   generateLocalChapter,
+  groundReadingExperienceEvidence,
   planNextChapter,
   retrieveRelevantMemory,
   storyArcPhase,
@@ -45,9 +47,15 @@ import {
   assertGenerationTokenBudget,
   CHAPTER_EXTRACTION_ADMISSION_RESERVE,
   CONTINUATION_JOB_TOKEN_BUDGET,
+  estimateModelCallTokenBudget,
 } from "../server/generationBudget";
 import { accumulateModelUsage, attachModelUsage, recordFailedJobUsage } from "../server/modelUsage";
 import { refineReadingExperienceContract, usesExperienceWordAsLiteralLabel } from "../server/readingExperience";
+import {
+  OPENING_CHAPTER_MAX_CHARACTERS,
+  OPENING_CHAPTER_MIN_CHARACTERS,
+  openingChapterLengthIsAllowed,
+} from "../server/openingConstraints";
 import { composeCustomTone, isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES } from "../src/storyConfig";
 import { currentRevision } from "../src/storyDomain";
 import type { GenerationJob, ModelConnection } from "../src/types";
@@ -274,6 +282,16 @@ function openingBudgetFixture() {
   };
 }
 
+test("opening chapter character limits accept a substantial 5523-character web-fiction chapter", () => {
+  assert.equal(OPENING_CHAPTER_MIN_CHARACTERS, 2_400);
+  assert.equal(OPENING_CHAPTER_MAX_CHARACTERS, 6_000);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(2_399)), false);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(2_400)), true);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(5_523)), true);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(6_000)), true);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(6_001)), false);
+});
+
 test("new stories expose broad web-fiction genres and serial-scale chapter plans", () => {
   assert.ok(STORY_GENRES.length >= 20);
   assert.deepEqual(STORY_LENGTH_OPTIONS.map((option) => option.chapterCount), [80, 200, 500, 1000]);
@@ -309,6 +327,20 @@ test("system-fiction defaults do not force a broken or reward-withholding system
     JSON.stringify({ gene: story.storyGene, opening: currentRevision(story.chapters[0])!.paragraphs.slice(0, 4) }),
     /故障系统|系统拒绝结算|奖励已撤回|奖励陷阱|长期权限不足/,
   );
+});
+
+test("system stability understands an explicit no-penalty and no-reward-withdrawal promise", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  assert.doesNotThrow(() => assertReadingExperienceNegativeInvariants(
+    contract,
+    "系统不提供任务失败惩罚或奖励撤回，但签到地点会随世界反应改变。",
+    { protagonistNames: ["林渊"] },
+  ));
+  assert.throws(() => assertReadingExperienceNegativeInvariants(
+    contract,
+    "系统不提供额外解释，随后奖励撤回，已领取能力全部失效。",
+    { protagonistNames: ["林渊"] },
+  ), /系统|稳定结算|持续可用/);
 });
 
 test("story tone presets are broad and two custom words form one safe tone", () => {
@@ -653,6 +685,278 @@ test("opening generation uses the selected planner, writer, and independent evid
   assert.equal(generated.chapter.experienceEvidence?.length, 2);
 });
 
+test("opening planner request specifies the nested machine-readable blueprint schema", async () => {
+  const { context, connection } = openingBudgetFixture();
+  let plannerSystem = "";
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      plannerSystem = request.system;
+      throw new Error("stop after planner prompt capture");
+    }, Number.POSITIVE_INFINITY),
+    /stop after planner prompt capture/,
+  );
+
+  assert.match(plannerSystem, /"storyGene"\s*:\s*\{\s*"protagonistPosition"/);
+  assert.match(plannerSystem, /"endingContract"\s*:\s*\{\s*"targetEnding"/);
+  assert.match(plannerSystem, /"worldBible"\s*:\s*\{\s*"organizations"/);
+  assert.match(plannerSystem, /"openingBeats"\s*:\s*\[\s*"/);
+  assert.match(plannerSystem, /storyGene、endingContract、worldBible 必须是 JSON 对象/);
+  assert.match(plannerSystem, /openingBeats 必须是字符串数组/);
+
+  const schemaLine = plannerSystem.split("\n").find((line) => line.startsWith('{"title":'));
+  assert.ok(schemaLine, "planner prompt must contain a parseable JSON example");
+  const schema = JSON.parse(schemaLine) as {
+    experienceAxes: Array<{
+      observableSignals: Array<{ description: string; evidenceAnchors: string[] }>;
+    }>;
+  };
+  assert.equal(schema.experienceAxes.length, 2);
+  for (const axis of schema.experienceAxes) {
+    assert.ok(axis.observableSignals.length >= 2);
+    for (const signal of axis.observableSignals) {
+      assert.ok(signal.evidenceAnchors.length >= 2);
+      assert.ok(signal.evidenceAnchors.every((anchor) => signal.description.includes(anchor)));
+    }
+  }
+});
+
+test("opening generation repairs a semantically useful planner response with the wrong JSON shape", async () => {
+  const { context, connection, plan } = openingBudgetFixture();
+  const requests: Array<{ model: string; system: string; prompt: string }> = [];
+  const malformedPlan = {
+    title: "钢铁摇篮",
+    subtitle: "退役机甲师守住女儿与旧城",
+    leadName: "周砺",
+    storyGene: "机械奶爸、旧城守护、及时回报",
+    endingContract: "父女与邻里共同重建旧城",
+    worldBible: "维修协会控制旧城资源，机甲能源有限",
+    experienceAxes: plan.experienceAxes,
+    openingBeats: [
+      { beat: "机械臂在首段挡住威胁" },
+      { beat: "父女共同选择改变现场关系" },
+    ],
+  };
+  const hostileRepair = {
+    ...plan,
+    title: "修复器擅自改名",
+    subtitle: "修复器擅自更换故事",
+    leadName: "陌生主角",
+  };
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      requests.push({ model: request.model, system: request.system, prompt: request.prompt });
+      if (requests.length === 1) {
+        return { value: malformedPlan, usageTokens: 148, usageEstimated: false };
+      }
+      if (requests.length === 2) {
+        return { value: hostileRepair, usageTokens: 200, usageEstimated: false };
+      }
+      throw attachModelUsage(new Error("writer transport failed after plan repair"), 300, false);
+    }, Number.POSITIVE_INFINITY),
+    (error: Error & { usageTokens?: number; usageEstimated?: boolean }) => {
+      assert.match(error.message, /writer transport failed after plan repair/);
+      assert.equal(error.usageTokens, 648);
+      assert.equal(error.usageEstimated, false);
+      return true;
+    },
+  );
+
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.extractor,
+    connection.routes.writer,
+  ]);
+  assert.match(requests[1].system, /开篇蓝图.*结构修复/);
+  assert.match(requests[1].prompt, /storyGene/);
+  assert.match(requests[1].prompt, /openingBeats/);
+  assert.match(requests[2].prompt, /"title":"钢铁摇篮"/);
+  assert.match(requests[2].prompt, /"leadName":"周砺"/);
+  assert.doesNotMatch(requests[2].prompt, /修复器擅自改名|陌生主角/);
+});
+
+test("opening generation retries semantic blueprint repair when the first repair still weakens system guarantees", async () => {
+  const { connection } = openingBudgetFixture();
+  const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
+  const context = {
+    input: { genre: "系统流", tone: "系统 · 无敌" },
+    contract: base.readingExperience,
+    targetChapterCount: base.targetChapterCount,
+  };
+  const safePlan = {
+    title: "签到即无敌",
+    subtitle: "每次签到都让世界秩序重新排位",
+    leadName: "林峰",
+    storyGene: base.storyGene,
+    endingContract: base.endingContract,
+    worldBible: base.worldBible,
+    experienceAxes: base.readingExperience.axes.map((axis) => ({
+      word: axis.word,
+      interpretation: axis.interpretation,
+      observableSignals: axis.observableSignals.map((signal) => signal.description),
+      hardPromises: axis.hardPromises.map((promise) => promise.description),
+      forbiddenShortcuts: axis.forbiddenShortcuts,
+    })),
+    openingBeats: ["林峰在首段完成签到并领取奖励", "林峰一击镇压来犯强敌并改变现场秩序"],
+  };
+  const unsafePlan = {
+    ...safePlan,
+    worldBible: {
+      ...safePlan.worldBible,
+      abilityBoundaries: ["系统随时可能故障并拒绝结算，已经发放的奖励也会被撤回"],
+    },
+  };
+  const hostileSafeRepair = {
+    ...safePlan,
+    title: "修复器改写的书名",
+    leadName: "修复器改写的主角",
+    worldBible: {
+      ...safePlan.worldBible,
+      organizations: ["修复器替换的组织"],
+      locations: ["修复器替换的世界"],
+      abilityBoundaries: ["系统持续稳定结算，既有奖励永久有效"],
+    },
+  };
+  const requests: Array<{ model: string; system: string; prompt: string }> = [];
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      requests.push({ model: request.model, system: request.system, prompt: request.prompt });
+      if (requests.length === 1) return { value: unsafePlan, usageTokens: 100, usageEstimated: false };
+      if (requests.length === 2) return { value: unsafePlan, usageTokens: 200, usageEstimated: false };
+      if (requests.length === 3) return { value: hostileSafeRepair, usageTokens: 250, usageEstimated: false };
+      throw attachModelUsage(new Error("writer reached after semantic plan repair"), 300, false);
+    }, Number.POSITIVE_INFINITY),
+    (error: Error & { usageTokens?: number }) => {
+      assert.match(error.message, /writer reached after semantic plan repair/);
+      assert.equal(error.usageTokens, 850);
+      return true;
+    },
+  );
+
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.extractor,
+    connection.routes.extractor,
+    connection.routes.writer,
+  ]);
+  assert.match(requests[1].prompt, /稳定结算|持续可用|系统/);
+  assert.match(requests[2].prompt, /稳定结算|持续可用|系统/);
+  assert.match(requests[3].prompt, new RegExp(`"title":"${safePlan.title}"`));
+  assert.match(requests[3].prompt, new RegExp(`"leadName":"${safePlan.leadName}"`));
+  assert.doesNotMatch(requests[3].prompt, /修复器改写|修复器替换/);
+});
+
+test("system-and-invincible writer must complete system payoff in the first paragraph", async () => {
+  const { connection } = openingBudgetFixture();
+  const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
+  const plan = {
+    title: "签到即无敌",
+    subtitle: "每次签到都让世界秩序重新排位",
+    leadName: "林峰",
+    storyGene: base.storyGene,
+    endingContract: base.endingContract,
+    worldBible: base.worldBible,
+    experienceAxes: base.readingExperience.axes.map((axis) => ({
+      word: axis.word,
+      interpretation: axis.interpretation,
+      observableSignals: axis.observableSignals.map((signal) => signal.description),
+      hardPromises: axis.hardPromises.map((promise) => promise.description),
+      forbiddenShortcuts: axis.forbiddenShortcuts,
+    })),
+    openingBeats: ["林峰在首段完成签到并领取奖励", "林峰一击镇压来犯强敌并改变现场秩序"],
+  };
+  let writerPrompt = "";
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection({
+      input: { genre: "系统流", tone: "系统 · 无敌" },
+      contract: base.readingExperience,
+      targetChapterCount: base.targetChapterCount,
+    }, connection, async (request) => {
+      if (request.model === connection.routes.planner) {
+        return { value: plan, usageTokens: 100, usageEstimated: false };
+      }
+      writerPrompt = request.prompt;
+      throw new Error("stop after specialized writer prompt capture");
+    }, Number.POSITIVE_INFINITY),
+    /stop after specialized writer prompt capture/,
+  );
+
+  assert.match(writerPrompt, /第一段前 120 字/);
+  assert.match(writerPrompt, /林峰本人/);
+  assert.match(writerPrompt, /触发.*系统.*反馈.*奖励/);
+  assert.match(writerPrompt, /不超过 100 字/);
+  assert.match(writerPrompt, /同一句.*林峰.*系统面板.*领取/);
+  assert.match(writerPrompt, /不得先写背景|不得先写赶路/);
+  assert.match(writerPrompt, /压倒性/);
+  assert.match(writerPrompt, /不超过 80 字/);
+  assert.match(writerPrompt, /林峰.*姓名/);
+  assert.match(writerPrompt, /不得只用“他”|不得只用.*指代/);
+  assert.match(writerPrompt, /18 个完整段落/);
+  assert.match(writerPrompt, /每段 140.?220/);
+  assert.match(writerPrompt, /2800.?3600/);
+});
+
+test("system-and-invincible opening retries prose before paying a reviewer when no dominant victory exists", async () => {
+  const { connection } = openingBudgetFixture();
+  const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
+  const plan = {
+    title: "签到即无敌",
+    subtitle: "每次签到都让世界秩序重新排位",
+    leadName: "林峰",
+    storyGene: base.storyGene,
+    endingContract: base.endingContract,
+    worldBible: base.worldBible,
+    experienceAxes: base.readingExperience.axes.map((axis) => ({
+      word: axis.word,
+      interpretation: axis.interpretation,
+      observableSignals: axis.observableSignals.map((signal) => signal.description),
+      hardPromises: axis.hardPromises.map((promise) => promise.description),
+      forbiddenShortcuts: axis.forbiddenShortcuts,
+    })),
+    openingBeats: ["林峰在首段完成签到并领取奖励", "林峰一击镇压来犯强敌并改变现场秩序"],
+  };
+  const quietWork = "林峰把仓库里的木箱逐个归位，又把门窗、灯火、货单与钥匙一一核对，确认每件东西都有清楚去处后才继续整理手边的杂物。";
+  const paragraphs = Array.from({ length: 16 }, (_, index) =>
+    index === 0
+      ? `林峰打开系统面板，领取永久奖励并确认能力已经生效。${quietWork.repeat(2)}`
+      : quietWork.repeat(3),
+  );
+  const writerPrompts: string[] = [];
+  const calledModels: string[] = [];
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection({
+      input: { genre: "系统流", tone: "系统 · 无敌" },
+      contract: base.readingExperience,
+      targetChapterCount: base.targetChapterCount,
+    }, connection, async (request) => {
+      calledModels.push(request.model);
+      if (request.model === connection.routes.planner) {
+        return { value: plan, usageTokens: 100, usageEstimated: false };
+      }
+      if (request.model === connection.routes.writer) {
+        writerPrompts.push(request.prompt);
+        if (writerPrompts.length === 1) {
+          return {
+            value: { title: "第一章 仓库签到", paragraphs },
+            usageTokens: 2_000,
+            usageEstimated: false,
+          };
+        }
+        throw new Error("stop after prose-specific retry");
+      }
+      throw new Error("reviewer should not run for prose with no dominant victory");
+    }, Number.POSITIVE_INFINITY),
+    /stop after prose-specific retry/,
+  );
+
+  assert.deepEqual(calledModels, [connection.routes.planner, connection.routes.writer, connection.routes.writer]);
+  assert.match(writerPrompts[1], /正文没有兑现由主角完成的.*压倒性胜利/);
+});
+
 test("opening generation retries a draft outside the required paragraph range before review", async () => {
   const connection: ModelConnection = {
     id: "conn_opening_paragraph_retry",
@@ -744,6 +1048,273 @@ test("opening generation retries a draft outside the required paragraph range be
   assert.deepEqual(calledModels, ["planner-route", "writer-route", "writer-route", "reviewer-route"]);
 });
 
+test("opening generation grounds paraphrased persistent state in validated prose evidence", async () => {
+  const { context, connection, plan, paragraph } = openingBudgetFixture();
+  const mechanicalQuote = "机械臂完成精确校准后稳稳托住奶瓶";
+  const parentQuote = "奶爸周砺俯身听清女儿说出的需要";
+  const groundedPlan = {
+    ...plan,
+    experienceAxes: [
+      {
+        word: "机械",
+        interpretation: "机械体验由精确校准、托举和维修结果体现",
+        observableSignals: [
+          { description: mechanicalQuote, evidenceAnchors: ["精确校准", "托住奶瓶"] },
+          { description: "机械维修恢复现场资源并挡住逼近威胁", evidenceAnchors: ["恢复现场资源", "挡住逼近威胁"] },
+        ],
+        hardPromises: ["每章让机械操作产生具体结果"],
+        forbiddenShortcuts: ["只描写金属颜色"],
+      },
+      {
+        word: "奶爸",
+        interpretation: "奶爸体验由父亲听清女儿需要并共同改变选择体现",
+        observableSignals: [
+          { description: parentQuote, evidenceAnchors: ["俯身听清", "女儿说出的需要"] },
+          { description: "父女共同作出选择并改变维修铺冲突", evidenceAnchors: ["共同作出选择", "改变维修铺冲突"] },
+        ],
+        hardPromises: ["每章用双向父女行动推进关系"],
+        forbiddenShortcuts: ["把孩子写成道具"],
+      },
+    ],
+  };
+
+  const generated = await generateStoryOpeningWithConnection(context, connection, async ({ model }) => {
+    if (model === connection.routes.planner) {
+      return { value: groundedPlan, usageTokens: 100, usageEstimated: false };
+    }
+    if (model === connection.routes.writer) {
+      return {
+        value: {
+          title: "第一章 修好的机械臂",
+          paragraphs: Array.from({ length: 16 }, () => paragraph),
+        },
+        usageTokens: 200,
+        usageEstimated: false,
+      };
+    }
+    return {
+      value: {
+        experienceEvidence: [
+          {
+            axisId: "primary",
+            word: "机械",
+            signalIds: ["primary_机械_model_signal_1", "primary_机械_model_signal_2", "primary_机械_signal_1"],
+            quote: "周砺把机械臂校准好，奶瓶随后被稳稳托住",
+          },
+          {
+            axisId: "secondary",
+            word: "奶爸",
+            signalIds: ["secondary_奶爸_model_signal_1", "secondary_奶爸_model_signal_2", "secondary_奶爸_signal_1"],
+            quote: "周砺弄清了女儿真正想要什么",
+          },
+        ],
+        event: {
+          title: "维修铺门前的冲突",
+          cause: "武装人员逼近维修铺",
+          outcome: "父女共同守住维修铺",
+          location: "旧城维修铺门前",
+          persistentFacts: [
+            "机械臂已经被周砺精确校准并成功托稳奶瓶",
+            "周砺听懂女儿需求后调整了守店方案",
+          ],
+        },
+      },
+      usageTokens: 300,
+      usageEstimated: false,
+    };
+  });
+
+  assert.deepEqual(generated.event.persistentFacts, [mechanicalQuote, parentQuote]);
+});
+
+test("opening generation repairs malformed reviewer JSON without rewriting accepted prose", async () => {
+  const { context, connection, plan, paragraph } = openingBudgetFixture();
+  const mechanicalQuote = "机械臂完成精确校准后稳稳托住奶瓶";
+  const parentQuote = "奶爸周砺俯身听清女儿说出的需要";
+  const reviewablePlan = {
+    ...plan,
+    experienceAxes: [
+      {
+        word: "机械",
+        interpretation: "机械体验由精确校准、托举和维修结果体现",
+        observableSignals: [
+          { description: mechanicalQuote, evidenceAnchors: ["精确校准", "托住奶瓶"] },
+          { description: "机械维修恢复现场资源并挡住逼近威胁", evidenceAnchors: ["恢复现场资源", "挡住逼近威胁"] },
+        ],
+        hardPromises: ["每章让机械操作产生具体结果"],
+        forbiddenShortcuts: ["只描写金属颜色"],
+      },
+      {
+        word: "奶爸",
+        interpretation: "奶爸体验由父亲听清女儿需要并共同改变选择体现",
+        observableSignals: [
+          { description: parentQuote, evidenceAnchors: ["俯身听清", "女儿说出的需要"] },
+          { description: "父女共同作出选择并改变维修铺冲突", evidenceAnchors: ["共同作出选择", "改变维修铺冲突"] },
+        ],
+        hardPromises: ["每章用双向父女行动推进关系"],
+        forbiddenShortcuts: ["把孩子写成道具"],
+      },
+    ],
+  };
+  const validReview = {
+    experienceEvidence: [
+      {
+        axisId: "primary",
+        word: "机械",
+        signalIds: ["primary_机械_model_signal_1", "primary_机械_model_signal_2", "primary_机械_signal_1"],
+        quote: mechanicalQuote,
+      },
+      {
+        axisId: "secondary",
+        word: "奶爸",
+        signalIds: ["secondary_奶爸_model_signal_1", "secondary_奶爸_model_signal_2", "secondary_奶爸_signal_1"],
+        quote: parentQuote,
+      },
+    ],
+    event: {
+      title: "维修铺门前的冲突",
+      cause: "武装人员逼近维修铺",
+      outcome: "父女共同守住维修铺",
+      location: "旧城维修铺门前",
+      persistentFacts: [mechanicalQuote, parentQuote],
+    },
+  };
+  const requests: Array<{ model: string; system: string }> = [];
+
+  const generated = await generateStoryOpeningWithConnection(context, connection, async (request) => {
+    requests.push({ model: request.model, system: request.system });
+    if (requests.length === 1) return { value: reviewablePlan, usageTokens: 100, usageEstimated: false };
+    if (requests.length === 2) {
+      return {
+        value: { title: "第一章 修好的机械臂", paragraphs: Array.from({ length: 16 }, () => paragraph) },
+        usageTokens: 200,
+        usageEstimated: false,
+      };
+    }
+    if (requests.length === 3) {
+      return {
+        value: { ...validReview, event: { ...validReview.event, location: "", persistentFacts: [] } },
+        usageTokens: 300,
+        usageEstimated: false,
+      };
+    }
+    return {
+      value: {
+        ...validReview,
+        event: {
+          ...validReview.event,
+          title: "修复器改写的事件",
+          cause: "修复器改写的原因",
+          outcome: "修复器改写的结果",
+          persistentFacts: ["修复器虚构的状态事实至少八个字"],
+        },
+      },
+      usageTokens: 400,
+      usageEstimated: false,
+    };
+  }, Number.POSITIVE_INFINITY);
+
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.writer,
+    connection.routes.extractor,
+    connection.routes.extractor,
+  ]);
+  assert.match(requests[3].system, /审稿.*JSON.*修复/);
+  assert.equal(generated.usageTokens, 1_000);
+  assert.equal(generated.chapter.paragraphs.length, 16);
+  assert.equal(generated.event.title, validReview.event.title);
+  assert.equal(generated.event.cause, validReview.event.cause);
+  assert.equal(generated.event.outcome, validReview.event.outcome);
+  assert.equal(generated.event.location, validReview.event.location);
+  assert.deepEqual(generated.event.persistentFacts, validReview.event.persistentFacts);
+  assert.doesNotMatch(JSON.stringify(generated.event), /修复器/);
+});
+
+test("opening reviewer retries unparseable JSON without rewriting accepted prose", async () => {
+  const { context, connection, plan, paragraph } = openingBudgetFixture();
+  const mechanicalQuote = "机械臂完成精确校准后稳稳托住奶瓶";
+  const parentQuote = "奶爸周砺俯身听清女儿说出的需要";
+  const reviewablePlan = {
+    ...plan,
+    experienceAxes: [
+      {
+        word: "机械",
+        interpretation: "机械体验由精确校准、托举和维修结果体现",
+        observableSignals: [
+          { description: mechanicalQuote, evidenceAnchors: ["精确校准", "托住奶瓶"] },
+          { description: "机械维修恢复现场资源并挡住逼近威胁", evidenceAnchors: ["恢复现场资源", "挡住逼近威胁"] },
+        ],
+        hardPromises: ["每章让机械操作产生具体结果"],
+        forbiddenShortcuts: ["只描写金属颜色"],
+      },
+      {
+        word: "奶爸",
+        interpretation: "奶爸体验由父亲听清女儿需要并共同改变选择体现",
+        observableSignals: [
+          { description: parentQuote, evidenceAnchors: ["俯身听清", "女儿说出的需要"] },
+          { description: "父女共同作出选择并改变维修铺冲突", evidenceAnchors: ["共同作出选择", "改变维修铺冲突"] },
+        ],
+        hardPromises: ["每章用双向父女行动推进关系"],
+        forbiddenShortcuts: ["把孩子写成道具"],
+      },
+    ],
+  };
+  const validReview = {
+    experienceEvidence: [
+      {
+        axisId: "primary",
+        word: "机械",
+        signalIds: ["primary_机械_model_signal_1", "primary_机械_model_signal_2", "primary_机械_signal_1"],
+        quote: mechanicalQuote,
+      },
+      {
+        axisId: "secondary",
+        word: "奶爸",
+        signalIds: ["secondary_奶爸_model_signal_1", "secondary_奶爸_model_signal_2", "secondary_奶爸_signal_1"],
+        quote: parentQuote,
+      },
+    ],
+    event: {
+      title: "维修铺门前的冲突",
+      cause: "武装人员逼近维修铺",
+      outcome: "父女共同守住维修铺",
+      location: "旧城维修铺门前",
+      persistentFacts: [],
+    },
+  };
+  const requests: Array<{ model: string; system: string }> = [];
+  let writerCalls = 0;
+
+  const generated = await generateStoryOpeningWithConnection(context, connection, async (request) => {
+    requests.push(request);
+    if (requests.length === 1) return { value: reviewablePlan, usageTokens: 100, usageEstimated: false };
+    if (request.model === connection.routes.writer) {
+      writerCalls += 1;
+      return {
+        value: { title: "第一章 修好的机械臂", paragraphs: Array.from({ length: 16 }, () => paragraph) },
+        usageTokens: 200,
+        usageEstimated: false,
+      };
+    }
+    if (requests.length === 3) {
+      throw attachModelUsage(new Error("模型 Qwen/Qwen3-14B 输出不是可修复的 JSON。"), 300, false);
+    }
+    return { value: validReview, usageTokens: 400, usageEstimated: false };
+  }, Number.POSITIVE_INFINITY);
+
+  assert.equal(writerCalls, 1);
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.writer,
+    connection.routes.extractor,
+    connection.routes.extractor,
+  ]);
+  assert.match(requests[3].system, /上一轮没有形成可解析 JSON/);
+  assert.equal(generated.usageTokens, 1_000);
+  assert.deepEqual(generated.event.persistentFacts, [mechanicalQuote, parentQuote]);
+});
+
 test("opening generation gives slow reasoning routes stage-appropriate deadlines", async () => {
   const { context, connection, plan, paragraph } = openingBudgetFixture();
   const requests: Array<{ model: string; timeout: number }> = [];
@@ -799,7 +1370,7 @@ test("opening gateway failures expose consumed model usage", async () => {
       targetChapterCount: base.targetChapterCount,
     }, connection, async () => ({ value: {}, usageTokens: 1_234, usageEstimated: false })),
     (error: Error & { usageTokens?: number; usageEstimated?: boolean }) => {
-      assert.equal(error.usageTokens, 1_234);
+      assert.equal(error.usageTokens, 3_702);
       assert.equal(error.usageEstimated, false);
       return /Schema/.test(error.message);
     },
@@ -886,6 +1457,344 @@ test("completeJson preserves call-local usage for every provider failure shape",
   );
 });
 
+test("completeJson retries transient SiliconFlow overloads without changing routes", async () => {
+  const connection: ModelConnection = {
+    id: "conn_siliconflow_retry",
+    name: "SiliconFlow retry",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://siliconflow-retry",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  let calls = 0;
+  let currentTime = 0;
+  const delays: number[] = [];
+  const overallTimeouts: number[] = [];
+  const requiredTokens = estimateModelCallTokenBudget({
+    system: "system prompt",
+    prompt: "user prompt",
+    maxOutputTokens: 40,
+  });
+  const dependencies = {
+    secretReader: async () => "test-key",
+    modelFetcher: async (_connection: ModelConnection, _apiKey: string, _pathname: string, _init: RequestInit, _timeout: number, overallTimeout: number) => {
+      calls += 1;
+      overallTimeouts.push(overallTimeout);
+      if (calls === 1) {
+        return new Response(JSON.stringify({ error: { message: "System is too busy now. Please try again later." } }), {
+          status: 503,
+        });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ ok: true }) } }],
+        usage: { total_tokens: 19 },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+    retryDelay: async (milliseconds: number) => {
+      delays.push(milliseconds);
+      currentTime += milliseconds;
+    },
+    remainingTokens: requiredTokens * 2,
+    stage: "测试正文",
+    now: () => currentTime,
+  } as NonNullable<Parameters<typeof completeJson>[6]> & {
+    retryDelay: (milliseconds: number) => Promise<void>;
+  };
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    "system prompt",
+    "user prompt",
+    10_000,
+    40,
+    dependencies,
+  );
+
+  assert.deepEqual(result, {
+    value: { ok: true },
+    usageTokens: requiredTokens + 19,
+    usageEstimated: true,
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [2_000]);
+  assert.deepEqual(overallTimeouts, [10_000, 8_000]);
+});
+
+test("completeJson refuses a retry that cannot fit in the remaining token budget", async () => {
+  const connection: ModelConnection = {
+    id: "conn_retry_budget",
+    name: "Retry budget",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://retry-budget",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const system = "system prompt";
+  const prompt = "user prompt";
+  const maxOutputTokens = 40;
+  const requiredTokens = estimateModelCallTokenBudget({ system, prompt, maxOutputTokens });
+  let calls = 0;
+
+  await assert.rejects(
+    () => completeJson(connection, connection.routes.writer, system, prompt, 10_000, maxOutputTokens, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => {
+        calls += 1;
+        return new Response("temporarily unavailable", { status: 503 });
+      },
+      retryDelay: async () => undefined,
+      remainingTokens: requiredTokens * 2 - 1,
+      stage: "测试正文",
+    }),
+    (error: Error & { usageTokens?: number; usageEstimated?: boolean }) => {
+      assert.match(error.message, /剩余 Token .*不足以支付测试正文重试/);
+      assert.equal(error.usageTokens, requiredTokens);
+      assert.equal(error.usageEstimated, true);
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+});
+
+test("completeJson bounds repeated transient failures to three paid attempts", async () => {
+  const connection: ModelConnection = {
+    id: "conn_retry_limit",
+    name: "Retry limit",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://retry-limit",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const system = "system prompt";
+  const prompt = "user prompt";
+  const maxOutputTokens = 40;
+  const requiredTokens = estimateModelCallTokenBudget({ system, prompt, maxOutputTokens });
+  let calls = 0;
+  let currentTime = 0;
+  const delays: number[] = [];
+
+  await assert.rejects(
+    () => completeJson(connection, connection.routes.writer, system, prompt, 30_000, maxOutputTokens, {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => {
+        calls += 1;
+        return new Response("temporarily unavailable", { status: 503 });
+      },
+      retryDelay: async (milliseconds) => {
+        delays.push(milliseconds);
+        currentTime += milliseconds;
+      },
+      remainingTokens: requiredTokens * 3,
+      stage: "测试正文",
+      now: () => currentTime,
+    }),
+    (error: Error & { usageTokens?: number; usageEstimated?: boolean }) => {
+      assert.match(error.message, /503/);
+      assert.equal(error.usageTokens, requiredTokens * 3);
+      assert.equal(error.usageEstimated, true);
+      return true;
+    },
+  );
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [2_000, 5_000]);
+});
+
+test("completeJson retries a transient network failure on generic compatible providers", async () => {
+  const connection: ModelConnection = {
+    id: "conn_network_retry",
+    name: "Network retry",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://network-retry",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const system = "system prompt";
+  const prompt = "user prompt";
+  const maxOutputTokens = 40;
+  const requiredTokens = estimateModelCallTokenBudget({ system, prompt, maxOutputTokens });
+  let calls = 0;
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    system,
+    prompt,
+    10_000,
+    maxOutputTokens,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("ECONNRESET");
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ ok: true }) } }],
+          usage: { total_tokens: 19 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      retryDelay: async () => undefined,
+      remainingTokens: requiredTokens * 2,
+      stage: "测试正文",
+    },
+  );
+
+  assert.deepEqual(result, {
+    value: { ok: true },
+    usageTokens: requiredTokens + 19,
+    usageEstimated: true,
+  });
+  assert.equal(calls, 2);
+});
+
+test("completeJson retries a transient failure while reading a non-streaming response body", async () => {
+  const connection: ModelConnection = {
+    id: "conn_body_retry",
+    name: "Body retry",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://body-retry",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const system = "system prompt";
+  const prompt = "user prompt";
+  const maxOutputTokens = 40;
+  const requiredTokens = estimateModelCallTokenBudget({ system, prompt, maxOutputTokens });
+  let calls = 0;
+  const delays: number[] = [];
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    system,
+    prompt,
+    10_000,
+    maxOutputTokens,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          const interruptedBody = new ReadableStream<Uint8Array>({
+            start(controller) { controller.error(new Error("terminated")); },
+          });
+          return new Response(interruptedBody, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ ok: true }) } }],
+          usage: { total_tokens: 19 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      retryDelay: async (milliseconds) => { delays.push(milliseconds); },
+      remainingTokens: requiredTokens * 2,
+      stage: "测试正文",
+    },
+  );
+
+  assert.deepEqual(result, {
+    value: { ok: true },
+    usageTokens: requiredTokens + 19,
+    usageEstimated: true,
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [2_000]);
+});
+
+test("completeJson recognizes transient Node transport error codes", async () => {
+  const connection: ModelConnection = {
+    id: "conn_error_code_retry",
+    name: "Error code retry",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://error-code-retry",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const system = "system prompt";
+  const prompt = "user prompt";
+  const maxOutputTokens = 40;
+  const requiredTokens = estimateModelCallTokenBudget({ system, prompt, maxOutputTokens });
+  let calls = 0;
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    system,
+    prompt,
+    10_000,
+    maxOutputTokens,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error("temporary name service failure"), { code: "EAI_AGAIN" });
+        }
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ ok: true }) } }],
+          usage: { total_tokens: 19 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      retryDelay: async () => undefined,
+      remainingTokens: requiredTokens * 2,
+      stage: "测试正文",
+    },
+  );
+
+  assert.equal(calls, 2);
+  assert.equal(result.usageTokens, requiredTokens + 19);
+  assert.equal(result.usageEstimated, true);
+});
+
 test("JSON response mode is only reused by routes backed by the tested writer model", async () => {
   const connection: ModelConnection = {
     id: "conn_route_json_capability",
@@ -930,9 +1839,47 @@ test("JSON response mode is only reused by routes backed by the tested writer mo
     secretReader: async () => "test-key",
     modelFetcher,
   });
+  await completeJson(connection, "extractor", "system", "prompt", 1_000, 20, {
+    secretReader: async () => "test-key",
+    modelFetcher,
+  });
 
   assert.equal(requestBodies[0].response_format, undefined);
   assert.deepEqual(requestBodies[1].response_format, { type: "json_object" });
+  assert.equal(requestBodies[2].response_format, undefined);
+});
+
+test("SiliconFlow Qwen3 extractor disables thinking and requests concise JSON mode", async () => {
+  const streamingConnection = siliconFlowStreamingTestConnection("conn_qwen_json_mode");
+  const connection: ModelConnection = {
+    ...streamingConnection,
+    capabilities: { ...streamingConnection.capabilities!, streaming: false },
+  };
+  let requestBody: Record<string, unknown> | undefined;
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.extractor,
+    "只返回 JSON",
+    "抽取证据",
+    1_000,
+    200,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, _pathname, init) => {
+        requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: "{\"ok\":true}" } }],
+          usage: { total_tokens: 9 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    },
+  );
+
+  assert.deepEqual(result, { value: { ok: true }, usageTokens: 9, usageEstimated: false });
+  assert.equal(requestBody?.enable_thinking, false);
+  assert.equal(requestBody?.temperature, 0.2);
+  assert.deepEqual(requestBody?.response_format, { type: "json_object" });
 });
 
 test("SiliconFlow structured completions stream long reasoning responses within bounded deadlines", async () => {
@@ -980,6 +1927,60 @@ test("SiliconFlow structured completions stream long reasoning responses within 
   assert.equal(requestBody?.stream, true);
   assert.equal(idleTimeout, 180_000);
   assert.equal(overallTimeout, 360_000);
+});
+
+test("SiliconFlow retries a transient aborted structured stream and accounts for both attempts", async () => {
+  const connection = siliconFlowStreamingTestConnection("conn_siliconflow_stream_retry");
+  let calls = 0;
+  const delays: number[] = [];
+  const requiredTokens = estimateModelCallTokenBudget({
+    system: "system prompt",
+    prompt: "user prompt",
+    maxOutputTokens: 6_500,
+  });
+  const successBody = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: "{\"ok\":true}" } }] })}`,
+    `data: ${JSON.stringify({ choices: [], usage: { total_tokens: 23 } })}`,
+    "data: [DONE]",
+  ].join("\n\n");
+  const dependencies = {
+    secretReader: async () => "test-key",
+    modelFetcher: async () => {
+      calls += 1;
+      if (calls === 1) {
+        const abortedBody = new ReadableStream<Uint8Array>({
+          start(controller) { controller.error(new Error("aborted")); },
+        });
+        return new Response(abortedBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response(successBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+    retryDelay: async (milliseconds: number) => { delays.push(milliseconds); },
+    remainingTokens: requiredTokens * 2,
+    stage: "测试正文",
+  };
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    "system prompt",
+    "user prompt",
+    300_000,
+    6_500,
+    dependencies,
+  );
+
+  assert.deepEqual(result.value, { ok: true });
+  assert.equal(result.usageTokens, requiredTokens + 23);
+  assert.equal(result.usageEstimated, true);
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [2_000]);
 });
 
 test("SiliconFlow structured streams cancel malformed input and enforce the UTF-8 byte cap", async () => {
@@ -1207,7 +2208,7 @@ test("streaming ignores non-positive provider usage and falls back to a positive
   assert.ok(result.usageTokens && result.usageTokens > 0);
   assert.equal(result.usageEstimated, true);
   assert.equal(observedStreamTimeout, 300_000);
-  assert.equal(observedStreamOverallTimeout, 900_000);
+  assert.equal(observedStreamOverallTimeout, 1_500_000);
 
   await assert.rejects(
     () => streamChapterWithConnection(connection, "prompt", () => undefined, 2_000, {
@@ -1510,7 +2511,7 @@ test("opening writer admission includes model-refined custom axes", async () => 
     () => generateStoryOpeningWithConnection(context, connection, async () => {
       calls += 1;
       return { value: plan, usageTokens: 100, usageEstimated: false };
-    }, 9_000),
+    }, 10_000),
     (error: Error & { usageTokens?: number }) => {
       assert.match(error.message, /剩余 Token.*开篇正文.*未启动/);
       assert.equal(error.usageTokens, 100);
@@ -1953,6 +2954,321 @@ test("reading-experience validation rejects pasted scenery and curated negative 
   );
 });
 
+test("paraphrased system and invincible evidence is grounded in exact validated prose", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const content = "系统面板立刻绑定主角并发放永久奖励，主角依据奖励选择目标。主角一击镇压敌人，全场强者无人敢反抗。";
+  const grounded = groundReadingExperienceEvidence(contract, content, [
+    {
+      axisId: "primary",
+      word: "系统",
+      signalIds: contract.axes[0].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: "系统已经选中主角，并把永久奖励交给了他",
+    },
+    {
+      axisId: "secondary",
+      word: "无敌",
+      signalIds: contract.axes[1].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: "主角轻易打败强敌，所有旁观者都不敢反抗",
+    },
+  ], { protagonistNames: ["主角"], opening: true, chapterNumber: 1 });
+
+  assert.deepEqual(grounded.map((item) => item.quote), [
+    "系统面板立刻绑定主角并发放永久奖励",
+    "主角一击镇压敌人",
+  ]);
+  assert.doesNotThrow(() => assertReadingExperienceEvidence(
+    contract,
+    content,
+    grounded,
+    { protagonistNames: ["主角"], opening: true, chapterNumber: 1 },
+  ));
+});
+
+test("grounding can preserve an exact adjacent-sentence victory span inside a long paragraph", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const systemQuote = "林峰打开系统面板，领取永久奖励并确认能力已经生效";
+  const victorySpan = "林峰面对来敌只抬了抬手。那名强者便被镇压在地，毫无还手之力。";
+  const longAftermath = "围观者退到街边，商铺重新开门，原本堵住路口的人群也恢复了通行秩序。".repeat(12);
+  const content = `${systemQuote}。\n${victorySpan}${longAftermath}`;
+  const grounded = groundReadingExperienceEvidence(contract, content, [
+    {
+      axisId: "primary",
+      word: "系统",
+      signalIds: contract.axes[0].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: systemQuote,
+    },
+    {
+      axisId: "secondary",
+      word: "无敌",
+      signalIds: contract.axes[1].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: "林峰抬手便让强者彻底失去反抗能力",
+    },
+  ], { protagonistNames: ["林峰"], chapterNumber: 1 });
+
+  assert.equal(grounded[1].quote, victorySpan);
+  assert.doesNotThrow(() => assertReadingExperienceEvidence(
+    contract,
+    content,
+    grounded,
+    { protagonistNames: ["林峰"], chapterNumber: 1 },
+  ));
+});
+
+test("segmented protagonist system interaction is accepted without crediting another character's system", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 明快" }, "user_test").readingExperience;
+  const protagonistInteraction = "林峰抬眼，半透明系统面板在他眼前展开。面板提示签到成功，新手奖励十万年修为已经到账。他点击领取，修为永久生效。";
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    protagonistInteraction,
+    { protagonistNames: ["林峰"], opening: true, chapterNumber: 1 },
+  ));
+
+  const villainInteraction = "反派赵无极打开系统面板。面板提示签到成功，新手奖励十万年修为已经到账。林峰站在远处看见了这一切。";
+  assert.throws(() => assertReadingExperienceContent(
+    contract,
+    villainInteraction,
+    { protagonistNames: ["林峰"], opening: true, chapterNumber: 1 },
+  ), /系统|主角|宿主|可操作/);
+});
+
+test("natural viewpoint modifiers remain attached to the named protagonist's system", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 明快" }, "user_test").readingExperience;
+  for (const protagonistInteraction of [
+    "苏尘心念一动打开签到面板，系统瞬间发放绝对领域永久能力，他立刻点击领取。",
+    "苏尘在意识模糊间瞥见一道半透明光幕浮在眼前，上面赫然写着每日签到系统已激活，他本能地默念签到，光幕瞬间弹出签到成功、获得永久能力的提示，苏尘想也没想便点击领取。",
+  ]) {
+    assert.doesNotThrow(() => assertReadingExperienceContent(
+      contract,
+      protagonistInteraction,
+      { protagonistNames: ["苏尘"], opening: true, chapterNumber: 1 },
+    ));
+  }
+});
+
+test("a protagonist's inner invocation remains attached to their system interaction", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 明快" }, "user_test").readingExperience;
+  for (const interaction of [
+    "林辰心中默念打开面板，眼前浮现签到系统界面并提示签到成功、永久能力已经发放，他点击领取并立即调用。",
+    "林辰念动间打开系统面板，签到成功的提示与永久功法奖励一同弹出，他立即点击领取。",
+    "林辰伸手点开面板的同时系统提示音响起并发放永久功法奖励，林辰毫不犹豫点击领取。",
+    "脑海中响起提示：【签到系统激活，是否签到？】林辰念动间打开系统面板，系统发放永久功法奖励，他立即点击领取。",
+    "眼前面板显示：\"签到系统激活，是否签到？\"林辰伸手点开面板，系统发放永久功法奖励，他立即点击领取。",
+  ]) {
+    assert.doesNotThrow(() => assertReadingExperienceContent(
+      contract,
+      interaction,
+      { protagonistNames: ["林辰"], opening: true, chapterNumber: 1 },
+    ));
+  }
+
+  assert.throws(() => assertReadingExperienceContent(
+    contract,
+    "林辰让师兄打开系统面板，系统向师兄发放永久功法奖励，师兄点击领取。",
+    { protagonistNames: ["林辰"], opening: true, chapterNumber: 1 },
+  ), /系统|主角|宿主|可操作/);
+});
+
+test("a named protagonist in the previous sentence anchors a natural pronoun system interaction", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 明快" }, "user_test").readingExperience;
+  const protagonistInteraction = "林辰倒在硬板床上，盯着天花板，第五次面试被拒的烦躁堵在胸口。他习惯性默念系统，眼前立刻浮现金色面板并显示系统绑定完成、新手礼包永久能力已发放，他随即点击领取。";
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    protagonistInteraction,
+    { protagonistNames: ["林辰"], opening: true, chapterNumber: 1 },
+  ));
+
+  const unrelatedInteraction = "反派赵无极倒在硬板床上，盯着天花板。他习惯性默念系统，眼前立刻浮现金色面板并显示系统绑定完成、新手礼包永久能力已发放，他随即点击领取。";
+  assert.throws(() => assertReadingExperienceContent(
+    contract,
+    unrelatedInteraction,
+    { protagonistNames: ["林辰"], opening: true, chapterNumber: 1 },
+  ), /系统|主角|宿主|可操作/);
+});
+
+test("the opening system interaction grants a durable payoff that the protagonist actually uses", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 明快" }, "user_test").readingExperience;
+  const context = { protagonistNames: ["林辰"], opening: true, chapterNumber: 1 };
+
+  for (const emptyInteraction of [
+    "林辰打开系统面板，面板显示今日任务是前往城南，他点击确认后关闭界面。",
+    "林辰唤出系统面板查看当前状态，面板列出姓名、年龄和待办任务，他随后收起面板。",
+    "系统提示林辰完成任务后可以获得永久功法，林辰接受任务，但奖励尚未发放。",
+    "林辰打开系统面板，面板显示永久功法将在明日发放，他点击确认后关闭界面。",
+    "林辰打开系统面板，系统向同伴发放永久能力，同伴点击领取并立即调用。",
+    "林辰打开系统面板，系统向同伴发放永久能力，点击领取并立即调用。",
+    "林辰打开系统面板，系统立即发放只能维持一分钟的临时能力奖励。林辰点击领取并立即使用。",
+    "林辰打开系统面板，系统立即发放并非永久的领域能力。林辰点击领取并立即调用。",
+    "林辰打开系统面板，系统说明这不是一项永久领域能力，却仍立即发放。林辰点击领取并立即调用。",
+  ]) {
+    assert.throws(
+      () => assertReadingExperienceContent(contract, emptyInteraction, context),
+      /前 15%|奖励|能力|领取|调用|使用/,
+    );
+  }
+
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    "林辰打开系统面板，系统立即发放永久功法奖励。林辰点击领取，随即运转功法震开门锁。",
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    "林辰打开系统面板，系统立即发放一次性新手礼包，礼包内含永久领域能力。林辰点击领取，随即调用领域能力震开门锁。",
+    context,
+  ));
+});
+
+test("grounding replaces an exact but semantically incomplete system quote", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const content = "苏尘打开系统面板，系统显示永久能力已经发放，苏尘点击领取并立即调用。苏尘抬手一拳击败怪物，对方毫无还手之力。围观者当场退开让路。";
+  const incompleteQuote = "系统显示永久能力已经发放";
+  const grounded = groundReadingExperienceEvidence(contract, content, [
+    {
+      axisId: "primary",
+      word: "系统",
+      signalIds: contract.axes[0].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: incompleteQuote,
+    },
+    {
+      axisId: "secondary",
+      word: "无敌",
+      signalIds: contract.axes[1].observableSignals.slice(0, 2).map((signal) => signal.id),
+      quote: "苏尘抬手一拳击败怪物，对方毫无还手之力",
+    },
+  ], { protagonistNames: ["苏尘"], opening: true, chapterNumber: 1 });
+
+  assert.notEqual(grounded[0].quote, incompleteQuote);
+  assert.doesNotThrow(() => assertReadingExperienceEvidence(
+    contract,
+    content,
+    grounded,
+    { protagonistNames: ["苏尘"], opening: true, chapterNumber: 1 },
+  ));
+});
+
+test("a system panel may report a defeated opponent's disabled cultivation without failing system availability", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const content = [
+    "林峰打开系统面板，系统立即发放诸天镇压永久权限奖励，林峰点击领取并直接调用。",
+    "林峰抬手一指点出，来犯的黑煞宗长老李玄通浑身灵力瞬间溃散，当场跪地无法反抗。",
+    "系统面板浮现李玄通的信息——修为：凝脉境巅峰（已被镇压，失效），法宝：黑煞旗（已被镇压，失效），目标解除前无法恢复。",
+  ].join("\n");
+
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    content,
+    { protagonistNames: ["林峰"], opening: true, chapterNumber: 1 },
+  ));
+});
+
+test("cross-sentence victory cannot be credited to the protagonist when a helper supplies the force", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const delegatedVictory = "林峰打开系统面板，领取永久奖励并确认能力已经生效。林峰抬手整理衣袖。那名强者便被护卫镇压在地，毫无还手之力。";
+  assert.throws(() => assertReadingExperienceContent(
+    contract,
+    delegatedVictory,
+    { protagonistNames: ["林峰"], chapterNumber: 1 },
+  ), /无敌|主角|压倒性胜利/);
+});
+
+test("dominant victory accepts natural monster-disintegration and observed-opponent phrasing", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  for (const victory of [
+    "林夜抬手一握，领域内所有怪物被无形力场碾成碎末，毫无反抗余地",
+    "林夜抬手虚握，那甲虫连同刀臂被无形力场碾成黑灰，毫无反抗余地",
+    "林夜看着来势汹汹的长老，随手一挥，那名长老便倒飞百丈，落地再也爬不起来",
+    "林夜一拳轰出——拳劲炸开肉眼可见的白色气浪，怪物胸腔被贯穿出一个脸盆大的窟窿，黑血喷溅中它毫无反抗之力地碎裂成一地肉块",
+    "林夜抬手一挥，两名特工便倒飞出去砸在车上，两人当场失去行动能力无法反抗",
+    "林夜抬手一击拍飞匕首，纵火者向后跌飞撞在垃圾箱上，当场昏迷毫无还手之力",
+    "林夜单手压下，漩涡将鳞甲巨兽和数十只变异怪物瞬间吞没，巨兽毫无还手之力便化为虚无",
+    "林夜转身抬手，吞噬漩涡一击打出，三只变异犬毫无还手之力便被吞没",
+  ]) {
+    const content = `林夜打开系统面板，系统立即发放永久奖励，林夜点击领取并直接调用。${victory}。\n围观者当场低头让路。`;
+    assert.doesNotThrow(() => assertReadingExperienceContent(
+      contract,
+      content,
+      { protagonistNames: ["林夜"], opening: true, chapterNumber: 1 },
+    ));
+  }
+});
+
+test("an opening invincible payoff requires an immediate real-world reaction", () => {
+  const contract = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const context = { protagonistNames: ["林夜"], opening: true, chapterNumber: 1 };
+  const systemPayoff = "林夜打开系统面板，系统立即发放永久领域能力，林夜点击领取并直接调用。";
+  const victory = "林夜抬手一拳击败宗门长老，对方当场倒地不起。";
+
+  assert.throws(
+    () => assertReadingExperienceContent(contract, `${systemPayoff}\n${victory}`, context),
+    /无敌|反应|旁观者|势力|资源|身份|秩序/,
+  );
+  assert.throws(
+    () => assertReadingExperienceContent(
+      contract,
+      `${systemPayoff}\n${victory}\n山风卷过空荡的演武场。\n围观弟子终于低头让路。`,
+      context,
+    ),
+    /无敌|反应|旁观者|势力|资源|身份|秩序/,
+  );
+  assert.throws(
+    () => assertReadingExperienceContent(
+      contract,
+      `${systemPayoff}\n${victory}\n围观弟子计划明日低头让路，但此刻仍没有任何人行动。`,
+      context,
+    ),
+    /无敌|反应|旁观者|势力|资源|身份|秩序/,
+  );
+  assert.throws(
+    () => assertReadingExperienceContent(
+      contract,
+      `${systemPayoff}\n${victory}\n围观弟子没有震惊，也没有退开让路。`,
+      context,
+    ),
+    /无敌|反应|旁观者|势力|资源|身份|秩序/,
+  );
+
+  const filler = Array.from({ length: 80 }, () => "林夜沿着演武场边缘检查石阶，周围弟子各自忙碌。 ").join("");
+  assert.throws(
+    () => assertReadingExperienceContent(
+      contract,
+      `${systemPayoff}\n${filler}\n${victory}\n围观弟子当场低头让路。`,
+      context,
+    ),
+    /前 15%|无敌|压倒性胜利/,
+  );
+
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n围观弟子当场低头让路，宗门随即撤销了对林夜的禁令。`,
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n围观弟子无不震惊，纷纷低头让路。`,
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n围观弟子没有一个不震惊。`,
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n围观弟子无一人不震惊。`,
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n周围路人尖叫逃散，整条巷子瞬间空了。`,
+    context,
+  ));
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    contract,
+    `${systemPayoff}\n${victory}\n围观弟子当场低头让路。\n${filler}`,
+    context,
+  ));
+});
+
 test("invincible validation binds the dominant victory to the protagonist", () => {
   const contract = createStory({ genre: "玄幻", tone: "系统 · 无敌" }, "user_test").readingExperience;
   const content = "主角的系统面板发放永久奖励并保持运行。敌人只用一击就击败了主角，主角倒地不起。";
@@ -2177,6 +3493,10 @@ test("invincible validation binds the dominant victory to the protagonist", () =
     "主角一拳打倒对手",
     "主角挥袖震退宗主，对方当场认输",
     "主角一脚踩住强者，逼得对方认输",
+    "主角抬手一指点出，来犯长老浑身灵力瞬间溃散，当场跪地毫无反抗之力",
+    "主角林峰只是抬起手指，烈虎帮副帮主赵魁便双膝砸地，浑身动弹不得",
+    "主角林峰一步踏出，执法长老周衡像断线风筝般砸进石壁，当场昏死",
+    "主角林峰随意挥掌，护法赵魁倒飞百丈，落地再也爬不起来",
   ]) {
     const victoryContent = `主角的系统面板发放永久奖励并保持运行。${commonDominantVictory}。`;
     assert.doesNotThrow(() => assertReadingExperienceEvidence(contract, victoryContent, [
@@ -2471,6 +3791,88 @@ test("curated feelings retain planner-bound semantic evidence instead of trustin
     quote: deliveredQuotes[index],
   }));
   assert.doesNotThrow(() => assertReadingExperienceEvidence(contract, deliveredContent, deliveredEvidence));
+});
+
+test("model-bound experience evidence and persistent facts require an actual realized event", () => {
+  const base = createStory({ genre: "都市", tone: "机械 · 奶爸" }, "user_test").readingExperience;
+  const contract = refineReadingExperienceContract(base, [
+    {
+      word: "机械",
+      interpretation: "机械体验由父亲操纵机械臂抓住坠落孩子并完成救援来体现",
+      observableSignals: [{
+        description: "父亲启动机械臂抓住孩子并把她送回安全地面",
+        evidenceAnchors: ["机械臂", "抓住孩子", "安全地面"],
+      }, "机械臂完成救援并解除坠落危险"],
+      hardPromises: ["每章让机械能力通过实际救援改变结果"],
+      forbiddenShortcuts: [],
+    },
+    {
+      word: "奶爸",
+      interpretation: "奶爸体验由父亲照料受惊孩子并让她恢复安全感来体现",
+      observableSignals: [{
+        description: "父亲抱住受惊孩子并轻声安抚直到她停止发抖",
+        evidenceAnchors: ["抱住", "轻声安抚", "停止发抖"],
+      }, "孩子接受父亲照料后恢复安全感"],
+      hardPromises: ["每章用实际照料推进亲子关系"],
+      forbiddenShortcuts: [],
+    },
+  ]);
+  const parentQuote = "父亲抱住受惊孩子并轻声安抚，直到她停止发抖";
+  const actualMechanicalQuote = "父亲启动机械臂抓住孩子，随后把她送回安全地面";
+  const evidenceFor = (mechanicalQuote: string) => contract.axes.map((axis, index) => ({
+    axisId: axis.id,
+    word: axis.word,
+    signalIds: [
+      axis.observableSignals.find((signal) => signal.id.includes("_model_signal_"))!.id,
+      axis.observableSignals.find((signal) => !signal.id.includes("_model_signal_"))!.id,
+    ],
+    quote: index === 0 ? mechanicalQuote : parentQuote,
+  }));
+  const unrealizedQuotes = [
+    "父亲并未启动机械臂抓住孩子，孩子仍在继续坠落",
+    "父亲计划启动机械臂抓住孩子，但还没有采取行动",
+    "父亲试图启动机械臂抓住孩子，却没有成功",
+    "父亲在梦境中启动机械臂抓住孩子，醒来后孩子仍在坠落",
+    "模拟画面中父亲启动机械臂抓住孩子，现实里的机械臂没有启动",
+    "父亲预测自己会启动机械臂抓住孩子，但事情尚未发生",
+    "只要父亲启动机械臂抓住孩子，她就会回到安全地面",
+    "一旦父亲启动机械臂抓住孩子，她便会回到安全地面",
+    "父亲必须启动机械臂抓住孩子，孩子才会回到安全地面",
+  ];
+
+  for (const unrealizedQuote of unrealizedQuotes) {
+    const content = `${unrealizedQuote}。${actualMechanicalQuote}。${parentQuote}。`;
+    const evidence = evidenceFor(unrealizedQuote);
+    assert.throws(
+      () => assertReadingExperienceEvidence(contract, content, evidence),
+      /实际|真实|未兑现|证据|行动语义/,
+    );
+    const grounded = groundReadingExperienceEvidence(contract, content, evidence);
+    assert.notEqual(grounded[0].quote, unrealizedQuote);
+    assert.doesNotThrow(() => assertReadingExperienceEvidence(contract, content, grounded));
+
+    assert.throws(
+      () => assertPersistentExperienceFacts(
+        contract,
+        `${unrealizedQuote}。${parentQuote}。`,
+        [unrealizedQuote, parentQuote],
+      ),
+      /实际|真实|未兑现|状态事实/,
+    );
+  }
+
+  const reversedFailure = "这次救援并非失败，而是成功：父亲启动机械臂抓住孩子，并把她送回安全地面";
+  const positiveContent = `${reversedFailure}。${parentQuote}。`;
+  assert.doesNotThrow(() => assertReadingExperienceEvidence(
+    contract,
+    positiveContent,
+    evidenceFor(reversedFailure),
+  ));
+  assert.doesNotThrow(() => assertPersistentExperienceFacts(
+    contract,
+    positiveContent,
+    [reversedFailure, parentQuote],
+  ));
 });
 
 test("chapter two validation requires the persistent reading-experience signals", () => {

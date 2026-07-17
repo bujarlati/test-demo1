@@ -72,7 +72,7 @@ export interface ReadingExperienceValidationContext {
 }
 
 function isNegatedPrefix(prefix: string): boolean {
-  return /(?:不|不会|绝不|绝非|绝不会|并非|并未|不是|不存在|绝无|从未|从不|未曾|不曾|永不|无需|避免|没有|无法|未能|没能|无人能|无人能够|没人能|没有人能|没有人能够|谁也不可能|不可能|扬言要|声称要|宣称要|试图|企图|计划|打算|没有被|并未被|未曾被|不曾被)$/.test(prefix.trim());
+  return /(?:不|不会|绝不|绝非|绝不会|并非|并未|不是|不存在|绝无|从未|从不|未曾|不曾|尚未|还未|还没|永不|无需|避免|没有|无法|未能|没能|无人能|无人能够|没人能|没有人能|没有人能够|谁也不可能|不可能|扬言要|声称要|宣称要|试图|企图|计划|打算|没有被|并未被|未曾被|不曾被)$/.test(prefix.trim());
 }
 
 function hasUnnegatedTerm(content: string, terms: string[]): boolean {
@@ -141,7 +141,7 @@ function hasUnnegatedSystemFailure(content: string): boolean {
     const sentenceAfter = after.split(/[。！？；\n]/, 1)[0];
     if (!/(?:系统|面板)/.test(sentenceBefore) && !/(?:系统|面板)/.test(sentenceAfter)) continue;
     const prefix = before.slice(-40);
-    const coordinatedNegationMatch = sentenceBefore.match(/(?:不会|绝不会|永不|从不|免于)([^。！？；\n]{0,60})$/);
+    const coordinatedNegationMatch = sentenceBefore.match(/(?:不会|绝不会|永不|从不|免于|不提供|不设置|不设)([^。！？；\n]{0,60})$/);
     const coordinatedNegation = Boolean(
       coordinatedNegationMatch &&
       !/(?:但|却|然而|最终|随后|反而|转而)/.test(coordinatedNegationMatch[1]),
@@ -188,10 +188,22 @@ function hasProtagonistSystemInteraction(
     ...(context.protagonistNames ?? []).flatMap((name) => [name.trim(), name.trim().replace(/^主角/, "")]),
   ].filter(Boolean)));
   const normalizedOwnerIsProtagonist = (owner: string) => {
-    const normalized = owner.replace(/^(?:真正的|那名|这名)/, "").replace(/(?:本人|自己)$/, "").trim();
+    const normalized = owner
+      .replace(/^(?:真正的|那名|这名)/, "")
+      .replace(/(?:本人|自己)$/, "")
+      .replace(/(?:心念一动|意念一动|念头一动|心中默念|轻声默念|低声默念|默念|心中呼唤|呼唤)$/, "")
+      .trim();
     return protagonistOwnerNames.some((name) => normalized === name || normalized === `主角${name}`);
   };
   const extractDeclaredOwner = (sentence: string): string | undefined => {
+    const namedOwnerBeforeSystem = sentence.match(new RegExp(
+      `^(${namedProtagonist})(?!的)([^，,。！？：:]{0,20}?)(?:绑定|拥有|打开|点开|开启|唤出|调用|使用|操控|激活|从|通过|按照|遵循)[^，,。！？]{0,12}(?:系统|面板)`,
+    ));
+    if (namedOwnerBeforeSystem) {
+      const modifier = namedOwnerBeforeSystem[2] ?? "";
+      const delegatesOrObservesAnotherActor = /(?:命令|吩咐|要求|让|请|示意|允许|逼迫|迫使|看着|看到|目睹|望着|交给|委托|安排)|(?:师父|师尊|师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡|反派|敌人)/.test(modifier);
+      if (!delegatesOrObservesAnotherActor) return namedOwnerBeforeSystem[1].trim();
+    }
     const ownerBeforeSystem = sentence.match(/^([^，,。！？：:]{1,24}?)(?:当场|随即|已经|成功|正式|终于)?(?:绑定|拥有|打开|点开|开启|唤出|调用|使用|操控|激活|从|通过|按照|遵循)[^，,。！？]{0,12}(?:系统|面板)/);
     if (ownerBeforeSystem) return ownerBeforeSystem[1].trim();
     const ownerBecomesHost = sentence.match(/^([^，,。！？：:]{1,24}?)(?:成为|被选为|是)[^，,。！？]{0,14}(?:系统(?:的)?|面板(?:的)?)?宿主/);
@@ -206,10 +218,18 @@ function hasProtagonistSystemInteraction(
   const systemBeforeNamedHero = new RegExp(`(?:系统|面板)[^。！？\\n]{0,18}(?:绑定|选择|认定|给|向|为|替|在|提示|通知|恭喜)[^。！？\\n]{0,12}${namedProtagonist}`);
   const namedHeroMention = new RegExp(namedProtagonist);
   const previousSentenceClearlyNamesProtagonist = new RegExp(`^(?:${protagonistOwnerNames.map(escapeRegExp).join("|")})(?!的)`);
-  const implicitViewpointUse = /^(?:(?:他|她|其|当场|随即|立刻|立即|径直|直接)[，,]?)?(?:点开|开启|操控|从|通过|按照|遵循|激活|唤出)[^。！？\n]{0,14}(?:系统|面板)/;
+  const implicitViewpointUse = /^(?:(?:他|她|其)[，,]?)?(?:(?:习惯性|本能地?|下意识|当场|随即|立刻|立即|径直|直接)[，,]?)?(?:默念|呼唤|唤醒|打开|点开|开启|操控|从|通过|按照|遵循|激活|唤出|签到|领取|调用|使用)[^。！？\n]{0,14}(?:系统|面板)/;
+  const implicitActorReference = /^(?:他|她|其)/;
+  const namedHeroSystemAssociation = new RegExp(
+    `(?:${namedProtagonist}[^。！？\\n]{0,64}(?:系统|面板)|(?:系统|面板)[^。！？\\n]{0,64}(?:${namedProtagonist}|宿主[：:]?${namedProtagonist}))`,
+  );
+  const systemFeedbackOrPayoff = /(?:系统|面板)[^。！？\n]{0,32}(?:提示|反馈|签到成功|绑定成功|领取成功|奖励|礼包|权限|修为|能力|任务|到账|生效|开放|解锁|发放|结算)|(?:签到|绑定|领取|奖励|礼包|权限|修为|能力|任务)[^。！？\n]{0,20}(?:成功|到账|生效|开放|解锁|发放|结算)/;
   let nonProtagonistHostActive = false;
+  let recentProtagonistSystemContext = 0;
   let previousSentence = "";
-  for (const sentence of content.split(/[。！？\n]/).filter(Boolean)) {
+  for (const rawSentence of content.split(/[。！？\n]/).filter(Boolean)) {
+    const sentence = rawSentence.replace(/^[\s】》」』”’"'）)\]]+/, "");
+    if (!sentence) continue;
     const declaredOwner = extractDeclaredOwner(sentence);
     let ownerIsProtagonist: boolean | undefined;
     if (declaredOwner && declaredOwner !== "宿主") {
@@ -217,24 +237,222 @@ function hasProtagonistSystemInteraction(
         ? previousSentenceClearlyNamesProtagonist.test(previousSentence)
         : normalizedOwnerIsProtagonist(declaredOwner);
       nonProtagonistHostActive = !ownerIsProtagonist;
+      if (ownerIsProtagonist === false) recentProtagonistSystemContext = 0;
     }
     const explicitlyBoundToNamedHero = namedHeroBeforeSystem.test(sentence) || systemBeforeNamedHero.test(sentence);
     if (explicitlyBoundToNamedHero && ownerIsProtagonist !== false) nonProtagonistHostActive = false;
+    const explicitProtagonistSystemContext = ownerIsProtagonist === true || explicitlyBoundToNamedHero ||
+      (namedHeroSystemAssociation.test(sentence) && ownerIsProtagonist !== false);
+    if (explicitProtagonistSystemContext && !nonProtagonistHostActive) recentProtagonistSystemContext = 3;
     const candidate = usableSignal.test(sentence) &&
       (heroBeforeSystem.test(sentence) || systemBeforeHero.test(sentence));
     const hostOnlyReference = /宿主/.test(sentence) && !namedHeroMention.test(sentence);
-    const implicitCandidate = usableSignal.test(sentence) && implicitViewpointUse.test(sentence);
+    const implicitCandidate = usableSignal.test(sentence) && implicitViewpointUse.test(sentence) &&
+      (!implicitActorReference.test(sentence) ||
+        previousSentenceClearlyNamesProtagonist.test(previousSentence) ||
+        recentProtagonistSystemContext > 0);
     if (
       (candidate || implicitCandidate) && ownerIsProtagonist !== false &&
       !(nonProtagonistHostActive && (hostOnlyReference || implicitCandidate))
     ) return true;
+    if (
+      recentProtagonistSystemContext > 0 && !nonProtagonistHostActive &&
+      systemFeedbackOrPayoff.test(sentence)
+    ) return true;
+    recentProtagonistSystemContext = Math.max(0, recentProtagonistSystemContext - 1);
     previousSentence = sentence;
   }
   return false;
 }
 
 function hasDreamOrHypotheticalCue(text: string): boolean {
-  return /(?:在|于)(?:梦中|梦里|梦境中|梦境里|幻觉中|幻觉里|想象中|想象里|幻想中|幻想里|设想中|模拟中|模拟里|推演中|演算中)|(?:只是|仅是|不过是|原来是)(?:一场)?(?:梦|梦境|幻觉|想象|模拟|推演|演算)|假如|如果|若是/.test(text);
+  return /(?:在|于)(?:梦中|梦里|梦境中|梦境里|幻觉中|幻觉里|想象中|想象里|幻想中|幻想里|设想中|模拟中|模拟里|推演中|演算中|预测中|预演中)|(?:梦境|幻觉|幻想|想象|模拟|推演|演算|预测|预演)(?:画面|场景|结果|影像|中|里)|(?:只是|仅是|不过是|原来是)(?:一场)?(?:梦|梦境|幻觉|想象|模拟|推演|演算|预测|预演)|假如|如果|若是|(?:只要|一旦|除非|倘若|假使|等到|待到)[^。！？\n]{0,64}(?:就|便|才|将|会)|(?:必须|需要|需得)[^。！？\n]{0,64}才/.test(text);
+}
+
+function leadingContentWindow(content: string, ratio: number, minimumNonWhitespaceCharacters: number): string {
+  const totalNonWhitespaceCharacters = content.replace(/\s/g, "").length;
+  const targetCharacters = Math.min(
+    totalNonWhitespaceCharacters,
+    Math.max(minimumNonWhitespaceCharacters, Math.ceil(totalNonWhitespaceCharacters * ratio)),
+  );
+  if (targetCharacters >= totalNonWhitespaceCharacters) return content;
+  let seenCharacters = 0;
+  let endIndex = 0;
+  while (endIndex < content.length && seenCharacters < targetCharacters) {
+    if (!/\s/.test(content[endIndex])) seenCharacters += 1;
+    endIndex += 1;
+  }
+  return content.slice(0, endIndex);
+}
+
+function matchingSignalAnchors(
+  quote: string,
+  axisWord: string,
+  signal: ReadingExperienceSignal,
+): string[] {
+  const normalizedQuote = quote.normalize("NFKC").toLowerCase();
+  const anchors = signal.evidenceAnchors?.length
+    ? signal.evidenceAnchors
+    : deriveSignalEvidenceAnchors(signal.description, axisWord);
+  return Array.from(new Set(anchors
+    .map((anchor) => anchor.normalize("NFKC").toLowerCase())
+    .filter((anchor) => normalizedQuote.includes(anchor))));
+}
+
+function hasAffirmedReversalWithAnchors(text: string, anchors: string[]): boolean {
+  for (const match of text.matchAll(/(?:并非|并不是|不是|并未|没有)[^。！？\n]{0,48}(?:而是|反而)([^。！？\n]+)/g)) {
+    const affirmed = match[1];
+    const affirmedAnchors = anchors.filter((anchor) => affirmed.includes(anchor));
+    if (
+      hasIndependentSignalEvidenceAnchors(affirmedAnchors) &&
+      !hasDreamOrHypotheticalCue(affirmed) &&
+      !/(?:并未|没有|未能|没能|无法|不能|尚未|还没|失败|落空|未发生|未实现|没有成功)/.test(affirmed)
+    ) return true;
+  }
+  return false;
+}
+
+function hasUnrealizedSignalClaim(text: string, anchors: string[]): boolean {
+  if (hasDreamOrHypotheticalCue(text)) return true;
+  if (hasAffirmedReversalWithAnchors(text, anchors)) return false;
+  const escapedAnchors = anchors.map(escapeRegExp);
+  if (escapedAnchors.length === 0) return false;
+  const anchor = `(?:${escapedAnchors.join("|")})`;
+  const unrealizedBefore = new RegExp(
+    `(?:并未|没有|未能|没能|无法|不能|从未|未曾|不曾|尚未|还未|还没|计划|打算|准备|试图|企图|希望|想要|预测|预言|声称|扬言)[^。！？\\n]{0,24}${anchor}`,
+  );
+  const unrealizedAfter = new RegExp(
+    `${anchor}[^。！？\\n]{0,32}(?:并未发生|没有发生|尚未发生|还没发生|未实现|没有实现|尚未实现|没有成功|未能成功|失败|落空|只是(?:模拟|推演|预测|梦境|幻想))`,
+  );
+  if (unrealizedBefore.test(text) || unrealizedAfter.test(text)) return true;
+  return escapedAnchors.some((escapedAnchor) => {
+    for (const match of text.matchAll(new RegExp(escapedAnchor, "g"))) {
+      const prefix = text.slice(Math.max(0, (match.index ?? 0) - 32), match.index ?? 0);
+      if (isNegatedPrefix(prefix)) return true;
+    }
+    return false;
+  });
+}
+
+function modelSignalClaimIsActual(
+  quote: string,
+  axisWord: string,
+  signal: ReadingExperienceSignal,
+): boolean {
+  const anchors = matchingSignalAnchors(quote, axisWord, signal);
+  return hasIndependentSignalEvidenceAnchors(anchors) && !hasUnrealizedSignalClaim(
+    quote.normalize("NFKC").toLowerCase(),
+    anchors,
+  );
+}
+
+function hasActualProtagonistSystemPayoff(
+  content: string,
+  context: ReadingExperienceValidationContext,
+): boolean {
+  const sentences = content
+    .split(/[。！？\n]/)
+    .map((sentence) => sentence.replace(/^[\s】》」』”’"'）)\]]+/, "").trim())
+    .filter(Boolean);
+  const valueTerm = "(?:奖励|能力|功法|体质|修为|权限|神通|血脉|领域|装备|道具|技能|传承|资源|称号)";
+  const durableMarker = "(?:永久|终身|持续|长期|可持续|始终|一直|不会消失|不会失效|不可撤回|不可收回)";
+  const durableBeforeValue = new RegExp(`(${durableMarker})[^。！？\\n]{0,16}${valueTerm}`, "g");
+  const durableAfterValue = new RegExp(`${valueTerm}[^。！？\\n]{0,16}(${durableMarker})`, "g");
+  const hasAffirmedDurableMarker = (span: string, pattern: RegExp) => {
+    for (const match of span.matchAll(pattern)) {
+      const marker = match[1];
+      const markerOffset = match[0].lastIndexOf(marker);
+      const absoluteMarkerIndex = (match.index ?? 0) + markerOffset;
+      const prefix = span.slice(Math.max(0, absoluteMarkerIndex - 40), absoluteMarkerIndex);
+      const localPrefix = prefix.slice(Math.max(
+        prefix.lastIndexOf("，"), prefix.lastIndexOf(","), prefix.lastIndexOf("；"), prefix.lastIndexOf(";"),
+      ) + 1).trim();
+      const explicitNegation = /(?:不是|并非|并不是|绝非|不算|不能算|不属于|并不属于|没有|并无|绝无|不存在)[^，,；;。！？\n]{0,12}$/.test(localPrefix);
+      const affirmativeReversal = /(?:而是|反而|却是|其实是|实际是)[^，,；;。！？\n]{0,8}$/.test(localPrefix);
+      const suffix = span.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 24);
+      const deniedAfterward = /^(?:并不?存在|并非真的|其实只是|却只是|只是(?:临时|暂时|限时)|名义上)/.test(suffix);
+      if (affirmativeReversal || (!isNegatedPrefix(localPrefix) && !explicitNegation && !deniedAfterward)) return true;
+    }
+    return false;
+  };
+  const hasAffirmedDurableValue = (span: string) =>
+    hasAffirmedDurableMarker(span, durableBeforeValue) || hasAffirmedDurableMarker(span, durableAfterValue);
+  const temporaryValue = /(?:临时|暂时|短期|限时|仅限|只能?维持|只可维持|维持[^。！？\n]{0,12}(?:秒|分钟|小时|天|次)|到期[^。！？\n]{0,8}(?:失效|消失|收回)|(?:秒|分钟|小时|天|次)后[^。！？\n]{0,8}(?:失效|消失|收回))/;
+  const actualGrant = /(?:系统|面板)[^。！？\n]{0,40}(?:发放|赋予|结算|解锁|开放|到账|生效|获得|弹出)[^。！？\n]{0,30}(?:奖励|能力|功法|体质|修为|权限|神通|血脉|领域|装备|道具|技能|传承|资源|称号)|(?:奖励|能力|功法|体质|修为|权限|神通|血脉|领域|装备|道具|技能|传承|资源|称号)[^。！？\n]{0,30}(?:已经|已|立即|当场|永久)?(?:发放|到账|生效|解锁|开放|赋予|获得|弹出)/;
+  const protagonist = `(?:${protagonistIdentityPattern(context)}|宿主|他|她)`;
+  const receiveOrUseVerb = "(?:领取|收下|接收|获得|调用|使用|施展|运转|装备|催动|融合|继承|掌握|借助|凭借|依据|按照)";
+  const protagonistReceivesOrUses = new RegExp(
+    `${protagonist}[^，,。！？\\n]{0,24}(?:点击)?${receiveOrUseVerb}[^，,。！？\\n]{0,20}(?:奖励|能力|功法|体质|修为|权限|神通|血脉|领域|装备|道具|技能|传承|资源|称号|它|其|这份)?`,
+  );
+  const omittedSubjectReceivesOrUses = new RegExp(
+    `${protagonistIdentityPattern(context)}[^，,。！？\\n]{0,36}[，,](?:(?:随即|立即|立刻|当场|直接|毫不犹豫)[地的]?)?(?:点击)?${receiveOrUseVerb}`,
+  );
+  const unrealizedGrant = /(?:完成|达成|做到)[^。！？\n]{0,16}(?:后|才)[^。！？\n]{0,12}(?:可以|可|将|会)?(?:获得|领取)|(?:计划|打算|准备|试图|企图|希望|想要|预测)[^。！？\n]{0,24}(?:发放|领取|获得|调用|使用)|(?:奖励|能力|功法|体质|修为|权限)[^。！？\n]{0,16}(?:(?:尚未|还未|还没|并未|没有|未能)(?:发放|到账|生效|领取|获得|解锁|开放)|(?:将会|将要|即将|以后会|未来会)[^。！？\n]{0,10}(?:发放|到账|生效|领取|获得|解锁|开放))/;
+  for (let start = 0; start < sentences.length; start += 1) {
+    for (let end = start; end < Math.min(sentences.length, start + 3); end += 1) {
+      const span = sentences.slice(start, end + 1).join("。");
+      if (
+        hasProtagonistSystemInteraction(span, context) &&
+        hasAffirmedDurableValue(span) && actualGrant.test(span) &&
+        (protagonistReceivesOrUses.test(span) || omittedSubjectReceivesOrUses.test(span)) &&
+        !hasDreamOrHypotheticalCue(span) && !unrealizedGrant.test(span) && !temporaryValue.test(span)
+      ) return true;
+    }
+  }
+  return false;
+}
+
+function hasActualWorldReaction(text: string): boolean {
+  const observerReaction = /(?:围观(?:者|弟子|人群)?|旁观者|众人|在场众人|全场(?:强者|修士|弟子|所有人)?|人群|观众|弟子们|长老们|各方代表|周围路人|路人|行人|群众|街坊|邻居|店员|住户|居民|工作人员)[^。！？\n]{0,36}(震惊|骇然|哗然|噤声|沉默|低头|退开|后退|让路|跪下|跪地|臣服|欢呼|尖叫|改口|不敢|无人敢|确认|承认|逃离|逃散|散开|敬畏|恐惧|发抖|倒吸冷气)/g;
+  const factionReaction = /(?:宗门|家族|势力|公会|学院|官方|军方|执法队|管理局|帮派|城主府|商会|敌方)[^。！？\n]{0,40}(撤回|撤销|改令|谈判|招揽|承认|归还|退让|让步|投降|臣服|通报|重新评估|连夜修改|放弃)/g;
+  const resourceReaction = /(?:资源|灵石|药材|仓库|领地|资产|战利品|宝物|财产|积分|修为|法宝|能力|权限)[^。！？\n]{0,32}(归还|返还|到账|开放|解锁|转移|交出|收回|接管|重新分配|恢复|失效|冻结|归零|解除|封禁)|(归还|返还|交出|接管|重新分配)[^。！？\n]{0,24}(?:资源|灵石|药材|仓库|领地|资产|战利品|宝物|财产|积分|修为|法宝|能力|权限)/g;
+  const identityReaction = /(?:身份|地位|声望|排名|称号|职位|资格|管辖权)[^。！？\n]{0,30}(提升|确立|得到承认|改为|晋升|获得|生效|恢复|取消|归零)/g;
+  const orderReaction = /(?:秩序|规则|禁令|命令|制度|规矩|封锁|通缉)[^。！？\n]{0,30}(改写|废除|解除|失效|重订|生效|改变|撤销|打破|重建|修改)/g;
+  const hasAffirmedReaction = (sentence: string, pattern: RegExp) => {
+    for (const match of sentence.matchAll(pattern)) {
+      const term = match.slice(1).find((value): value is string => typeof value === "string" && value.length > 0);
+      if (!term) continue;
+      const termOffset = match[0].lastIndexOf(term);
+      const absoluteTermIndex = (match.index ?? 0) + termOffset;
+      const prefix = sentence.slice(Math.max(0, absoluteTermIndex - 24), absoluteTermIndex);
+      const localPrefix = prefix.slice(Math.max(
+        prefix.lastIndexOf("，"), prefix.lastIndexOf(","), prefix.lastIndexOf("；"), prefix.lastIndexOf(";"),
+      ) + 1).trim();
+      const looselyNegated = /(?:不|并不|并未|没有|没|未曾|不曾|从未|尚未|还未|还没|拒绝|不肯)[^，,；;。！？\n]{0,10}$/.test(localPrefix);
+      const affirmativeDoubleNegative = /(?:无不|无一(?:人|名|个)?不|没有(?:一人|一名|一个|任何人)?不|没人不|不得不)$/.test(localPrefix);
+      if (affirmativeDoubleNegative || (!isNegatedPrefix(localPrefix) && !looselyNegated)) return true;
+    }
+    return false;
+  };
+  return text.split(/[。！？\n]/).filter(Boolean).some((sentence) => {
+    if (hasDreamOrHypotheticalCue(sentence)) return false;
+    if (/(?:计划|打算|准备|试图|企图|希望|想要|预测|声称|扬言)[^。！？\n]{0,30}(?:低头|退开|后退|让路|跪下|臣服|撤回|撤销|谈判|归还|接管|改写|废除|解除|修改)|(?:尚未|还未|还没|并未|没有任何人)[^。！？\n]{0,18}(?:行动|回应|反应|低头|让路)/.test(sentence)) return false;
+    return hasAffirmedReaction(sentence, observerReaction) || hasAffirmedReaction(sentence, factionReaction) ||
+      hasAffirmedReaction(sentence, resourceReaction) || hasAffirmedReaction(sentence, identityReaction) ||
+      hasAffirmedReaction(sentence, orderReaction);
+  });
+}
+
+function hasDominantVictoryWithImmediateReaction(
+  content: string,
+  context: ReadingExperienceValidationContext,
+): boolean {
+  const paragraphs = content.split(/\n+/).map((paragraph) => paragraph.trim()).filter(Boolean);
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
+    const paragraph = paragraphs[paragraphIndex];
+    const sentenceUnits = [...paragraph.matchAll(/[^。！？]+[。！？]?/g)];
+    for (let sentenceIndex = 0; sentenceIndex < sentenceUnits.length; sentenceIndex += 1) {
+      for (let endIndex = sentenceIndex; endIndex < Math.min(sentenceUnits.length, sentenceIndex + 2); endIndex += 1) {
+        const start = sentenceUnits[sentenceIndex].index ?? 0;
+        const endMatch = sentenceUnits[endIndex];
+        const end = (endMatch.index ?? 0) + endMatch[0].length;
+        if (!hasDominantProtagonistVictory(paragraph.slice(start, end), context)) continue;
+        const immediateText = [paragraph.slice(start), paragraphs[paragraphIndex + 1] ?? ""].filter(Boolean).join("\n");
+        if (hasActualWorldReaction(immediateText)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 function hasDominantProtagonistVictory(
@@ -243,21 +461,31 @@ function hasDominantProtagonistVictory(
 ): boolean {
   const subject = protagonistActorPattern(context);
   const sentence = "[^。！？\\n]";
-  const decisiveAction = "(?:一击|一招|一掌|一拳|一剑|一刀|一脚|一巴掌|一指|一眼|抬手|弹指|挥手|挥袖|屈指|随手|碾压|横推|秒杀)";
-  const decisiveResult = "(?:击败|镇压|轰飞|横飞|斩杀|结束|倒飞|崩碎|崩散|熄灭|跪下|撞碎|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住|认输|爬不起来|无法反抗|毫无还手之力|连第二招都无法抬起)";
-  const opponent = "(?:敌人|对手|反派|强者|魔头|来敌|来援者|施术者|长老|宗主|全场|所有人|那人|对方)";
-  const actionPattern = new RegExp(`(${subject})(${sentence}{0,32}?)(${decisiveAction})(${sentence}{0,36}(?:。${sentence}{0,36})?)(${decisiveResult})`, "g");
+  const decisiveAction = "(?:一击|一招|一掌|一拳|一剑|一刀|一脚|一巴掌|一指|一眼|右拳|轰出|抬手|抬了抬手|抬起手指|抬起一指|抬起一只手|单手压下|反手挥出|挥出|弹指|挥手|挥掌|拍掌|挥袖|屈指|随手|打了个响指|打响指|一步踏出|目光一扫|轻轻一按|念头一动|碾压|横推|秒杀)";
+  const decisiveResult = "(?:击败|镇压|轰飞|横飞|斩杀|结束|倒飞|贯穿|洞穿|打穿|吞没|吞噬|湮灭|化为虚无|化作虚无|彻底消失|崩碎|崩散|崩解|碎裂|熄灭|跪下|跪地|跪伏|跪倒|压跪|双膝砸地|撞碎|砸进|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住|认输|昏死|动弹不得|失去战力|吐血倒地|碾碎|压碎|碾成碎末|碾成黑灰|化为飞灰|化成飞灰|炸成碎片|轰成碎片|爆成碎片|灰飞烟灭|爆成血雾|爬不起来|无法反抗|毫无反抗之力|毫无反抗余地|毫无还手之力|连第二招都无法抬起)";
+  const opponent = "(?:敌人|对手|反派|强者|魔头|来敌|来援者|施术者|长老|宗主|帮主|副帮主|教主|护法|执事|统领|队长|首领|修士|魔修|杀手|刺客|特工|觉醒者|异能者|武者|武装人员|打手|歹徒|纵火者|绑匪|猎杀者|守卫|守军|敌军|士兵|黑衣人|壮汉|怪物|异兽|魔物|巨兽|兽潮|变异(?:犬|兽|怪物|生物|蜥蜴|巨兽|虫|体)|甲虫|巨蜥|石像鬼|巨熊|妖兽|凶兽|全场|所有人|那人|对方)";
+  const actionPattern = new RegExp(`(${subject})(${sentence}{0,32}?)(${decisiveAction})(${sentence}{0,36})(${decisiveResult})`, "g");
   const directVictoryPattern = new RegExp(`(${subject})(${sentence}{0,28}?)(?:碾压|横推|秒杀|击败|镇压|斩杀|轰飞|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住)(?:了|掉)?${sentence}{0,12}${opponent}`, "g");
-  const causativeVictoryPattern = new RegExp(`(${subject})${sentence}{0,20}(?:让|令|逼得)${sentence}{0,8}${opponent}${sentence}{0,12}(?:无法反抗|毫无还手之力|跪下|认输|倒地不起)`, "g");
+  const causativeVictoryPattern = new RegExp(`(${subject})${sentence}{0,20}(?:让|令|逼得)${sentence}{0,8}${opponent}${sentence}{0,12}(?:无法反抗|毫无反抗之力|毫无还手之力|跪下|跪地|认输|倒地不起)`, "g");
+  const crossSentenceVictoryPattern = new RegExp(
+    `(${subject})(${sentence}{0,32}?)(${decisiveAction})${sentence}{0,24}[。！？](${sentence}{0,10}${opponent}${sentence}{0,12}(?:便|就|当场|直接|随即|已经|已)${sentence}{0,18}${decisiveResult})`,
+    "g",
+  );
   const unrealizedCue = new RegExp(`(?:扬言|发誓|声称|宣称|自称|说自己|表示自己|认为自己|相信自己|希望|想要|正要|准备|打算|计划|试图|企图|自己会|他会|她会|必会|终会|迟早会|一定会|将会|将要|即将|若|如果|一旦)${sentence}{0,24}(?:${decisiveAction}|${decisiveResult}|碾压|横推|秒杀)`);
   const unfinishedConflict = /(?:战斗|交手|冲突|对决)[^。！？\n]{0,12}(?:还没|尚未|并未|没有)[^。！？\n]{0,8}(?:开始|发生|结束)/;
-  const opponentTookOver = /(?:看着|看到|目睹|望着|确认|发现|听见|听到)[^，；。！？]{0,14}(?:敌人|对手|反派|强者|长老|宗主)|(?:敌人|对手|反派|强者|长老|宗主)(?:只|便|就|竟|突然|当场|直接|用|以|一招|一击|一掌)/;
+  const opponentTookOver = new RegExp(
+    `(?:看着|看到|目睹|望着|确认|发现|听见|听到)[^，,；;。！？]{0,14}${opponent}[^，,；;。！？]{0,8}$|(?:^|[，,；;])${opponent}(?:只|便|就|竟|突然|当场|直接|用|以|一招|一击|一掌)[^，,；;。！？]{0,8}$`,
+  );
   const conflictTarget = new RegExp(`${opponent}|(?:敌方|敌阵|来袭|攻击|攻势|杀招|杀阵|阵法|威压|法则|剑气|刀光|拳罡|巨印|护体法宝)`);
   const negatedOrNearMiss = /(?:没能|未能|没有|并未|并没有|未曾|不曾|无法|不能|差点|险些|几乎|本可以|本可|原可以|原可)[^。！？\n]{0,18}(?:一击|一招|一掌|一拳|一剑|一刀|一脚|击败|镇压|轰飞|斩杀|碾压|横推|秒杀)|(?:一击|一招|一掌|一拳|一剑|一刀|一脚)[^。！？\n]{0,8}(?:没能|未能|没有|并未|并没有|未曾|不曾|无法|不能)[^。！？\n]{0,8}(?:击败|镇压|轰飞|斩杀|碾压|横推|秒杀)/;
   const reversedOrSimulatedOutcome = /(?:但|却|反而|最终|随后|其实)[^。！？\n]{0,24}(?:没有出手|并未出手|未曾出手|只能逃|转身逃|被[^。！？\n]{0,10}逼退|毫发无损|胜负未分|无事发生)|(?:画面|场景|结果|胜利)[^。！？\n]{0,14}(?:只是|仅是|不过是|原来是|属于)(?:系统)?(?:模拟|演算|预测|推演|幻觉|梦境|想象)|(?:只是|仅是|不过是)(?:系统)?(?:模拟|演算|预测|推演)/;
-  const delegatedVictory = new RegExp(`${subject}[^。！？\\n]{0,16}(?:看着|看到|目睹|望着|命令|吩咐|让|请来?|躲在|藏在)[^。！？\\n]{1,24}${decisiveAction}`);
+  const delegatedActor = "(?:师父|师尊|师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡|高手)";
+  const delegatedVictory = new RegExp(
+    `${subject}[^。！？\\n]{0,16}(?:(?:看着|看到|目睹|望着)[^。！？\\n]{0,18}${delegatedActor}[^，,；;。！？\\n]{0,8}${decisiveAction}|(?:命令|吩咐|让|请来?|躲在|藏在)[^。！？\\n]{0,18}${delegatedActor}[^。！？\\n]{0,10}${decisiveAction})`,
+  );
   const protagonistReclaimsAction = new RegExp(`(?:自己|亲自|本人)[^。！？\\n]{0,6}${decisiveAction}`);
   const nonProtagonistActorBeforeAction = /(?:的)?(?:师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡)[^。！？\n]{0,10}$/;
+  const delegatedCrossSentenceResult = /(?:被|由)?(?:师父|师尊|师弟|师兄|师姐|师妹|徒弟|弟子|父亲|母亲|兄长|弟弟|妹妹|同伴|朋友|护卫|手下|宠物|分身|傀儡|高手)[^。！？\n]{0,12}(?:击败|镇压|轰飞|斩杀|打趴|点杀|秒杀|拍死|劈死|打倒|震退|踩住)/;
   const validMatch = (match: RegExpMatchArray, preAction = "", requireConflictTarget = false) => {
     const index = match.index ?? 0;
     const surrounding = content.slice(Math.max(0, index - 18), index + match[0].length + 40);
@@ -269,7 +497,10 @@ function hasDominantProtagonistVictory(
   };
   return [...content.matchAll(actionPattern)].some((match) => validMatch(match, match[2] ?? "", true)) ||
     [...content.matchAll(directVictoryPattern)].some((match) => validMatch(match, match[2] ?? "")) ||
-    [...content.matchAll(causativeVictoryPattern)].some((match) => validMatch(match));
+    [...content.matchAll(causativeVictoryPattern)].some((match) => validMatch(match)) ||
+    [...content.matchAll(crossSentenceVictoryPattern)].some((match) =>
+      validMatch(match, match[2] ?? "", true) && !delegatedCrossSentenceResult.test(match[4] ?? ""),
+    );
 }
 
 function hasActualHeroReverseDefeat(content: string, pattern: RegExp): boolean {
@@ -460,6 +691,18 @@ export function assertPersistentExperienceFacts(
   ) {
     throw new Error("开篇没有返回可由第二章继续使用的正文状态事实，已拒绝发布。");
   }
+  const containsUnrealizedModelSignal = facts.some((fact) => contract.axes.some((axis) =>
+    axis.observableSignals
+      .filter((signal) => signal.id.includes("_model_signal_"))
+      .some((signal) => {
+        const anchors = matchingSignalAnchors(fact, axis.word, signal);
+        return hasIndependentSignalEvidenceAnchors(anchors) &&
+          !modelSignalClaimIsActual(fact, axis.word, signal);
+      }),
+  ));
+  if (containsUnrealizedModelSignal) {
+    throw new Error("开篇状态事实把否定、计划、尝试或假想中的体验动作当成真实结果，已拒绝发布。");
+  }
   if (
     contract.sourceWords.includes("系统") &&
     !facts.some((fact) =>
@@ -482,15 +725,98 @@ function quoteSupportsClaimedModelSignal(
   axisWord: string,
   signals: ReadingExperienceSignal[],
 ): boolean {
-  const normalizedQuote = quote.normalize("NFKC").toLowerCase();
-  return signals.some((signal) => {
-    const anchors = signal.evidenceAnchors?.length
-      ? signal.evidenceAnchors
-      : deriveSignalEvidenceAnchors(signal.description, axisWord);
-    const matches = Array.from(new Set(anchors
-      .map((anchor) => anchor.normalize("NFKC").toLowerCase())
-      .filter((anchor) => normalizedQuote.includes(anchor))));
-    return hasIndependentSignalEvidenceAnchors(matches);
+  return signals.some((signal) => modelSignalClaimIsActual(quote, axisWord, signal));
+}
+
+function evidenceQuoteCandidates(content: string): string[] {
+  const candidates = new Set<string>();
+  const addCandidate = (value: string) => {
+    const candidate = value.trim();
+    const length = Array.from(candidate).length;
+    if (length >= 8 && length <= 300) candidates.add(candidate);
+  };
+  for (const pattern of [/[^，,；;。！？!?\n]+/g, /[^。！？!?\n]+/g, /[^\n]+/g]) {
+    for (const match of content.matchAll(pattern)) {
+      addCandidate(match[0]);
+    }
+  }
+  const sentenceUnits = [...content.matchAll(/[^。！？!?\n]+[。！？!?]?/g)].map((match) => ({
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+  for (let startIndex = 0; startIndex < sentenceUnits.length; startIndex += 1) {
+    for (let endIndex = startIndex + 1; endIndex < Math.min(sentenceUnits.length, startIndex + 3); endIndex += 1) {
+      const previous = sentenceUnits[endIndex - 1];
+      const current = sentenceUnits[endIndex];
+      if (content.slice(previous.end, current.start).includes("\n")) break;
+      const span = content.slice(sentenceUnits[startIndex].start, current.end);
+      if (Array.from(span.trim()).length > 300) break;
+      addCandidate(span);
+    }
+  }
+  return [...candidates];
+}
+
+function quoteSimilarity(left: string, right: string): number {
+  const normalize = (value: string) => Array.from(value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, ""));
+  const leftCharacters = normalize(left);
+  const rightCharacters = normalize(right);
+  const ngrams = (characters: string[]) => {
+    const result = new Set<string>();
+    for (let index = 0; index < characters.length - 1; index += 1) {
+      result.add(`${characters[index]}${characters[index + 1]}`);
+    }
+    return result;
+  };
+  const leftNgrams = ngrams(leftCharacters);
+  const rightNgrams = ngrams(rightCharacters);
+  const sharedNgrams = [...leftNgrams].filter((value) => rightNgrams.has(value)).length;
+  const rightSet = new Set(rightCharacters);
+  const sharedCharacters = new Set(leftCharacters.filter((value) => rightSet.has(value))).size;
+  return sharedNgrams * 4 + sharedCharacters;
+}
+
+export function groundReadingExperienceEvidence(
+  contract: ReadingExperienceContract,
+  content: string,
+  evidence: ReadingExperienceEvidence[] | undefined,
+  context: ReadingExperienceValidationContext = {},
+): ReadingExperienceEvidence[] {
+  const supplied = evidence ?? [];
+  const candidates = evidenceQuoteCandidates(content);
+  const usedQuotes = new Set<string>();
+  return supplied.map((item) => {
+    const originalQuote = typeof item.quote === "string" ? item.quote.trim() : "";
+    const axis = contract.axes.find((candidate) => candidate.id === item.axisId && candidate.word === item.word);
+    if (!axis) return item;
+    const claimedModelSignals = axis.observableSignals.filter((signal) =>
+      signal.id.includes("_model_signal_") && item.signalIds.includes(signal.id),
+    );
+    const semanticallySupportsAxis = (candidate: string) =>
+      (claimedModelSignals.length === 0 || quoteSupportsClaimedModelSignal(
+        candidate,
+        axis.word,
+        claimedModelSignals,
+      )) &&
+      (axis.word !== "系统" || hasProtagonistSystemInteraction(candidate, context)) &&
+      (axis.word !== "无敌" || hasDominantProtagonistVictory(candidate, context));
+    if (
+      Array.from(originalQuote).length >= 8 && content.includes(originalQuote) &&
+      semanticallySupportsAxis(originalQuote)
+    ) {
+      usedQuotes.add(originalQuote);
+      return { ...item, quote: originalQuote };
+    }
+    const replacement = candidates
+      .filter((candidate) => !usedQuotes.has(candidate))
+      .filter(semanticallySupportsAxis)
+      .sort((left, right) =>
+        Array.from(left).length - Array.from(right).length ||
+        quoteSimilarity(right, originalQuote) - quoteSimilarity(left, originalQuote),
+      )[0];
+    if (!replacement) return item;
+    usedQuotes.add(replacement);
+    return { ...item, quote: replacement };
   });
 }
 
@@ -529,7 +855,7 @@ export function assertReadingExperienceEvidence(
       const claimedModelSignals = axis.observableSignals
         .filter((signal) => modelSignalIds.includes(signal.id) && axisEvidence.signalIds.includes(signal.id))
       if (!quoteSupportsClaimedModelSignal(quote, axis.word, claimedModelSignals)) {
-        throw new Error(`阅读体验轴“${axis.word}”的证据原句没有兑现所申报模型信号中的具体行动语义，已阻止发布。`);
+        throw new Error(`阅读体验轴“${axis.word}”的证据原句没有实际兑现所申报模型信号中的具体行动语义，已阻止发布。`);
       }
       if (quote.includes(axis.word) && usesExperienceWordAsLiteralLabel(quote, axis.word)) {
         throw new Error(`阅读体验轴“${axis.word}”只作为字样或标签出现，没有兑现语义，已阻止发布。`);
@@ -560,29 +886,50 @@ export function assertReadingExperienceEvidence(
     throw new Error("两个自定义阅读体验必须分别提供语义明确的正文证据，不能复用同一句泛化动作。");
   }
 
+  assertReadingExperienceContent(contract, content, context);
   if (contract.sourceWords.includes("系统")) {
     const systemEvidence = supplied.find((item) => item.axisId === contract.axes.find((axis) => axis.word === "系统")?.id);
-    if (
-      !hasProtagonistSystemInteraction(content, context) ||
-      !systemEvidence || !hasProtagonistSystemInteraction(systemEvidence.quote, context)
-    ) {
+    if (!systemEvidence || !hasProtagonistSystemInteraction(systemEvidence.quote, context)) {
       throw new Error("正文没有出现归属于主角且真实可操作的系统交互，已阻止发布。");
-    }
-    if (context.opening) {
-      const compact = content.replace(/\s/g, "");
-      const openingSlice = compact.slice(0, Math.max(120, Math.ceil(compact.length * 0.15)));
-      if (!hasProtagonistSystemInteraction(openingSlice, context)) {
-        throw new Error("第一章前 15% 没有兑现真实系统交互，已阻止发布。");
-      }
     }
   }
   if (contract.sourceWords.includes("无敌")) {
     const invincibleEvidence = supplied.find((item) => item.axisId === contract.axes.find((axis) => axis.word === "无敌")?.id);
-    if (
-      !hasDominantProtagonistVictory(content, context) ||
-      !invincibleEvidence || !hasDominantProtagonistVictory(invincibleEvidence.quote, context)
-    ) {
+    if (!invincibleEvidence || !hasDominantProtagonistVictory(invincibleEvidence.quote, context)) {
       throw new Error("正文没有兑现由主角完成的“无敌”压倒性胜利，已阻止发布。");
+    }
+  }
+}
+
+export function assertReadingExperienceContent(
+  contract: ReadingExperienceContract,
+  content: string,
+  context: ReadingExperienceValidationContext = {},
+): void {
+  assertReadingExperienceNegativeInvariants(contract, content, context);
+  if (contract.sourceWords.includes("系统")) {
+    if (!hasProtagonistSystemInteraction(content, context)) {
+      throw new Error("正文没有出现归属于主角且真实可操作的系统交互，已阻止发布。");
+    }
+    if (context.opening) {
+      const openingSlice = leadingContentWindow(content, 0.15, 240);
+      if (!hasActualProtagonistSystemPayoff(openingSlice, context)) {
+        throw new Error("第一章前 15% 没有由系统实际发放可持续奖励、能力或权限并让主角本人领取、调用或使用，已阻止发布。");
+      }
+    }
+  }
+  if (contract.sourceWords.includes("无敌")) {
+    if (!hasDominantProtagonistVictory(content, context)) {
+      throw new Error("正文没有兑现由主角完成的“无敌”压倒性胜利，已阻止发布。");
+    }
+    if (context.opening && !hasDominantVictoryWithImmediateReaction(content, context)) {
+      throw new Error("第一章的压倒性胜利后没有在同段或下一段出现旁观者、势力、资源、身份或秩序的即时实际反应，已阻止发布。");
+    }
+    if (
+      context.opening &&
+      !hasDominantVictoryWithImmediateReaction(leadingContentWindow(content, 0.15, 240), context)
+    ) {
+      throw new Error("第一章前 15% 没有完成由主角主导的压倒性胜利及其即时现实反应，已阻止发布。");
     }
   }
 }
@@ -1299,7 +1646,7 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
     `金色的系统面板在${lead}眼前展开，上一场胜利获得的修为、功法权限与势力声望全部保留，没有一项衰减。【既有状态：${persistedSystemState}】新的状态提示紧跟着亮起：【检测到外部势力越界施压。可选目标：解除压迫、接管资源、重订规则。完成任意一项即可获得世界权限。】面板下方还逐项列出已经生效的长期状态，昨日得到帮助的人、已经归还的资源和被改写的权限都在现实中保持原样。${lead}随手关闭不需要的提示，只留下与眼前行动直接相关的三项信息。`,
     `${plan.selected.event}。起因已经由系统标得清清楚楚：${plan.selected.cause}。${lead}没有把任务当成束缚，而是先看奖励能为身边的人解决什么；确认选择以后，系统立刻开放相关地图、敌方状态和可调动资源，把决定权完整留给宿主。`,
     `挡在前方的人试图用身份压住现场，随后又展示足以让寻常修士绝望的境界。${lead}只看了一眼，系统便完成对比：【敌方综合强度不足宿主亿万分之一，不构成威胁。】这不是鼓励，也不是夸张的口号，而是一份即将由结果证明的力量差距。`,
-    `对方率先出手，灵力化作遮蔽半座山门的巨印。${lead}没有后退，独自抬手向前一推。巨印从中心无声崩散，施术者的护体法宝与身后阵旗同时熄灭，浩大的攻势连他脚下的一粒尘土都没能吹动。`,
+    `对方率先出手，灵力化作遮蔽半座山门的巨印。${lead}没有后退，独自抬手向前一推，巨印从中心无声崩散，施术者的护体法宝与身后阵旗同时熄灭，浩大的攻势连他脚下的一粒尘土都没能吹动。`,
     `${lead}随后踏出一步。没有拉扯数百回合，压向众人的威压便被反向镇回施术者身上。那人双膝撞碎石板，连第二招都无法抬起。围观者终于确认，所谓上宗强者与${lead}之间不是略逊一筹，而是根本不存在可以交手的资格。`,
     `【压倒性胜利成立。奖励：目标势力全部资源合法接管；奖励：指定友方境界提升；奖励：敌方功法自动解析至圆满。】系统提示落下的同时，封锁仓库的禁制自行开启，被扣押的灵石和药材按原主人姓名飞出，一件不少地回到众人手中。`,
     `${lead}没有让胜利停在打倒一个人。他调出势力面板，把侵吞记录、受益者和受害者公开投在半空，命令仍掌权的人当场选择：归还资源并接受新规则，或失去继续利用这套秩序的资格。曾经只能沉默的人第一次拥有了能够真正使用的证据和力量。`,

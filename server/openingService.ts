@@ -19,6 +19,12 @@ import { createStory } from "./storyService";
 import { generateStoryOpeningWithConnection } from "./modelGateway";
 import { safetyCategories } from "./safetyService";
 import { normalizeChapterTitle } from "./narrationPolicy";
+import {
+  OPENING_CHAPTER_MAX_CHARACTERS,
+  OPENING_CHAPTER_MIN_CHARACTERS,
+  openingChapterCharacterCount,
+  openingChapterLengthIsAllowed,
+} from "./openingConstraints";
 
 export interface OpeningGenerationContext {
   input: CreateStoryInput;
@@ -124,9 +130,11 @@ function validateOpeningResult(
     throw new Error("第一章段落不足或包含空段，已拒绝发布。");
   }
   const content = generated.chapter.paragraphs.join("\n");
-  const characterCount = content.replace(/\s/g, "").length;
-  if (characterCount < 2_400 || characterCount > 4_800) {
-    throw new Error(`第一章字数为 ${characterCount} 字，要求 2400—4800 字，已拒绝发布。`);
+  const characterCount = openingChapterCharacterCount(content);
+  if (!openingChapterLengthIsAllowed(content)) {
+    throw new Error(
+      `第一章字数为 ${characterCount} 字，要求 ${OPENING_CHAPTER_MIN_CHARACTERS}—${OPENING_CHAPTER_MAX_CHARACTERS} 字，已拒绝发布。`,
+    );
   }
   assertImmersiveNarration(normalizeChapterTitle(generated.chapter.title));
   assertImmersiveNarration(content);

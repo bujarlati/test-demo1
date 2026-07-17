@@ -7,8 +7,10 @@ import type { CapabilitySnapshot, EndingContract, ModelConnection, ReadingExperi
 import {
   assertImmersiveNarration,
   assertPersistentExperienceFacts,
+  assertReadingExperienceContent,
   assertReadingExperienceEvidence,
   assertReadingExperienceNegativeInvariants,
+  groundReadingExperienceEvidence,
   storyArcPhase,
   type CandidateDraft,
   type ExtractedChapterState,
@@ -22,6 +24,12 @@ import {
   type ModelExperienceAxisDraft,
 } from "./readingExperience";
 import { IMMERSIVE_NARRATION_PROMPT, normalizeChapterTitle } from "./narrationPolicy";
+import {
+  OPENING_CHAPTER_MAX_CHARACTERS,
+  OPENING_CHAPTER_MIN_CHARACTERS,
+  openingChapterCharacterCount,
+  openingChapterLengthIsAllowed,
+} from "./openingConstraints";
 import {
   assertModelCallTokenBudget,
   CONTINUATION_JOB_TOKEN_BUDGET,
@@ -532,6 +540,10 @@ export type CompletionModelFetcher = (
 export interface CompleteJsonDependencies {
   secretReader?: typeof readSecret;
   modelFetcher?: CompletionModelFetcher;
+  retryDelay?: (milliseconds: number) => Promise<void>;
+  remainingTokens?: number;
+  stage?: string;
+  now?: () => number;
 }
 
 export type JsonModelCompleter = <T>(
@@ -541,6 +553,7 @@ export type JsonModelCompleter = <T>(
   prompt: string,
   timeout?: number,
   maxTokens?: number,
+  dependencies?: Pick<CompleteJsonDependencies, "remainingTokens" | "stage">,
 ) => Promise<{ value: T; usageTokens: number; usageEstimated: boolean }>;
 
 function estimatedCompletionFailureTokens(system: string, prompt: string, maxTokens: number): number {
@@ -565,6 +578,7 @@ function isSiliconFlowConnection(connection: ModelConnection): boolean {
 }
 
 function streamedCompletionOverallTimeout(timeout: number, maxTokens: number): number {
+  if (maxTokens >= 6_000) return timeout * 5;
   return timeout * (maxTokens >= 4_000 ? 3 : 2);
 }
 
@@ -651,118 +665,204 @@ export async function completeJson<T>(
 ): Promise<{ value: T; usageTokens: number; usageEstimated: boolean }> {
   const secretReader = dependencies.secretReader ?? readSecret;
   const completionFetcher = dependencies.modelFetcher ?? modelFetch;
+  const retryDelay = dependencies.retryDelay ?? ((milliseconds: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const now = dependencies.now ?? Date.now;
   const apiKey = await secretReader(connection.id, connection.secretVersion);
   const streamStructuredResponse = isSiliconFlowConnection(connection) && connection.capabilities?.streaming === true;
+  const useConciseQwenExtractorOutput = isSiliconFlowConnection(connection) &&
+    model === connection.routes.extractor && /^Qwen\/Qwen3(?:[-./]|$)/i.test(model);
   const body: Record<string, unknown> = {
     model,
     messages: [
       { role: "system", content: system },
       { role: "user", content: prompt },
     ],
-    temperature: 0.7,
+    temperature: model === connection.routes.extractor ? 0.2 : 0.7,
     stream: streamStructuredResponse,
     max_tokens: maxTokens,
   };
-  if (connection.capabilities?.jsonSchema && model === connection.routes.writer) {
+  if (useConciseQwenExtractorOutput) body.enable_thinking = false;
+  if (
+    connection.capabilities?.jsonSchema &&
+    (model === connection.routes.writer || useConciseQwenExtractorOutput)
+  ) {
     body.response_format = { type: "json_object" };
   }
   const conservativeFailureTokens = estimatedCompletionFailureTokens(system, prompt, maxTokens);
-  let response: Response;
-  try {
-    response = await completionFetcher(
-      connection,
-      apiKey,
-      "/chat/completions",
-      { method: "POST", body: JSON.stringify(body) },
-      timeout,
-      streamStructuredResponse ? streamedCompletionOverallTimeout(timeout, maxTokens) : timeout,
+  const maximumAttempts = 3;
+  const logicalOverallTimeout = streamStructuredResponse
+    ? streamedCompletionOverallTimeout(timeout, maxTokens)
+    : timeout;
+  const deadlineAt = now() + logicalOverallTimeout;
+  const retryTokenBudget = dependencies.remainingTokens ?? Number.POSITIVE_INFINITY;
+  const retryStage = dependencies.stage ?? `模型 ${model}`;
+  let priorFailureTokens = 0;
+  let priorUsageEstimated = false;
+  const addFailedAttempt = (tokens: number, estimated: boolean) => {
+    priorFailureTokens += Math.max(0, Math.round(tokens));
+    priorUsageEstimated ||= estimated;
+  };
+  const transientTransportFailure = (error: unknown) => {
+    const code = error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+    const reason = error instanceof Error ? error.message : String(error);
+    return /(?:aborted|terminated|premature|socket hang up|ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|UND_ERR_(?:SOCKET|CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT)|network|fetch failed|连接超时|请求超时)/i.test(
+      `${code} ${reason}`,
     );
-  } catch (error) {
-    throw attachModelUsage(error, conservativeFailureTokens, true);
-  }
-  if (!response.ok) {
-    throw attachModelUsage(
-      await providerResponseError(response, `模型 ${model}`, apiKey),
-      conservativeFailureTokens,
-      true,
-    );
-  }
-  let content: string | undefined;
-  let reportedTokens: number | undefined;
-  if (streamStructuredResponse) {
-    let streamedFailureTokens: number | undefined;
+  };
+  const waitBeforeRetry = async (milliseconds: number, failure: unknown) => {
+    if (deadlineAt - now() <= milliseconds) {
+      throw attachModelUsage(failure, priorFailureTokens, priorUsageEstimated);
+    }
     try {
-      const streamed = await readChatCompletionStream(response, {
-        onUsage: (usageTokens) => { streamedFailureTokens = usageTokens; },
+      await retryDelay(milliseconds);
+    } catch (error) {
+      throw attachModelUsage(error, priorFailureTokens, priorUsageEstimated);
+    }
+  };
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    try {
+      assertModelCallTokenBudget({
+        remainingTokens: retryTokenBudget - priorFailureTokens,
+        system,
+        prompt,
+        maxOutputTokens: maxTokens,
+        stage: attempt === 1 ? retryStage : `${retryStage}重试`,
       });
-      content = streamed.content;
-      reportedTokens = streamed.reportedTokens;
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "未知流式响应错误";
+      throw attachModelUsage(error, priorFailureTokens, priorUsageEstimated);
+    }
+    const remainingOverallTimeout = deadlineAt - now();
+    if (remainingOverallTimeout <= 0) {
       throw attachModelUsage(
-        new Error(`模型 ${model} 的流式响应无效：${reason.slice(0, 160)}。`),
-        streamedFailureTokens ?? conservativeFailureTokens,
-        streamedFailureTokens === undefined,
+        new Error(`模型 ${model} 在总时限内没有完成。`),
+        priorFailureTokens,
+        priorUsageEstimated,
       );
     }
-  } else {
-    let payload: {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: { total_tokens?: number };
-    };
+    let response: Response;
     try {
-      payload = (await response.json()) as typeof payload;
+      response = await completionFetcher(
+        connection,
+        apiKey,
+        "/chat/completions",
+        { method: "POST", body: JSON.stringify(body) },
+        Math.max(1, Math.min(timeout, remainingOverallTimeout)),
+        Math.max(1, remainingOverallTimeout),
+      );
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "未知响应错误";
+      addFailedAttempt(conservativeFailureTokens, true);
+      if (attempt < maximumAttempts && transientTransportFailure(error)) {
+        await waitBeforeRetry(attempt === 1 ? 2_000 : 5_000, error);
+        continue;
+      }
+      throw attachModelUsage(error, priorFailureTokens, priorUsageEstimated);
+    }
+    if (!response.ok) {
+      const transientOverload = [429, 502, 503, 504].includes(response.status);
+      const retryAfter = Number(response.headers.get("retry-after"));
+      const delayMilliseconds = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(10_000, Math.max(500, retryAfter * 1_000))
+        : attempt === 1 ? 2_000 : 5_000;
+      const providerError = await providerResponseError(response, `模型 ${model}`, apiKey);
+      addFailedAttempt(conservativeFailureTokens, true);
+      if (transientOverload && attempt < maximumAttempts) {
+        await waitBeforeRetry(delayMilliseconds, providerError);
+        continue;
+      }
+      throw attachModelUsage(providerError, priorFailureTokens, priorUsageEstimated);
+    }
+    let content: string | undefined;
+    let reportedTokens: number | undefined;
+    if (streamStructuredResponse) {
+      let streamedFailureTokens: number | undefined;
+      try {
+        const streamed = await readChatCompletionStream(response, {
+          onUsage: (usageTokens) => { streamedFailureTokens = usageTokens; },
+        });
+        content = streamed.content;
+        reportedTokens = streamed.reportedTokens;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "未知流式响应错误";
+        const failureTokens = streamedFailureTokens ?? conservativeFailureTokens;
+        const failureUsageEstimated = streamedFailureTokens === undefined;
+        addFailedAttempt(failureTokens, failureUsageEstimated);
+        const streamFailure = new Error(`模型 ${model} 的流式响应无效：${reason.slice(0, 160)}。`);
+        if (attempt < maximumAttempts && transientTransportFailure(error)) {
+          await waitBeforeRetry(attempt === 1 ? 2_000 : 5_000, streamFailure);
+          continue;
+        }
+        throw attachModelUsage(streamFailure, priorFailureTokens, priorUsageEstimated);
+      }
+    } else {
+      let payload: {
+        choices?: Array<{ message?: { content?: string } }>;
+        usage?: { total_tokens?: number };
+      };
+      try {
+        payload = (await response.json()) as typeof payload;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "未知响应错误";
+        const invalidResponse = new Error(`模型 ${model} 返回的响应不是有效 JSON：${reason.slice(0, 160)}。`);
+        addFailedAttempt(conservativeFailureTokens, true);
+        if (attempt < maximumAttempts && transientTransportFailure(error)) {
+          await waitBeforeRetry(attempt === 1 ? 2_000 : 5_000, invalidResponse);
+          continue;
+        }
+        throw attachModelUsage(invalidResponse, priorFailureTokens, priorUsageEstimated);
+      }
+      content = payload.choices?.[0]?.message?.content;
+      reportedTokens = reportedCompletionUsage(payload);
+    }
+    const failureTokens = reportedTokens ?? conservativeFailureTokens;
+    const failureUsageEstimated = reportedTokens === undefined;
+    if (typeof content !== "string" || !content.trim()) {
       throw attachModelUsage(
-        new Error(`模型 ${model} 返回的响应不是有效 JSON：${reason.slice(0, 160)}。`),
-        conservativeFailureTokens,
-        true,
+        new Error(`模型 ${model} 没有返回可用内容。`),
+        priorFailureTokens + failureTokens,
+        priorUsageEstimated || failureUsageEstimated,
       );
     }
-    content = payload.choices?.[0]?.message?.content;
-    reportedTokens = reportedCompletionUsage(payload);
-  }
-  const failureTokens = reportedTokens ?? conservativeFailureTokens;
-  const failureUsageEstimated = reportedTokens === undefined;
-  if (typeof content !== "string" || !content.trim()) {
-    throw attachModelUsage(
-      new Error(`模型 ${model} 没有返回可用内容。`),
-      failureTokens,
-      failureUsageEstimated,
-    );
-  }
-  let value: T;
-  try {
-    value = JSON.parse(content) as T;
-  } catch {
-    const match = content.match(/\{[\s\S]*\}/);
-    if (!match) {
-      throw attachModelUsage(
-        new Error(`模型 ${model} 输出不是可修复的 JSON。`),
-        failureTokens,
-        failureUsageEstimated,
-      );
-    }
+    let value: T;
     try {
-      value = JSON.parse(match[0]) as T;
+      value = JSON.parse(content) as T;
     } catch {
-      throw attachModelUsage(
-        new Error(`模型 ${model} 输出不是可修复的 JSON。`),
-        failureTokens,
-        failureUsageEstimated,
-      );
+      const match = content.match(/\{[\s\S]*\}/);
+      if (!match) {
+        throw attachModelUsage(
+          new Error(`模型 ${model} 输出不是可修复的 JSON。`),
+          priorFailureTokens + failureTokens,
+          priorUsageEstimated || failureUsageEstimated,
+        );
+      }
+      try {
+        value = JSON.parse(match[0]) as T;
+      } catch {
+        throw attachModelUsage(
+          new Error(`模型 ${model} 输出不是可修复的 JSON。`),
+          priorFailureTokens + failureTokens,
+          priorUsageEstimated || failureUsageEstimated,
+        );
+      }
     }
-  }
-  return {
-    value,
-    usageTokens: reportedTokens ?? estimateModelCallTokenBudget({
+    const successfulTokens = reportedTokens ?? estimateModelCallTokenBudget({
       system,
       prompt,
       maxOutputTokens: Buffer.byteLength(content, "utf8"),
-    }),
-    usageEstimated: reportedTokens === undefined,
-  };
+    });
+    return {
+      value,
+      usageTokens: priorFailureTokens + successfulTokens,
+      usageEstimated: priorUsageEstimated || reportedTokens === undefined,
+    };
+  }
+  throw attachModelUsage(
+    new Error(`模型 ${model} 连续重试后仍未返回结果。`),
+    priorFailureTokens,
+    priorUsageEstimated,
+  );
 }
 
 export interface OpeningCompletionRequest {
@@ -772,6 +872,8 @@ export interface OpeningCompletionRequest {
   prompt: string;
   timeout: number;
   maxTokens: number;
+  remainingTokens: number;
+  stage: string;
 }
 
 export type OpeningModelCompleter = (
@@ -785,6 +887,7 @@ const defaultOpeningCompleter: OpeningModelCompleter = async (request) => comple
   request.prompt,
   request.timeout,
   request.maxTokens,
+  { remainingTokens: request.remainingTokens, stage: request.stage },
 );
 
 interface OpeningPlanPayload {
@@ -808,36 +911,357 @@ interface OpeningReviewPayload {
   event?: GeneratedStoryOpening["event"];
 }
 
+const openingPlanJsonExample = JSON.stringify({
+  title: "书名",
+  subtitle: "一句话副标题",
+  leadName: "主角姓名",
+  storyGene: {
+    protagonistPosition: "主角的起始身份与处境",
+    visibleGoal: "主角主动追求的外在目标",
+    hiddenNeed: "主角尚未正视的内在需要",
+    conflictEngine: "可持续制造事件的核心冲突机制",
+    recurringCost: "主角每次推进目标都要面对的持续代价",
+    endingShape: "故事最终局面的形态",
+    creativeAxes: ["题材机制", "人物关系", "世界变化"],
+  },
+  endingContract: {
+    targetEnding: "明确的目标结局",
+    characterArc: "主角从开篇到结局的变化",
+    prerequisites: ["结局前必须完成的前置条件"],
+  },
+  worldBible: {
+    organizations: ["至少一个组织"],
+    locations: ["至少一个地点"],
+    abilityBoundaries: ["能力或机制的明确边界"],
+    pointOfView: "近距离第三人称",
+    styleParameters: ["目标清晰、回报及时、冲突有效"],
+  },
+  experienceAxes: [{
+    word: "第一个体验词",
+    interpretation: "由哪些人物行动和事件结果兑现",
+    observableSignals: [{
+      description: "主角启动核心机制完成首次操作，现场资源立即增加",
+      evidenceAnchors: ["启动核心机制", "现场资源立即增加"],
+    }, {
+      description: "主角调动新增资源解决眼前阻碍，周围势力当场改变态度",
+      evidenceAnchors: ["调动新增资源", "周围势力当场改变态度"],
+    }],
+    hardPromises: ["本章必须兑现的承诺"],
+    forbiddenShortcuts: ["禁止的敷衍写法"],
+  }, {
+    word: "第二个体验词",
+    interpretation: "由哪些人物行动和事件结果兑现",
+    observableSignals: [{
+      description: "主角作出关键选择兑现人物体验，同行者立刻调整行动",
+      evidenceAnchors: ["作出关键选择", "同行者立刻调整行动"],
+    }, {
+      description: "主角承担关系风险保护重要对象，对方主动回应并改变方案",
+      evidenceAnchors: ["承担关系风险", "对方主动回应并改变方案"],
+    }],
+    hardPromises: ["本章必须兑现的承诺"],
+    forbiddenShortcuts: ["禁止的敷衍写法"],
+  }],
+  openingBeats: ["首段发生的具体事件", "第一章中段的行动结果", "章末推动下一事件的变化"],
+});
+
+const openingReviewJsonExample = JSON.stringify({
+  experienceEvidence: [{
+    axisId: "primary",
+    word: "第一个体验词",
+    signalIds: ["契约中真实命中的信号 ID"],
+    quote: "从正文逐字复制的连续原句证据",
+  }, {
+    axisId: "secondary",
+    word: "第二个体验词",
+    signalIds: ["契约中真实命中的信号 ID"],
+    quote: "另一条从正文逐字复制的连续原句证据",
+  }],
+  event: {
+    title: "正文事件名称",
+    cause: "正文已经写明的事件原因",
+    outcome: "正文已经写明的事件结果",
+    location: "正文中的具体地点",
+    persistentFacts: ["正文逐字原句事实一", "正文逐字原句事实二"],
+  },
+});
+
+function isOpeningPlanRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isOpeningNonEmptyString(value: unknown, minimumLength = 1): value is string {
+  return typeof value === "string" && value.trim().length >= minimumLength;
+}
+
+function isOpeningStringArray(value: unknown, minimumItems: number, itemMinimumLength = 1): value is string[] {
+  return Array.isArray(value) && value.length >= minimumItems &&
+    value.every((item) => isOpeningNonEmptyString(item, itemMinimumLength));
+}
+
+function isOpeningExperienceAxes(value: unknown): value is ModelExperienceAxisDraft[] {
+  if (!Array.isArray(value) || value.length !== 2) return false;
+  return value.every((entry) => {
+    if (!isOpeningPlanRecord(entry)) return false;
+    if (!isOpeningNonEmptyString(entry.word) || !isOpeningNonEmptyString(entry.interpretation)) return false;
+    if (!Array.isArray(entry.observableSignals) || entry.observableSignals.length < 2) return false;
+    const validSignals = entry.observableSignals.every((signal) => {
+      if (isOpeningNonEmptyString(signal)) return true;
+      return isOpeningPlanRecord(signal) && isOpeningNonEmptyString(signal.description) &&
+        isOpeningStringArray(signal.evidenceAnchors, 2);
+    });
+    return validSignals && isOpeningStringArray(entry.hardPromises, 1) &&
+      Array.isArray(entry.forbiddenShortcuts) && entry.forbiddenShortcuts.every((item) => isOpeningNonEmptyString(item));
+  });
+}
+
+function mergeOpeningPlanSchemaRepair(original: unknown, proposal: unknown): unknown {
+  if (!isOpeningPlanRecord(original) || !isOpeningPlanRecord(proposal)) return proposal;
+  const chooseString = (key: string) => isOpeningNonEmptyString(original[key]) ? original[key] : proposal[key];
+  const mergeSection = (
+    key: string,
+    stringKeys: string[],
+    arrayRules: Array<[key: string, minimumItems: number]>,
+  ) => {
+    const before = isOpeningPlanRecord(original[key]) ? original[key] : {};
+    const after = isOpeningPlanRecord(proposal[key]) ? proposal[key] : {};
+    return Object.fromEntries([
+      ...stringKeys.map((field) => [field, isOpeningNonEmptyString(before[field]) ? before[field] : after[field]]),
+      ...arrayRules.map(([field, minimumItems]) => [
+        field,
+        isOpeningStringArray(before[field], minimumItems) ? before[field] : after[field],
+      ]),
+    ]);
+  };
+  return {
+    title: chooseString("title"),
+    subtitle: chooseString("subtitle"),
+    leadName: chooseString("leadName"),
+    storyGene: mergeSection(
+      "storyGene",
+      ["protagonistPosition", "visibleGoal", "hiddenNeed", "conflictEngine", "recurringCost", "endingShape"],
+      [["creativeAxes", 3]],
+    ),
+    endingContract: mergeSection("endingContract", ["targetEnding", "characterArc"], [["prerequisites", 1]]),
+    worldBible: mergeSection(
+      "worldBible",
+      ["pointOfView"],
+      [["organizations", 1], ["locations", 1], ["abilityBoundaries", 1], ["styleParameters", 1]],
+    ),
+    experienceAxes: isOpeningExperienceAxes(original.experienceAxes) ? original.experienceAxes : proposal.experienceAxes,
+    openingBeats: isOpeningStringArray(original.openingBeats, 2, 4) ? original.openingBeats : proposal.openingBeats,
+  };
+}
+
+function openingPlanSemanticRepairTargets(
+  value: unknown,
+  baseContract: ReadingExperienceContract,
+): string[] {
+  if (!hasOpeningPlanShape(value)) return [];
+  const targets = new Set<string>();
+  try {
+    refineReadingExperienceContract(baseContract, value.experienceAxes);
+  } catch {
+    targets.add("experienceAxes");
+  }
+  const sections: Array<[string, Record<string, unknown>]> = [
+    ["storyGene", value.storyGene as unknown as Record<string, unknown>],
+    ["endingContract", value.endingContract as unknown as Record<string, unknown>],
+    ["worldBible", value.worldBible as unknown as Record<string, unknown>],
+  ];
+  for (const [sectionName, section] of sections) {
+    for (const [field, fieldValue] of Object.entries(section)) {
+      try {
+        assertReadingExperienceNegativeInvariants(
+          baseContract,
+          JSON.stringify({ [sectionName]: { [field]: fieldValue } }),
+          { protagonistNames: [value.leadName] },
+        );
+      } catch {
+        targets.add(`${sectionName}.${field}`);
+      }
+    }
+  }
+  return [...targets];
+}
+
+function mergeOpeningPlanSemanticRepair(original: unknown, proposal: unknown, targets: string[]): unknown {
+  if (!hasOpeningPlanShape(original) || !isOpeningPlanRecord(proposal)) return original;
+  const result: Record<string, unknown> = {
+    title: original.title,
+    subtitle: original.subtitle,
+    leadName: original.leadName,
+    storyGene: { ...original.storyGene },
+    endingContract: { ...original.endingContract },
+    worldBible: { ...original.worldBible },
+    experienceAxes: original.experienceAxes,
+    openingBeats: original.openingBeats,
+  };
+  for (const target of targets) {
+    if (target === "experienceAxes") {
+      result.experienceAxes = proposal.experienceAxes;
+      continue;
+    }
+    const [sectionName, field] = target.split(".");
+    if (!field || !isOpeningPlanRecord(result[sectionName]) || !isOpeningPlanRecord(proposal[sectionName])) continue;
+    (result[sectionName] as Record<string, unknown>)[field] =
+      (proposal[sectionName] as Record<string, unknown>)[field];
+  }
+  return result;
+}
+
+function openingPlanValidationIssues(value: unknown): string[] {
+  if (!isOpeningPlanRecord(value)) return ["根节点必须是 JSON 对象"];
+  const issues: string[] = [];
+  const requireString = (record: Record<string, unknown>, path: string, key: string) => {
+    const field = record[key];
+    if (typeof field !== "string" || !field.trim()) issues.push(`${path} 必须是非空字符串`);
+  };
+  const requireStringArray = (
+    record: Record<string, unknown>,
+    path: string,
+    key: string,
+    minimum: number,
+    itemMinimumLength = 1,
+  ) => {
+    const field = record[key];
+    if (!Array.isArray(field) || field.length < minimum) {
+      issues.push(`${path} 必须是至少 ${minimum} 项的字符串数组`);
+      return;
+    }
+    field.forEach((item, index) => {
+      if (typeof item !== "string" || item.trim().length < itemMinimumLength) {
+        issues.push(`${path}[${index}] 必须是至少 ${itemMinimumLength} 字的字符串`);
+      }
+    });
+  };
+  const requireObject = (key: string): Record<string, unknown> | undefined => {
+    const field = value[key];
+    if (!isOpeningPlanRecord(field)) {
+      issues.push(`${key} 必须是 JSON 对象`);
+      return undefined;
+    }
+    return field;
+  };
+
+  requireString(value, "title", "title");
+  requireString(value, "subtitle", "subtitle");
+  requireString(value, "leadName", "leadName");
+
+  const gene = requireObject("storyGene");
+  if (gene) {
+    for (const key of ["protagonistPosition", "visibleGoal", "hiddenNeed", "conflictEngine", "recurringCost", "endingShape"]) {
+      requireString(gene, `storyGene.${key}`, key);
+    }
+    requireStringArray(gene, "storyGene.creativeAxes", "creativeAxes", 3);
+  }
+
+  const ending = requireObject("endingContract");
+  if (ending) {
+    requireString(ending, "endingContract.targetEnding", "targetEnding");
+    requireString(ending, "endingContract.characterArc", "characterArc");
+    requireStringArray(ending, "endingContract.prerequisites", "prerequisites", 1);
+  }
+
+  const bible = requireObject("worldBible");
+  if (bible) {
+    requireStringArray(bible, "worldBible.organizations", "organizations", 1);
+    requireStringArray(bible, "worldBible.locations", "locations", 1);
+    requireStringArray(bible, "worldBible.abilityBoundaries", "abilityBoundaries", 1);
+    requireString(bible, "worldBible.pointOfView", "pointOfView");
+    requireStringArray(bible, "worldBible.styleParameters", "styleParameters", 1);
+  }
+
+  if (!isOpeningExperienceAxes(value.experienceAxes)) {
+    issues.push("experienceAxes 必须是严格对应两个体验词、且字段完整的 2 项数组");
+  }
+  requireStringArray(value, "openingBeats", "openingBeats", 2, 4);
+  return issues;
+}
+
 function hasOpeningPlanShape(value: unknown): value is Required<OpeningPlanPayload> {
-  if (!value || typeof value !== "object") return false;
-  const plan = value as OpeningPlanPayload;
-  const gene = plan.storyGene;
-  const ending = plan.endingContract;
-  const bible = plan.worldBible;
-  return [plan.title, plan.subtitle, plan.leadName].every((item) => typeof item === "string" && item.trim().length > 0) &&
-    Boolean(gene) && [gene?.protagonistPosition, gene?.visibleGoal, gene?.hiddenNeed, gene?.conflictEngine, gene?.recurringCost, gene?.endingShape]
-      .every((item) => typeof item === "string" && item.trim().length > 0) &&
-    Array.isArray(gene?.creativeAxes) && gene.creativeAxes.length >= 3 && gene.creativeAxes.every((item) => typeof item === "string" && item.trim()) &&
-    Boolean(ending) && [ending?.targetEnding, ending?.characterArc].every((item) => typeof item === "string" && item.trim().length > 0) &&
-    Array.isArray(ending?.prerequisites) && ending.prerequisites.length >= 1 && ending.prerequisites.every((item) => typeof item === "string" && item.trim()) &&
-    Boolean(bible) &&
-    [bible?.organizations, bible?.locations, bible?.abilityBoundaries, bible?.styleParameters]
-      .every((items) => Array.isArray(items) && items.length >= 1 && items.every((item) => typeof item === "string" && item.trim().length > 0)) &&
-    typeof bible?.pointOfView === "string" && bible.pointOfView.trim().length > 0 &&
-    Array.isArray(plan.experienceAxes) && plan.experienceAxes.length === 2 &&
-    Array.isArray(plan.openingBeats) && plan.openingBeats.length >= 2 &&
-    plan.openingBeats.every((item) => typeof item === "string" && item.trim().length >= 4);
+  return openingPlanValidationIssues(value).length === 0;
+}
+
+function openingReviewValidationIssues(value: unknown): string[] {
+  if (!isOpeningPlanRecord(value)) return ["审稿根节点必须是 JSON 对象"];
+  const issues: string[] = [];
+  if (!Array.isArray(value.experienceEvidence) || value.experienceEvidence.length !== 2) {
+    issues.push("experienceEvidence 必须是严格对应两个体验轴的 2 项数组");
+  } else {
+    value.experienceEvidence.forEach((entry, index) => {
+      if (!isOpeningPlanRecord(entry)) {
+        issues.push(`experienceEvidence[${index}] 必须是 JSON 对象`);
+        return;
+      }
+      for (const key of ["axisId", "word", "quote"]) {
+        const field = entry[key];
+        const minimum = key === "quote" ? 8 : 1;
+        if (typeof field !== "string" || field.trim().length < minimum) {
+          issues.push(`experienceEvidence[${index}].${key} 必须是至少 ${minimum} 字的字符串`);
+        }
+      }
+      if (
+        !Array.isArray(entry.signalIds) || entry.signalIds.length < 1 ||
+        entry.signalIds.some((signalId) => typeof signalId !== "string" || !signalId.trim())
+      ) {
+        issues.push(`experienceEvidence[${index}].signalIds 必须是非空字符串数组`);
+      }
+    });
+  }
+  const event = value.event;
+  if (!isOpeningPlanRecord(event)) {
+    issues.push("event 必须是 JSON 对象");
+    return issues;
+  }
+  for (const key of ["title", "cause", "outcome", "location"]) {
+    const field = event[key];
+    if (typeof field !== "string" || field.trim().length < 4) {
+      issues.push(`event.${key} 必须是至少 4 字的字符串`);
+    }
+  }
+  if (
+    !Array.isArray(event.persistentFacts) || event.persistentFacts.length > 8 ||
+    event.persistentFacts.some((fact) => typeof fact !== "string" || fact.trim().length < 8)
+  ) {
+    issues.push("event.persistentFacts 必须是 0—8 条至少 8 字的字符串数组；允许留空后从已验证体验证据补齐");
+  }
+  return issues;
+}
+
+function isOpeningReviewEvidence(value: unknown): boolean {
+  return Array.isArray(value) && value.length === 2 && value.every((entry) =>
+    isOpeningPlanRecord(entry) &&
+    isOpeningNonEmptyString(entry.axisId) &&
+    isOpeningNonEmptyString(entry.word) &&
+    isOpeningNonEmptyString(entry.quote, 8) &&
+    isOpeningStringArray(entry.signalIds, 1),
+  );
+}
+
+function mergeOpeningReviewSchemaRepair(original: unknown, proposal: unknown): unknown {
+  if (!isOpeningPlanRecord(original) || !isOpeningPlanRecord(proposal)) return proposal;
+  const beforeEvent = isOpeningPlanRecord(original.event) ? original.event : {};
+  const afterEvent = isOpeningPlanRecord(proposal.event) ? proposal.event : {};
+  const chooseEventString = (field: string) =>
+    isOpeningNonEmptyString(beforeEvent[field], 4) ? beforeEvent[field] : afterEvent[field];
+  const beforeFactsAreValid = Array.isArray(beforeEvent.persistentFacts) && beforeEvent.persistentFacts.length <= 8 &&
+    beforeEvent.persistentFacts.every((fact) => isOpeningNonEmptyString(fact, 8));
+  return {
+    experienceEvidence: isOpeningReviewEvidence(original.experienceEvidence)
+      ? original.experienceEvidence
+      : proposal.experienceEvidence,
+    event: {
+      title: chooseEventString("title"),
+      cause: chooseEventString("cause"),
+      outcome: chooseEventString("outcome"),
+      location: chooseEventString("location"),
+      persistentFacts: beforeFactsAreValid ? beforeEvent.persistentFacts : afterEvent.persistentFacts,
+    },
+  };
 }
 
 function hasOpeningReviewShape(value: unknown): value is Required<OpeningReviewPayload> {
-  if (!value || typeof value !== "object") return false;
-  const review = value as OpeningReviewPayload;
-  return Array.isArray(review.experienceEvidence) && review.experienceEvidence.length === 2 &&
-    Boolean(review.event) && [review.event?.title, review.event?.cause, review.event?.outcome, review.event?.location]
-      .every((item) => typeof item === "string" && item.trim().length >= 4) &&
-    Array.isArray(review.event?.persistentFacts) && review.event.persistentFacts.length >= 2 &&
-    review.event.persistentFacts.length <= 8 &&
-    review.event.persistentFacts.every((item) => typeof item === "string" && item.trim().length >= 8);
+  return openingReviewValidationIssues(value).length === 0;
 }
 
 export async function generateStoryOpeningWithConnection(
@@ -854,7 +1278,11 @@ export async function generateStoryOpeningWithConnection(
       "把用户给出的两个阅读体验词解释为人物行动、机制、冲突结果、世界反应和语言节奏上的可观察承诺；不得把词语直接贴到景物描写上。",
       "开篇必须先发生具体事件：前 200 字给出主角处境、触发事件和第一个行动；第一章内兑现两个体验，不得承诺以后再写。",
       "不要模仿或点名任何在世作者；使用成熟网文的目标清晰、回报及时、冲突有效和章末推动力等通用技巧。",
-      "JSON 字段：title,subtitle,leadName,storyGene,endingContract,worldBible,experienceAxes,openingBeats。experienceAxes 必须按用户两个词的顺序，每项含 word,interpretation,observableSignals(至少2项对象),hardPromises(至少1项),forbiddenShortcuts。每个 observableSignals 对象含 description 与 evidenceAnchors：evidenceAnchors 给出 2—6 个可自然逐字写入正文的短语，至少分别覆盖一个具体动作和一个对象或结果，短语必须来自 description 本身，禁止只填人物称谓、体验词或“行动/结果”等泛词；对自定义词，解释、信号或硬承诺中必须原样出现该词并说明它如何由行动兑现。",
+      "若体验词包含“系统”，任何蓝图字段都不得把系统故障、拒绝结算、撤回奖励、冻结权限或不可使用当作代价与边界；若包含“无敌”，不得安排封印、削弱、失去力量、势均力敌、落败或他人救场。持续代价必须来自胜利后的世界、资源或关系变化，不能收回核心体验。",
+      "严格按下面的 JSON 结构返回，禁止增加外层包装。storyGene、endingContract、worldBible 必须是 JSON 对象，不能写成字符串；openingBeats 必须是字符串数组，不能写成对象数组。",
+      "下面各字段中的文字只说明数据形状，不是故事内容；必须根据题材、灵感和两个体验词全部改写，禁止照抄示例语句。",
+      openingPlanJsonExample,
+      "experienceAxes 必须按用户两个词的顺序，每项含 word,interpretation,observableSignals(至少2项对象),hardPromises(至少1项),forbiddenShortcuts。每个 observableSignals 对象含 description 与 evidenceAnchors：evidenceAnchors 给出 2—6 个可自然逐字写入正文的短语，至少分别覆盖一个具体动作和一个对象或结果，短语必须来自 description 本身，禁止只填人物称谓、体验词或“行动/结果”等泛词；对自定义词，解释、信号或硬承诺中必须原样出现该词并说明它如何由行动兑现。",
     ].join("\n"),
     prompt: [
       `题材：${context.input.genre}`,
@@ -866,6 +1294,8 @@ export async function generateStoryOpeningWithConnection(
     ].join("\n"),
     timeout: GENERATION_STAGE_TIMEOUT_MS.planner,
     maxTokens: 2_600,
+    remainingTokens: tokenBudget,
+    stage: "开篇规划",
   };
   assertModelCallTokenBudget({
     remainingTokens: tokenBudget,
@@ -875,24 +1305,115 @@ export async function generateStoryOpeningWithConnection(
     stage: "开篇规划",
   });
   const planner = await complete(plannerRequest);
-  if (!hasOpeningPlanShape(planner.value)) {
-    throw attachModelUsage(
-      new Error("规划模型输出未通过开篇蓝图 Schema 校验。"),
-      planner.usageTokens,
-      planner.usageEstimated,
-    );
-  }
-  const plan = planner.value;
-  let contract: ReadingExperienceContract;
-  try {
-    contract = refineReadingExperienceContract(context.contract, plan.experienceAxes);
+  let accumulatedTokens = planner.usageTokens;
+  let usageEstimated = planner.usageEstimated;
+  let planValue = planner.value;
+  let planIssues = openingPlanValidationIssues(planValue);
+  let planRepairCount = 0;
+  const repairPlan = async (
+    issues: string[],
+    mode: "schema" | "semantic",
+    semanticTargets: string[] = [],
+  ): Promise<unknown> => {
+    const repairRequest: OpeningCompletionRequest = {
+      connection,
+      model: connection.routes.extractor,
+      system: [
+        "你是开篇蓝图 JSON 结构修复与硬契约校正器，只返回修复后的 JSON。",
+        "保留原蓝图的书名、人物、机制、事件与体验承诺，只修复指定问题并补齐必填字段；不要写小说正文，不要解释，不要增加外层包装。",
+        "若体验词包含“系统”，删除系统故障、拒绝结算、撤回奖励、冻结权限或不可使用等削弱设定；若包含“无敌”，删除封印、削弱、失去力量、势均力敌、落败或他人救场等冲突。把代价改为胜利后的世界、资源或关系后果，绝不收回核心体验。",
+        "storyGene、endingContract、worldBible 必须是 JSON 对象，openingBeats 必须是字符串数组。严格采用以下结构：",
+        openingPlanJsonExample,
+      ].join("\n"),
+      prompt: [
+        `当前校验问题：${issues.join("；")}`,
+        `两个阅读体验词（顺序不可改变）：${context.contract.sourceWords.join(" · ")}`,
+        `题材：${context.input.genre}`,
+        `原始蓝图：${JSON.stringify(planValue)}`,
+        "逐字段删除或改写所有触发问题的原句，不能只在前面添加否定词，也不能保留违规设定再解释它不会发生；原始蓝图缺少的必填内容，应根据已有语义作最小补齐。",
+      ].join("\n"),
+      timeout: GENERATION_STAGE_TIMEOUT_MS.reviewer,
+      maxTokens: 3_200,
+      remainingTokens: tokenBudget - accumulatedTokens,
+      stage: "开篇蓝图修复",
+    };
+    planRepairCount += 1;
+    try {
+      assertModelCallTokenBudget({
+        remainingTokens: tokenBudget - accumulatedTokens,
+        system: repairRequest.system,
+        prompt: repairRequest.prompt,
+        maxOutputTokens: repairRequest.maxTokens,
+        stage: "开篇蓝图修复",
+      });
+      const repair = await complete(repairRequest);
+      accumulatedTokens += repair.usageTokens;
+      usageEstimated ||= repair.usageEstimated;
+      return mode === "schema"
+        ? mergeOpeningPlanSchemaRepair(planValue, repair.value)
+        : mergeOpeningPlanSemanticRepair(planValue, repair.value, semanticTargets);
+    } catch (error) {
+      throw addModelUsage(error, accumulatedTokens, usageEstimated);
+    }
+  };
+  const interpretPlan = (candidate: unknown) => {
+    if (!hasOpeningPlanShape(candidate)) {
+      throw new Error(`规划模型输出未通过开篇蓝图 Schema 校验：${openingPlanValidationIssues(candidate).join("；")}。`);
+    }
+    const plan = candidate;
+    const contract = refineReadingExperienceContract(context.contract, plan.experienceAxes);
     assertReadingExperienceNegativeInvariants(contract, JSON.stringify({
       storyGene: plan.storyGene,
       endingContract: plan.endingContract,
       worldBible: plan.worldBible,
     }), { protagonistNames: [plan.leadName] });
-  } catch (error) {
-    throw attachModelUsage(error, planner.usageTokens, planner.usageEstimated);
+    return { plan, contract };
+  };
+  let plan!: Required<OpeningPlanPayload>;
+  let contract!: ReadingExperienceContract;
+  const maxPlanRepairs = 2;
+  while (true) {
+    planIssues = openingPlanValidationIssues(planValue);
+    if (planIssues.length > 0) {
+      if (planRepairCount >= maxPlanRepairs) {
+        throw attachModelUsage(
+          new Error(`规划模型输出未通过开篇蓝图 Schema 校验：${planIssues.join("；")}。`),
+          accumulatedTokens,
+          usageEstimated,
+        );
+      }
+      planValue = await repairPlan(planIssues, "schema");
+      continue;
+    }
+    try {
+      ({ plan, contract } = interpretPlan(planValue));
+      break;
+    } catch (error) {
+      const semanticIssue = error instanceof Error ? error.message : "蓝图违反阅读体验硬契约";
+      const semanticTargets = openingPlanSemanticRepairTargets(planValue, context.contract);
+      if (semanticTargets.length === 0) {
+        throw attachModelUsage(error, accumulatedTokens, usageEstimated);
+      }
+      if (planRepairCount >= maxPlanRepairs) {
+        throw attachModelUsage(error, accumulatedTokens, usageEstimated);
+      }
+      planValue = await repairPlan(
+        [`${semanticIssue}；仅允许修复字段：${semanticTargets.join("、")}`],
+        "semantic",
+        semanticTargets,
+      );
+    }
+  }
+  const specializedOpeningInstructions: string[] = [];
+  if (contract.sourceWords.includes("系统")) {
+    specializedOpeningInstructions.push(
+      `系统体验强制前置：第一段前 120 字内，${plan.leadName}本人必须主动触发系统或打开面板，系统必须立即反馈并结算、发放一项永久可用的奖励、权限或能力，${plan.leadName}须在第一段结束前领取或调用它。至少安排一句不超过 100 字的独立原句，在同一句中明确写出${plan.leadName}打开系统面板、系统发放永久奖励，以及${plan.leadName}点击领取或立即调用；不得把这三步拆散后只用“他”或界面提示代称。不得先写背景，且不得先写赶路、旁观、调查、回忆或长篇环境铺陈。`,
+    );
+  }
+  if (contract.sourceWords.includes("无敌")) {
+    specializedOpeningInstructions.push(
+      `无敌体验强制前置：前 15% 内让${plan.leadName}亲自使用已经到手的能力，在第一场有意义的冲突中压倒性获胜；必须写出对手无力反抗以及旁观者、资源、身份或现场秩序的即时变化。至少安排一句不超过 80 字的独立原句，在同一句中明确写出${plan.leadName}的姓名、一次“一击/一招/抬手/弹指”等直接动作、被击败或镇压的具体对手，以及“无法反抗/毫无还手之力/当场认输”等决定性结果；不得只用“他”“青年”等指代${plan.leadName}。`,
+    );
   }
   const writerPrompt = [
     `开篇蓝图：${JSON.stringify({
@@ -904,13 +1425,12 @@ export async function generateStoryOpeningWithConnection(
       openingBeats: plan.openingBeats,
     })}`,
     formatReadingExperienceForPrompt(contract, 1),
-    "写第一章正文，16—20 个完整段落、2400—4200 个中文字符。首段直接进入事件；前 15% 兑现两个体验轴；本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。",
+    ...specializedOpeningInstructions,
+    "写第一章正文，严格写 18 个完整段落，每段 140—220 个中文字符；去除空白后的正文总长必须为 2800—3600 个中文字符。不要用大量短段凑数，也不要把对话拆成不足 140 字的独立段落。首段直接进入事件；前 15% 兑现两个体验轴；本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。",
     `只返回 JSON：{\"title\":\"章名\",\"paragraphs\":[\"完整段落\"]}。${IMMERSIVE_NARRATION_PROMPT}`,
   ].join("\n");
   const writerSystem = "你是原创中文长篇网文作家。用现场动作、人物选择、冲突结果和具体关系写作；回报及时，因果清楚，禁止作者侧元叙事。只返回符合要求的 JSON。";
 
-  let accumulatedTokens = planner.usageTokens;
-  let usageEstimated = planner.usageEstimated;
   let lastFailure: unknown;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let writer: Awaited<ReturnType<OpeningModelCompleter>>;
@@ -924,6 +1444,8 @@ export async function generateStoryOpeningWithConnection(
       prompt: attemptPrompt,
       timeout: GENERATION_STAGE_TIMEOUT_MS.writer,
       maxTokens: 6_500,
+      remainingTokens: tokenBudget - accumulatedTokens,
+      stage: "开篇正文",
     };
     try {
       assertModelCallTokenBudget({
@@ -955,14 +1477,22 @@ export async function generateStoryOpeningWithConnection(
     }
     const paragraphs = written.paragraphs.map((paragraph) => paragraph.trim());
     const content = paragraphs.join("\n");
-    const characterCount = content.replace(/\s/g, "").length;
-    if (characterCount < 2_400 || characterCount > 4_800) {
-      lastFailure = new Error(`正文字数为 ${characterCount} 字，要求 2400—4800 字。`);
+    const validationContext = {
+      protagonistNames: [plan.leadName],
+      opening: true,
+      chapterNumber: 1,
+    };
+    const characterCount = openingChapterCharacterCount(content);
+    if (!openingChapterLengthIsAllowed(content)) {
+      lastFailure = new Error(
+        `正文字数为 ${characterCount} 字，要求 ${OPENING_CHAPTER_MIN_CHARACTERS}—${OPENING_CHAPTER_MAX_CHARACTERS} 字。`,
+      );
       continue;
     }
     try {
       assertImmersiveNarration(normalizedChapterTitle);
       assertImmersiveNarration(content);
+      assertReadingExperienceContent(contract, content, validationContext);
     } catch (error) {
       lastFailure = error;
       continue;
@@ -970,14 +1500,20 @@ export async function generateStoryOpeningWithConnection(
     const reviewerRequest: OpeningCompletionRequest = {
       connection,
       model: connection.routes.extractor,
-      system: "你是独立的中文小说质量审稿与正史事件抽取器，只返回 JSON。不得替正文补事实，也不得仅因出现体验词就判定兑现。",
+      system: [
+        "你是独立的中文小说质量审稿与正史事件抽取器，只返回 JSON。不得替正文补事实，也不得仅因出现体验词就判定兑现。",
+        "严格返回 experienceEvidence 两项数组与 event 对象，禁止增加外层包装；quote 和 persistentFacts 必须从正文逐字复制，禁止概括、改写或补标点。",
+        openingReviewJsonExample,
+      ].join("\n"),
       prompt: [
         `体验契约：${JSON.stringify(contract)}`,
         `正文：${normalizedChapterTitle}\n${content}`,
         "逐轴返回正文中的连续原句证据以及命中的 signalIds；证据必须具体对应所申报模型信号中的人物、动作、对象与结果，并在同一句 quote 中逐字包含该模型信号 evidenceAnchors 中至少两个相互独立的短语。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，不能把标签、人物称谓共词或无关动作冒充兑现。两个轴必须提供不同原句，不能把同一句泛化动作重复标给两轴。event.persistentFacts 返回 2—8 条正文连续原句，保存主角已经获得的能力、奖励、权限、资源、关系或世界状态，供下一章直接继承。返回 {experienceEvidence:[{axisId,word,signalIds,quote}],event:{title,cause,outcome,location,persistentFacts}}。任一轴没有真实证据时仍返回空 evidence，让本稿失败重写。",
       ].join("\n"),
       timeout: GENERATION_STAGE_TIMEOUT_MS.reviewer,
-      maxTokens: 1_400,
+      maxTokens: 3_200,
+      remainingTokens: tokenBudget - accumulatedTokens,
+      stage: "开篇审稿",
     };
     try {
       assertModelCallTokenBudget({
@@ -991,17 +1527,118 @@ export async function generateStoryOpeningWithConnection(
       throw addModelUsage(error, accumulatedTokens, usageEstimated);
     }
     try {
-      const reviewer = await complete(reviewerRequest);
+      const completeReviewerWithSyntaxRetry = async () => {
+        let priorFailureTokens = 0;
+        let priorUsageEstimated = false;
+        for (let syntaxAttempt = 1; syntaxAttempt <= 2; syntaxAttempt += 1) {
+          const request = syntaxAttempt === 1 ? reviewerRequest : {
+            ...reviewerRequest,
+            system: [
+              reviewerRequest.system,
+              "上一轮没有形成可解析 JSON。本轮关闭解释和思考，只输出一个从 { 开始、以 } 结束的完整 JSON 对象。",
+            ].join("\n"),
+            remainingTokens: tokenBudget - accumulatedTokens - priorFailureTokens,
+            stage: "开篇审稿重试",
+          };
+          if (syntaxAttempt > 1) {
+            try {
+              assertModelCallTokenBudget({
+                remainingTokens: tokenBudget - accumulatedTokens - priorFailureTokens,
+                system: request.system,
+                prompt: request.prompt,
+                maxOutputTokens: request.maxTokens,
+                stage: "开篇审稿重试",
+              });
+            } catch (error) {
+              throw addModelUsage(error, priorFailureTokens, priorUsageEstimated);
+            }
+          }
+          try {
+            const result = await complete(request);
+            return {
+              ...result,
+              usageTokens: priorFailureTokens + result.usageTokens,
+              usageEstimated: priorUsageEstimated || result.usageEstimated,
+            };
+          } catch (error) {
+            const retryableSyntaxFailure = /(?:输出不是可修复的 JSON|没有返回可用内容)/.test(
+              error instanceof Error ? error.message : String(error),
+            );
+            if (syntaxAttempt >= 2 || !retryableSyntaxFailure) {
+              const failure = addModelUsage(error, priorFailureTokens, priorUsageEstimated);
+              if (syntaxAttempt >= 2 && retryableSyntaxFailure) {
+                Object.assign(failure, { reviewerProtocolFailure: true });
+              }
+              throw failure;
+            }
+            const failedUsage = attachedModelUsage(error);
+            priorFailureTokens += failedUsage.tokens;
+            priorUsageEstimated ||= failedUsage.estimated;
+          }
+        }
+        throw new Error("开篇审稿重试没有返回结果。");
+      };
+      let reviewer = await completeReviewerWithSyntaxRetry();
       accumulatedTokens += reviewer.usageTokens;
       usageEstimated ||= reviewer.usageEstimated;
-      if (!hasOpeningReviewShape(reviewer.value)) throw new Error("审稿模型没有返回两个体验轴的有效证据。");
-      assertPersistentExperienceFacts(contract, content, reviewer.value.event.persistentFacts, {
+      let reviewIssues = openingReviewValidationIssues(reviewer.value);
+      if (reviewIssues.length > 0) {
+        const reviewRepairRequest: OpeningCompletionRequest = {
+          connection,
+          model: connection.routes.extractor,
+          system: [
+            "你是中文小说审稿 JSON 结构修复器，只返回修复后的 JSON。",
+            "只依据给定正文和体验契约修复审稿结果；quote 与 persistentFacts 必须从正文逐字复制，不得概括、改写、补标点或虚构事实。",
+            "experienceEvidence 必须严格为两个体验轴各一项，event 必须含 title、cause、outcome、location、persistentFacts。禁止增加外层包装。",
+            openingReviewJsonExample,
+          ].join("\n"),
+          prompt: [
+            `当前 Schema 问题：${reviewIssues.join("；")}`,
+            `体验契约：${JSON.stringify(contract)}`,
+            `待修复审稿：${JSON.stringify(reviewer.value)}`,
+            `正文：${normalizedChapterTitle}\n${content}`,
+            "保留能够被正文逐字验证的内容，缺失字段直接从正文抽取。只返回完整修复 JSON。",
+          ].join("\n"),
+          timeout: GENERATION_STAGE_TIMEOUT_MS.reviewer,
+          maxTokens: 2_400,
+          remainingTokens: tokenBudget - accumulatedTokens,
+          stage: "开篇审稿修复",
+        };
+        assertModelCallTokenBudget({
+          remainingTokens: tokenBudget - accumulatedTokens,
+          system: reviewRepairRequest.system,
+          prompt: reviewRepairRequest.prompt,
+          maxOutputTokens: reviewRepairRequest.maxTokens,
+          stage: "开篇审稿修复",
+        });
+        const repairedReviewer = await complete(reviewRepairRequest);
+        accumulatedTokens += repairedReviewer.usageTokens;
+        usageEstimated ||= repairedReviewer.usageEstimated;
+        reviewer = {
+          ...repairedReviewer,
+          value: mergeOpeningReviewSchemaRepair(reviewer.value, repairedReviewer.value),
+        };
+        reviewIssues = openingReviewValidationIssues(reviewer.value);
+      }
+      if (!hasOpeningReviewShape(reviewer.value)) {
+        throw new Error(`审稿模型没有返回两个体验轴的有效证据：${reviewIssues.join("；")}。`);
+      }
+      const groundedExperienceEvidence = groundReadingExperienceEvidence(
+        contract,
+        content,
+        reviewer.value.experienceEvidence,
+        validationContext,
+      );
+      assertReadingExperienceEvidence(contract, content, groundedExperienceEvidence, validationContext);
+      const groundedPersistentFacts = Array.from(new Set([
+        ...groundedExperienceEvidence.map((evidence) => evidence.quote.trim()),
+        ...reviewer.value.event.persistentFacts.map((fact) => fact.trim()),
+      ])).filter((fact) => {
+        const length = Array.from(fact).length;
+        return length >= 8 && length <= 300 && content.includes(fact);
+      }).slice(0, 8);
+      assertPersistentExperienceFacts(contract, content, groundedPersistentFacts, {
         protagonistNames: [plan.leadName],
-        chapterNumber: 1,
-      });
-      assertReadingExperienceEvidence(contract, content, reviewer.value.experienceEvidence, {
-        protagonistNames: [plan.leadName],
-        opening: true,
         chapterNumber: 1,
       });
       return {
@@ -1017,11 +1654,11 @@ export async function generateStoryOpeningWithConnection(
           paragraphs,
           model: connection.routes.writer,
           origin: "model",
-          experienceEvidence: reviewer.value.experienceEvidence,
+          experienceEvidence: groundedExperienceEvidence,
           usageTokens: writer.usageTokens,
           usageEstimated: writer.usageEstimated,
         },
-        event: reviewer.value.event,
+        event: { ...reviewer.value.event, persistentFacts: groundedPersistentFacts },
         plannerModel: connection.routes.planner,
         writerModel: connection.routes.writer,
         usageTokens: accumulatedTokens,
@@ -1032,6 +1669,12 @@ export async function generateStoryOpeningWithConnection(
       accumulatedTokens += failedCallUsage.tokens;
       usageEstimated ||= failedCallUsage.estimated;
       lastFailure = error;
+      if (
+        error instanceof Error &&
+        (error as Error & { reviewerProtocolFailure?: boolean }).reviewerProtocolFailure === true
+      ) {
+        throw attachModelUsage(error, accumulatedTokens, usageEstimated);
+      }
     }
   }
   throw attachModelUsage(
@@ -1072,6 +1715,7 @@ export async function generateCandidateDraftsWithConnection(
     plannerPrompt,
     GENERATION_STAGE_TIMEOUT_MS.planner,
     1_800,
+    { remainingTokens: tokenBudget, stage: "候选规划" },
   );
   const payload = completion.value;
   const candidates = (Array.isArray(payload?.candidates) ? payload.candidates : [])
@@ -1132,6 +1776,7 @@ export async function generateCandidateDraftsWithConnection(
       auditPrompt,
       GENERATION_STAGE_TIMEOUT_MS.reviewer,
       1_800,
+      { remainingTokens: tokenBudget - completion.usageTokens, stage: "候选审计" },
     );
   } catch (error) {
     throw addModelUsage(error, completion.usageTokens, completion.usageEstimated);
@@ -1186,6 +1831,7 @@ export async function generateChapterWithConnection(
     prompt,
     GENERATION_STAGE_TIMEOUT_MS.writer,
     maxTokens,
+    { remainingTokens: tokenBudget, stage: "正文" },
   );
   const parsed = completion.value;
   if (
@@ -1404,6 +2050,7 @@ export async function extractChapterStateWithConnection(
     extractorPrompt,
     GENERATION_STAGE_TIMEOUT_MS.reviewer,
     1_500,
+    { remainingTokens: tokenBudget, stage: "状态抽取" },
   );
   const parsed = completion.value;
   try {

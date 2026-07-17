@@ -64,8 +64,8 @@ const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(currentDirectory, "..");
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const USER_DAILY_TOKEN_BUDGET = 120_000;
-const STORY_DAILY_TOKEN_BUDGET = 60_000;
+const USER_DAILY_TOKEN_BUDGET = 1_500_000;
+const STORY_DAILY_TOKEN_BUDGET = 120_000;
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
