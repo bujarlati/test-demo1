@@ -98,7 +98,7 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
   const compareText = (left: string, right: string) => left === right ? 0 : left < right ? -1 : 1;
   const compareDebt = (left: { dimensionId: string; promiseId: string; dueByChapter: number }, right: { dimensionId: string; promiseId: string; dueByChapter: number }) => compareText(left.dimensionId, right.dimensionId) || compareText(left.promiseId, right.promiseId) || left.dueByChapter - right.dueByChapter;
   const plannedDebts = plan.newDebts.map((debt) => ({ ...debt })).sort(compareDebt);
-  const suppliedDebts = Object.entries(patch.newDebtsByDimension).flatMap(([dimensionId, debts]) => debts.map((debt) => ({ dimensionId, ...debt }))).sort(compareDebt);
+  const suppliedDebts = Object.entries(patch.newDebtsByDimension).flatMap(([dimensionId, debts]) => debts.map((debt) => ({ ...debt, dimensionId }))).sort(compareDebt);
   if (suppliedDebts.some((debt, index) => index > 0 && compareDebt(debt, suppliedDebts[index - 1]) === 0) || plannedDebts.length !== suppliedDebts.length || plannedDebts.some((debt, index) => compareDebt(debt, suppliedDebts[index]) !== 0)) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (plan.dueSoftPromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId) && !plan.newDebts.some((debt) => debt.promiseId === promiseId) && !plan.carriedDebtPromiseIds.includes(promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (ledger.dimensions.flatMap((dimension) => dimension.persistentResults).some((fact) => !deps.liveCanon.factReferences.some((reference) => sameFact(reference, fact)))) throw new ExperienceSchedulingError("unauthorized_fact");
@@ -128,8 +128,9 @@ function assertPatchCompatibility(ledger: ExperienceLedgerV2, patch: ExperienceL
   if (invalidDebt) {
     throw new ExperienceSchedulingError("invalid_debt");
   }
-  const existingDebtIds = new Set(ledger.dimensions.flatMap((dimension) => dimension.debts).map((debt) => debt.promiseId));
-  if (Object.values(patch.newDebtsByDimension).flat().some((debt) => existingDebtIds.has(debt.promiseId))) throw new ExperienceSchedulingError("invalid_debt");
+  if (Object.entries(patch.newDebtsByDimension).some(([dimensionId, debts]) => debts.some((debt) =>
+    ledger.dimensions.some((dimension) => dimension.dimensionId === dimensionId && dimension.debts.some((existing) => existing.promiseId === debt.promiseId)),
+  ))) throw new ExperienceSchedulingError("invalid_debt");
   if (patch.deliveredPromiseIds.some((promiseId) => !deps.contract.promises.some((promise) => promise.id === promiseId))) throw new ExperienceSchedulingError("contract_mismatch");
 }
 

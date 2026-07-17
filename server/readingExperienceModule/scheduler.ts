@@ -150,10 +150,9 @@ function priorDeliveries(request: ScheduleExperienceRequest, promiseId: string):
   return request.ledger.promiseStates.find((state) => state.promiseId === promiseId)?.deliveredChapters ?? [];
 }
 
-function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: ExperienceDebtV2[]; carried: string[] } {
-  const existing = new Set(request.ledger.dimensions.flatMap((dimension) => dimension.debts).map((debt) => debt.promiseId));
+function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: Array<ExperienceDebtV2 & { dimensionId: string }>; carried: string[] } {
   const due: DeliveryPromiseV2[] = [];
-  const debts: ExperienceDebtV2[] = [];
+  const debts: Array<ExperienceDebtV2 & { dimensionId: string }> = [];
   const carried: string[] = [];
   for (const promise of request.contract.promises) {
     if (promise.hardness !== "soft") continue;
@@ -167,8 +166,12 @@ function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): {
     const carriedDebt = request.ledger.dimensions.flatMap((dimension) => dimension.debts).some((debt) => debt.promiseId === promise.id);
     if (carriedDebt) carried.push(promise.id);
     if (delivered < promise.scope.minimumDeliveries || carriedDebt) due.push(promise);
-    if (canEvaluateCompletedWindow && delivered < promise.scope.minimumDeliveries && !existing.has(promise.id)) {
-      debts.push({ promiseId: promise.id, dueByChapter: chapter + (promise.compensationWindow ?? 1) - 1 });
+    if (canEvaluateCompletedWindow && delivered < promise.scope.minimumDeliveries) {
+      const dimensionIds = promise.dimensionId === "both" ? request.contract.dimensions.map((dimension) => dimension.id) : [promise.dimensionId];
+      for (const dimensionId of dimensionIds) {
+        const alreadyOwed = request.ledger.dimensions.find((dimension) => dimension.dimensionId === dimensionId)?.debts.some((debt) => debt.promiseId === promise.id) ?? false;
+        if (!alreadyOwed) debts.push({ dimensionId, promiseId: promise.id, dueByChapter: chapter + (promise.compensationWindow ?? 1) - 1 });
+      }
     }
   }
   return { due, debts, carried };
@@ -272,12 +275,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     softRollingPromiseIds: request.contract.promises.filter((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window").map((promise) => promise.id),
     dueSoftPromiseIds: soft.due.map((promise) => promise.id),
     carriedDebtPromiseIds: soft.carried,
-    newDebts: soft.debts.flatMap((debt) => {
-      const promise = request.contract.promises.find((candidate) => candidate.id === debt.promiseId);
-      if (!promise) return [];
-      const dimensionIds = promise.dimensionId === "both" ? request.contract.dimensions.map((dimension) => dimension.id) : [promise.dimensionId];
-      return dimensionIds.map((dimensionId) => ({ ...debt, dimensionId }));
-    }),
+    newDebts: soft.debts,
     ticket: { ...unsigned, signature: signExperienceStageTicket(unsigned, deps.ticketSecret) },
   };
   return deepFreeze(structuredClone({ ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, deps.ticketSecret) }));

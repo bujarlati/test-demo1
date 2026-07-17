@@ -290,11 +290,19 @@ test("a due both-dimension rolling promise creates and applies one debt per dime
   assert.equal(updated.dimensions.flatMap((dimension) => dimension.debts).length, 2);
   assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0]] } }, trusted), { code: "unauthorized_delivery" });
   assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0], plan.newDebts[1]], dimension_voice: [] } }, trusted), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0], plan.newDebts[0]], dimension_voice: [plan.newDebts[1]] } }, trusted), { code: "unauthorized_delivery" });
 });
 
 test("fallback ticket ids hash canonical fields rather than delimiter joins", () => {
   const noInjectedId = { now, ticketSecret: secret, ticketTtlMs: 60_000 };
-  const left = request({ contract: { ...contract(), id: "a\u001fb" }, activation: { ...activation(), contractRevisionId: "a\u001fb" }, ledger: ledger({ contractRevisionId: "a\u001fb" }) });
-  const right = request({ contract: { ...contract(), id: "a" }, activation: { ...activation(), id: "b\u001factivation-r1", contractRevisionId: "a" }, ledger: ledger({ contractRevisionId: "a", activationId: "b\u001factivation-r1" }) });
+  const leftContract = { ...contract(), id: "a\u001fb" };
+  const leftActivation = { ...activation(), id: "c", contractRevisionId: leftContract.id };
+  const rightContract = { ...contract(), id: "a" };
+  const rightActivation = { ...activation(), id: "b\u001fc", contractRevisionId: rightContract.id };
+  const left = request({ contract: leftContract, activation: leftActivation, ledger: ledger({ contractRevisionId: leftContract.id, activationId: leftActivation.id }) });
+  const right = request({ contract: rightContract, activation: rightActivation, ledger: ledger({ contractRevisionId: rightContract.id, activationId: rightActivation.id }) });
+  const leftFields = [leftContract.id, leftActivation.id, 3, "branch-main", 7, "opening", "chapter", "job-1", 1];
+  const rightFields = [rightContract.id, rightActivation.id, 3, "branch-main", 7, "opening", "chapter", "job-1", 1];
+  assert.equal(leftFields.join("\u001f"), rightFields.join("\u001f"));
   assert.notEqual(scheduleExperience(left, noInjectedId).ticket.id, scheduleExperience(right, noInjectedId).ticket.id);
 });
