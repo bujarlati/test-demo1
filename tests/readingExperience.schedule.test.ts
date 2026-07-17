@@ -273,3 +273,28 @@ test("authorization canonicalization is strict and deterministic", () => {
   const cycle: Record<string, unknown> = {}; cycle.self = cycle;
   assert.throws(() => canonicalAuthorizationPayload(cycle), { code: "invalid_authorization_payload" });
 });
+
+test("a due both-dimension rolling promise creates and applies one debt per dimension", () => {
+  const revised = contract();
+  revised.promises = [...revised.promises.filter((promise) => promise.hardness === "hard"), { id: "soft-both", dimensionId: "both", scope: { kind: "rolling_window", chapters: 3, minimumDeliveries: 2 }, hardness: "soft", minimumSignals: 1, carryRuleIds: [], compensationWindow: 2 }];
+  const initial = ledger({ promiseStates: [{ promiseId: "soft-both", deliveredChapters: [] }] });
+  const plan = scheduleExperience(request({ contract: revised, chapterNumber: 5, ledger: initial }), deps);
+  assert.deepEqual(plan.newDebts, [
+    { dimensionId: "dimension_action", promiseId: "soft-both", dueByChapter: 6 },
+    { dimensionId: "dimension_voice", promiseId: "soft-both", dueByChapter: 6 },
+  ]);
+  const authorization = createLedgerAuthorization(plan, request().canon, ["evidence-1"], secret);
+  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: [plan.newDebts[0]], dimension_voice: [plan.newDebts[1]] }, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-1"] };
+  const trusted = { ...deps, contract: revised, authorization, liveCanon: request().canon };
+  const updated = applyExperienceLedgerPatch(initial, base, trusted);
+  assert.equal(updated.dimensions.flatMap((dimension) => dimension.debts).length, 2);
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0]] } }, trusted), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, { ...base, newDebtsByDimension: { dimension_action: [plan.newDebts[0], plan.newDebts[1]], dimension_voice: [] } }, trusted), { code: "unauthorized_delivery" });
+});
+
+test("fallback ticket ids hash canonical fields rather than delimiter joins", () => {
+  const noInjectedId = { now, ticketSecret: secret, ticketTtlMs: 60_000 };
+  const left = request({ contract: { ...contract(), id: "a\u001fb" }, activation: { ...activation(), contractRevisionId: "a\u001fb" }, ledger: ledger({ contractRevisionId: "a\u001fb" }) });
+  const right = request({ contract: { ...contract(), id: "a" }, activation: { ...activation(), id: "b\u001factivation-r1", contractRevisionId: "a" }, ledger: ledger({ contractRevisionId: "a", activationId: "b\u001factivation-r1" }) });
+  assert.notEqual(scheduleExperience(left, noInjectedId).ticket.id, scheduleExperience(right, noInjectedId).ticket.id);
+});
