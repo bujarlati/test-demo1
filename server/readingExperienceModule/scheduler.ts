@@ -55,12 +55,17 @@ function stableToken(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
-function stageFor(request: ScheduleExperienceRequest): ExperienceStage {
-  if (request.stage) return request.stage;
+function derivedStage(request: ScheduleExperienceRequest): ExperienceStage {
   if (request.failedRuleIds?.length) return "rewrite";
   if (request.artifactKind === "blueprint") return "blueprint";
   if (request.artifactKind === "retcon_revision") return "retcon";
   return request.chapterNumber === request.activation.effectiveFromChapter ? "opening" : "continuation";
+}
+
+function stageFor(request: ScheduleExperienceRequest): ExperienceStage {
+  const expected = derivedStage(request);
+  if (request.stage !== undefined && request.stage !== expected) throw new ExperienceSchedulingError("invalid_stage");
+  return expected;
 }
 
 function chapterNumber(request: ScheduleExperienceRequest): number {
@@ -112,10 +117,10 @@ function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): {
       if (isChapterDue(promise, chapter)) due.push(promise);
       continue;
     }
-    const lower = chapter - promise.scope.chapters;
+    const lower = Math.max(request.activation.effectiveFromChapter, chapter - promise.scope.chapters);
     const delivered = priorDeliveries(request, promise.id).filter((deliveredChapter) => deliveredChapter >= lower && deliveredChapter < chapter).length;
-    const canEvaluateCompletedWindow = chapter >= request.activation.effectiveFromChapter + promise.scope.chapters - 1;
-    const carriedDebt = request.ledger.dimensions.flatMap((dimension) => dimension.debts).some((debt) => debt.promiseId === promise.id && debt.dueByChapter >= chapter);
+    const canEvaluateCompletedWindow = chapter >= request.activation.effectiveFromChapter + promise.scope.chapters;
+    const carriedDebt = request.ledger.dimensions.flatMap((dimension) => dimension.debts).some((debt) => debt.promiseId === promise.id);
     if (delivered < promise.scope.minimumDeliveries || carriedDebt) due.push(promise);
     if (canEvaluateCompletedWindow && delivered < promise.scope.minimumDeliveries && !existing.has(promise.id)) {
       debts.push({ promiseId: promise.id, dueByChapter: chapter + (promise.compensationWindow ?? 1) - 1 });
@@ -144,6 +149,14 @@ function selectForDimension(dimension: ExperienceDimension, hard: DeliveryPromis
   return [...selected.values()];
 }
 
+function assertDistributionRequirements(dimension: ExperienceDimension): void {
+  for (const category of dimension.categories) {
+    if ((category === "voice" || category === "pacing") && !dimension.observableSignals.some((signal) => signal.kind === category && signal.verification.kind === "distribution")) {
+      throw new ExperienceSchedulingError("invalid_distribution");
+    }
+  }
+}
+
 function canonFactsFor(selected: ObservableSignalV2[], facts: CanonFactReferenceV2[]): CanonFactReferenceV2[] {
   const needsCarry = selected.some((signal) => (signal.kind === "mechanic" || signal.kind === "relationship") && (signal.persistence === "cross_chapter" || signal.persistence === "whole_story"));
   // The ledger contains delivery metadata, never source facts. Persistent prompts only receive current canon references.
@@ -155,12 +168,13 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
   const hard = activeHardPresence(request, chapter);
-  if (request.contract.dimensions.some((dimension) => !hard.some((promise) => matchesDimension(promise, dimension.id)))) {
+  if (request.contract.dimensions.some((dimension) => !hard.some((promise) => promise.dimensionId === dimension.id))) {
     throw new ExperienceSchedulingError("contract_mismatch");
   }
   const soft = softDueAndDebts(request, chapter);
   const dimensions = request.contract.dimensions.map((dimension) => {
-    const selected = selectForDimension(dimension, hard, chapter);
+    assertDistributionRequirements(dimension);
+    const selected = selectForDimension(dimension, [...hard, ...soft.due], chapter);
     return {
       id: dimension.id,
       interpretation: dimension.interpretation,
@@ -186,6 +200,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     expiresAt,
   };
   return {
+    chapterNumber: chapter,
     stage,
     artifactKind: request.artifactKind,
     promptProjection: {
