@@ -95,7 +95,8 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
     }
     if (!plannedDimensions.has(dimensionId)) throw new ExperienceSchedulingError("unauthorized_delivery");
   }
-  const compareDebt = (left: { dimensionId: string; promiseId: string; dueByChapter: number }, right: { dimensionId: string; promiseId: string; dueByChapter: number }) => left.dimensionId.localeCompare(right.dimensionId) || left.promiseId.localeCompare(right.promiseId) || left.dueByChapter - right.dueByChapter;
+  const compareText = (left: string, right: string) => left === right ? 0 : left < right ? -1 : 1;
+  const compareDebt = (left: { dimensionId: string; promiseId: string; dueByChapter: number }, right: { dimensionId: string; promiseId: string; dueByChapter: number }) => compareText(left.dimensionId, right.dimensionId) || compareText(left.promiseId, right.promiseId) || left.dueByChapter - right.dueByChapter;
   const plannedDebts = plan.newDebts.map((debt) => ({ dimensionId: deps.contract.promises.find((promise) => promise.id === debt.promiseId)?.dimensionId ?? "", ...debt })).sort(compareDebt);
   const suppliedDebts = Object.entries(patch.newDebtsByDimension).flatMap(([dimensionId, debts]) => debts.map((debt) => ({ dimensionId, ...debt }))).sort(compareDebt);
   if (suppliedDebts.some((debt, index) => index > 0 && compareDebt(debt, suppliedDebts[index - 1]) === 0) || plannedDebts.length !== suppliedDebts.length || plannedDebts.some((debt, index) => compareDebt(debt, suppliedDebts[index]) !== 0)) throw new ExperienceSchedulingError("unauthorized_delivery");

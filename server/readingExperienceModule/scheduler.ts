@@ -49,25 +49,37 @@ export function verifyExperienceStageTicket(ticket: ExperienceStageTicket, deps:
 function stableToken(value: string): string { return createHash("sha256").update(value).digest("base64url"); }
 
 export function canonicalAuthorizationPayload(value: unknown): string {
-  const seen = new WeakSet<object>();
+  const active = new WeakSet<object>();
   const invalid = (): never => { throw new ExperienceSchedulingError("invalid_authorization_payload"); };
   const visit = (input: unknown): string => {
     if (input === null) return "null";
     if (typeof input === "boolean" || typeof input === "string") return JSON.stringify(input);
     if (typeof input === "number") return Number.isFinite(input) ? JSON.stringify(input) : invalid();
     if (typeof input !== "object") return invalid();
-    if (seen.has(input)) return invalid();
-    seen.add(input);
+    if (active.has(input)) return invalid();
+    active.add(input);
+    try {
     if (Array.isArray(input)) {
-      if (Object.keys(input).some((key) => !/^(0|[1-9][0-9]*)$/.test(key)) || input.length !== Object.keys(input).length) return invalid();
-      return `[${Array.from({ length: input.length }, (_, index) => visit(input[index])).join(",")}]`;
+      if (Object.getPrototypeOf(input) !== Array.prototype) return invalid();
+      const descriptors = Object.getOwnPropertyDescriptors(input);
+      const keys = Reflect.ownKeys(descriptors);
+      if (keys.some((key) => typeof key !== "string") || keys.length !== input.length + 1 || !Object.hasOwn(descriptors, "length")) return invalid();
+      const values: string[] = [];
+      for (let index = 0; index < input.length; index += 1) {
+        const key = String(index); const descriptor = descriptors[key];
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable || descriptor.value === undefined) return invalid();
+        values.push(visit(descriptor.value));
+      }
+      return `[${values.join(",")}]`;
     }
     const prototype = Object.getPrototypeOf(input);
     if (prototype !== Object.prototype && prototype !== null) return invalid();
     const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (Reflect.ownKeys(descriptors).some((key) => typeof key !== "string")) return invalid();
     const keys = Object.keys(descriptors).sort();
-    if (keys.some((key) => !("value" in descriptors[key]) || !descriptors[key].enumerable)) return invalid();
+    if (keys.length !== Reflect.ownKeys(descriptors).length || keys.some((key) => !("value" in descriptors[key]) || !descriptors[key].enumerable)) return invalid();
     return `{${keys.map((key) => `${JSON.stringify(key)}:${visit(descriptors[key].value)}`).join(",")}}`;
+    } finally { active.delete(input); }
   };
   try { return visit(value); } catch (error) { if (error instanceof ExperienceSchedulingError) throw error; throw new ExperienceSchedulingError("invalid_authorization_payload"); }
 }
@@ -213,9 +225,6 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     throw new ExperienceSchedulingError("contract_mismatch");
   }
   const soft = softDueAndDebts(request, chapter);
-  if (request.contract.promises.some((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window" && promise.dimensionId === "both")) {
-    throw new ExperienceSchedulingError("contract_mismatch");
-  }
   const dimensions = request.contract.dimensions.map((dimension) => {
     assertDistributionRequirements(dimension);
     const selected = selectForDimension(dimension, [...hard, ...soft.due], chapter);
