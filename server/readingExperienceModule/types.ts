@@ -116,7 +116,10 @@ export interface ExperienceStagePlan {
   duePromiseIds: string[];
   hardPresencePromiseIds: string[];
   softRollingPromiseIds: string[];
+  dueSoftPromiseIds: string[];
+  carriedDebtPromiseIds: string[];
   newDebts: ExperienceDebtV2[];
+  authorizationMac: string;
   ticket: ExperienceStageTicket;
 }
 

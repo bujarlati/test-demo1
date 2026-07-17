@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { CanonFactReferenceV2, DeliveryPromiseV2, ExperienceDebtV2, ExperienceDimension, ObservableSignalV2 } from "../../src/types";
 import type {
   ExperienceSchedulingErrorCode,
@@ -46,13 +46,16 @@ export function verifyExperienceStageTicket(ticket: ExperienceStageTicket, deps:
   return supplied.length === actual.length && timingSafeEqual(supplied, actual);
 }
 
-function stableToken(value: string): string {
-  let hash = 2166136261;
-  for (const character of value) {
-    hash ^= character.codePointAt(0) ?? 0;
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
+function stableToken(value: string): string { return createHash("sha256").update(value).digest("base64url"); }
+
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`;
+}
+
+export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizationMac">, secret: string): string {
+  return createHmac("sha256", secret).update(canonical(plan)).digest("base64url");
 }
 
 function derivedStage(request: ScheduleExperienceRequest): ExperienceStage {
@@ -107,10 +110,11 @@ function priorDeliveries(request: ScheduleExperienceRequest, promiseId: string):
   return request.ledger.promiseStates.find((state) => state.promiseId === promiseId)?.deliveredChapters ?? [];
 }
 
-function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: ExperienceDebtV2[] } {
+function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): { due: DeliveryPromiseV2[]; debts: ExperienceDebtV2[]; carried: string[] } {
   const existing = new Set(request.ledger.dimensions.flatMap((dimension) => dimension.debts).map((debt) => debt.promiseId));
   const due: DeliveryPromiseV2[] = [];
   const debts: ExperienceDebtV2[] = [];
+  const carried: string[] = [];
   for (const promise of request.contract.promises) {
     if (promise.hardness !== "soft") continue;
     if (promise.scope.kind !== "rolling_window") {
@@ -121,12 +125,13 @@ function softDueAndDebts(request: ScheduleExperienceRequest, chapter: number): {
     const delivered = priorDeliveries(request, promise.id).filter((deliveredChapter) => deliveredChapter >= lower && deliveredChapter < chapter).length;
     const canEvaluateCompletedWindow = chapter >= request.activation.effectiveFromChapter + promise.scope.chapters;
     const carriedDebt = request.ledger.dimensions.flatMap((dimension) => dimension.debts).some((debt) => debt.promiseId === promise.id);
+    if (carriedDebt) carried.push(promise.id);
     if (delivered < promise.scope.minimumDeliveries || carriedDebt) due.push(promise);
     if (canEvaluateCompletedWindow && delivered < promise.scope.minimumDeliveries && !existing.has(promise.id)) {
       debts.push({ promiseId: promise.id, dueByChapter: chapter + (promise.compensationWindow ?? 1) - 1 });
     }
   }
-  return { due, debts };
+  return { due, debts, carried };
 }
 
 function rotatedSignals(signals: ObservableSignalV2[], chapter: number): ObservableSignalV2[] {
@@ -180,6 +185,9 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     throw new ExperienceSchedulingError("contract_mismatch");
   }
   const soft = softDueAndDebts(request, chapter);
+  if (request.contract.promises.some((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window" && promise.dimensionId === "both")) {
+    throw new ExperienceSchedulingError("contract_mismatch");
+  }
   const dimensions = request.contract.dimensions.map((dimension) => {
     assertDistributionRequirements(dimension);
     const selected = selectForDimension(dimension, [...hard, ...soft.due], chapter);
@@ -213,7 +221,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     attempt: request.attempt,
     expiresAt,
   };
-  return deepFreeze({
+  const unsignedPlan: Omit<ExperienceStagePlan, "authorizationMac"> = {
     chapterNumber: chapter,
     stage,
     artifactKind: request.artifactKind,
@@ -225,7 +233,10 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     duePromiseIds: [...hard, ...soft.due].map((promise) => promise.id),
     hardPresencePromiseIds: hard.map((promise) => promise.id),
     softRollingPromiseIds: request.contract.promises.filter((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window").map((promise) => promise.id),
+    dueSoftPromiseIds: soft.due.map((promise) => promise.id),
+    carriedDebtPromiseIds: soft.carried,
     newDebts: soft.debts,
     ticket: { ...unsigned, signature: signExperienceStageTicket(unsigned, deps.ticketSecret) },
-  });
+  };
+  return deepFreeze(structuredClone({ ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, deps.ticketSecret) }));
 }

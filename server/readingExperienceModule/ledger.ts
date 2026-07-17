@@ -1,6 +1,7 @@
 import type { ExperienceLedgerV2 } from "../../src/types";
 import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies } from "./types";
 import { ExperienceSchedulingError, verifyExperienceStageTicket } from "./scheduler";
+import { signExperiencePlan } from "./scheduler";
 
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -16,7 +17,10 @@ export function createLedgerAuthorization(
   plan: LedgerAuthorization["plan"],
   canon: LedgerAuthorization["canon"],
   evidenceIds: string[],
+  ticketSecret: string,
 ): LedgerAuthorization {
+  const { authorizationMac, ...unsignedPlan } = plan;
+  if (authorizationMac !== signExperiencePlan(unsignedPlan, ticketSecret)) throw new ExperienceSchedulingError("plan_mismatch");
   const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceIds })) as LedgerAuthorization;
   authenticAuthorizations.add(snapshot);
   return snapshot;
@@ -90,10 +94,11 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
     }
     if (!plannedDimensions.has(dimensionId)) throw new ExperienceSchedulingError("unauthorized_delivery");
   }
-  const plannedDebtKeys = plan.newDebts.map((debt) => `${debt.promiseId}\u001f${debt.dueByChapter}`).sort();
-  const suppliedDebtKeys = Object.values(patch.newDebtsByDimension).flat().map((debt) => `${debt.promiseId}\u001f${debt.dueByChapter}`).sort();
-  if (new Set(suppliedDebtKeys).size !== suppliedDebtKeys.length || plannedDebtKeys.join("\u001f") !== suppliedDebtKeys.join("\u001f")) throw new ExperienceSchedulingError("unauthorized_delivery");
-  if (plan.softRollingPromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId) && !plan.newDebts.some((debt) => debt.promiseId === promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
+  const compareDebt = (left: { dimensionId: string; promiseId: string; dueByChapter: number }, right: { dimensionId: string; promiseId: string; dueByChapter: number }) => left.dimensionId.localeCompare(right.dimensionId) || left.promiseId.localeCompare(right.promiseId) || left.dueByChapter - right.dueByChapter;
+  const plannedDebts = plan.newDebts.map((debt) => ({ dimensionId: deps.contract.promises.find((promise) => promise.id === debt.promiseId)?.dimensionId ?? "", ...debt })).sort(compareDebt);
+  const suppliedDebts = Object.entries(patch.newDebtsByDimension).flatMap(([dimensionId, debts]) => debts.map((debt) => ({ dimensionId, ...debt }))).sort(compareDebt);
+  if (suppliedDebts.some((debt, index) => index > 0 && compareDebt(debt, suppliedDebts[index - 1]) === 0) || plannedDebts.length !== suppliedDebts.length || plannedDebts.some((debt, index) => compareDebt(debt, suppliedDebts[index]) !== 0)) throw new ExperienceSchedulingError("unauthorized_delivery");
+  if (plan.dueSoftPromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId) && !plan.newDebts.some((debt) => debt.promiseId === promiseId) && !plan.carriedDebtPromiseIds.includes(promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (ledger.dimensions.flatMap((dimension) => dimension.persistentResults).some((fact) => !deps.liveCanon.factReferences.some((reference) => sameFact(reference, fact)))) throw new ExperienceSchedulingError("unauthorized_fact");
 }
 
