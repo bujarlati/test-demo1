@@ -1,6 +1,6 @@
 import type { GenerationJob } from "../src/types";
 
-export const CONTINUATION_JOB_TOKEN_BUDGET = 30_000;
+export const CONTINUATION_JOB_TOKEN_BUDGET = 50_000;
 export const OPENING_JOB_TOKEN_BUDGET = 120_000;
 export const CHAPTER_EXTRACTION_ADMISSION_RESERVE = 14_000;
 const MODEL_CALL_FRAMING_TOKEN_RESERVE = 32;

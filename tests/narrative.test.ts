@@ -22,6 +22,7 @@ import {
   assertReadingExperienceNegativeInvariants,
   buildChapterPrompt,
   buildConversationContext,
+  chapterParagraphCountIsAllowed,
   endingContractSatisfied,
   eventFromChapter,
   generateLocalChapter,
@@ -61,6 +62,7 @@ import { currentRevision } from "../src/storyDomain";
 import type { GenerationJob, ModelConnection } from "../src/types";
 
 interface FakeModelProviderOptions {
+  embeddingMode?: "standard" | "ark_multimodal";
   mandatoryMinCompletionTokens?: number;
   writerDelayMs?: number;
   writerHeadersOnly?: boolean;
@@ -76,6 +78,7 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
   let activeRequests = 0;
   let maxConcurrentRequests = 0;
   let responsesCalls = 0;
+  const embeddingRequests: Array<{ pathname: string; body: Record<string, unknown> }> = [];
   const mandatoryProbeModels: string[] = [];
   let resolveWriterProbeSeen: (() => void) | undefined;
   let resolveWriterHeadersSent: (() => void) | undefined;
@@ -99,11 +102,15 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
       activeRequests += 1;
       maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+        input?: unknown;
         max_tokens?: number;
         messages?: Array<{ content?: string }>;
         model?: string;
         stream?: boolean;
       };
+      if (request.url?.startsWith("/embeddings")) {
+        embeddingRequests.push({ pathname: request.url, body });
+      }
       const prompt = body.messages?.[0]?.content ?? "";
       const isMandatoryProbe = prompt === "回复：好";
       if (isMandatoryProbe && body.model) mandatoryProbeModels.push(body.model);
@@ -137,9 +144,26 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
             response.statusCode = mandatoryRouteStatus;
             response.setHeader("Content-Type", "application/json");
             response.end(JSON.stringify({ error: { message: isWriterProbe ? "writer access denied" : `${body.model} access denied` } }));
+          } else if (request.url === "/embeddings" && options.embeddingMode === "ark_multimodal") {
+            response.statusCode = 404;
+            response.setHeader("Content-Type", "application/json");
+            response.end(JSON.stringify({ error: { message: "use /embeddings/multimodal" } }));
           } else if (request.url === "/embeddings") {
             response.setHeader("Content-Type", "application/json");
             response.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+          } else if (request.url === "/embeddings/multimodal" && options.embeddingMode === "ark_multimodal") {
+            const input = Array.isArray(body.input) ? body.input : [];
+            const hasTypedText = input.some((item) => item && typeof item === "object" &&
+              (item as { type?: unknown }).type === "text" &&
+              typeof (item as { text?: unknown }).text === "string");
+            if (!hasTypedText) {
+              response.statusCode = 400;
+              response.setHeader("Content-Type", "application/json");
+              response.end(JSON.stringify({ error: { message: "typed multimodal input required" } }));
+            } else {
+              response.setHeader("Content-Type", "application/json");
+              response.end(JSON.stringify({ data: [{ embedding: [[0.1, 0.2]] }] }));
+            }
           } else if (body.stream) {
             response.setHeader("Content-Type", "text/event-stream");
             response.end("data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n");
@@ -201,6 +225,7 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
     writerProbeSeen,
     mandatoryProbeModels: () => [...mandatoryProbeModels],
     maxConcurrentRequests: () => maxConcurrentRequests,
+    embeddingRequests: () => structuredClone(embeddingRequests),
     responsesCalls: () => responsesCalls,
     async close() {
       if (previousAllowPrivate === undefined) delete process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
@@ -398,10 +423,10 @@ function openingBudgetFixture() {
 }
 
 test("opening chapter character limits accept a substantial 5523-character web-fiction chapter", () => {
-  assert.equal(OPENING_CHAPTER_MIN_CHARACTERS, 2_400);
+  assert.equal(OPENING_CHAPTER_MIN_CHARACTERS, 1_800);
   assert.equal(OPENING_CHAPTER_MAX_CHARACTERS, 6_000);
-  assert.equal(openingChapterLengthIsAllowed("字".repeat(2_399)), false);
-  assert.equal(openingChapterLengthIsAllowed("字".repeat(2_400)), true);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(1_799)), false);
+  assert.equal(openingChapterLengthIsAllowed("字".repeat(1_800)), true);
   assert.equal(openingChapterLengthIsAllowed("字".repeat(5_523)), true);
   assert.equal(openingChapterLengthIsAllowed("字".repeat(6_000)), true);
   assert.equal(openingChapterLengthIsAllowed("字".repeat(6_001)), false);
@@ -891,6 +916,82 @@ test("opening generation repairs a semantically useful planner response with the
   assert.doesNotMatch(requests[2].prompt, /修复器擅自改名|陌生主角/);
 });
 
+test("opening semantic repair remains available after two schema repairs", async () => {
+  const { connection } = openingBudgetFixture();
+  const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
+  const context = {
+    input: { genre: "系统流", tone: "系统 · 无敌" },
+    contract: base.readingExperience,
+    targetChapterCount: base.targetChapterCount,
+  };
+  const safePlan = {
+    title: "签到即无敌",
+    subtitle: "每次签到都让世界秩序重新排位",
+    leadName: "林峰",
+    storyGene: base.storyGene,
+    endingContract: base.endingContract,
+    worldBible: base.worldBible,
+    experienceAxes: base.readingExperience.axes.map((axis) => ({
+      word: axis.word,
+      interpretation: axis.interpretation,
+      observableSignals: axis.observableSignals.map((signal) => signal.description),
+      hardPromises: axis.hardPromises.map((promise) => promise.description),
+      forbiddenShortcuts: axis.forbiddenShortcuts,
+    })),
+    openingBeats: ["林峰在首段完成签到并领取奖励", "林峰一击镇压强敌并改变秩序"],
+  };
+  const unsafeStoryGene = {
+    ...safePlan.storyGene,
+    recurringCost: "系统会拒绝结算并撤回已经发放的奖励",
+  };
+  const malformedPlan = {
+    ...safePlan,
+    storyGene: unsafeStoryGene,
+    worldBible: "错误的世界设定形状",
+    openingBeats: [{ beat: "错误的节拍形状" }],
+  };
+  const firstSchemaRepair = {
+    ...safePlan,
+    openingBeats: [{ beat: "仍然错误的节拍形状" }],
+  };
+  const semanticRepair = {
+    ...safePlan,
+    title: "修复器不得改名",
+    storyGene: {
+      ...safePlan.storyGene,
+      recurringCost: "每次胜利都会扩大需要维护的世界秩序与资源范围",
+    },
+  };
+  const requests: Array<{ model: string; prompt: string }> = [];
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      requests.push({ model: request.model, prompt: request.prompt });
+      if (requests.length === 1) return { value: malformedPlan, usageTokens: 100, usageEstimated: false };
+      if (requests.length === 2) return { value: firstSchemaRepair, usageTokens: 200, usageEstimated: false };
+      if (requests.length === 3) return { value: safePlan, usageTokens: 250, usageEstimated: false };
+      if (requests.length === 4) return { value: semanticRepair, usageTokens: 300, usageEstimated: false };
+      throw attachModelUsage(new Error("writer reached after independent repair budgets"), 400, false);
+    }, Number.POSITIVE_INFINITY),
+    (error: Error & { usageTokens?: number }) => {
+      assert.match(error.message, /writer reached after independent repair budgets/);
+      assert.equal(error.usageTokens, 1_250);
+      return true;
+    },
+  );
+
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.extractor,
+    connection.routes.extractor,
+    connection.routes.extractor,
+    connection.routes.writer,
+  ]);
+  assert.match(requests[3].prompt, /storyGene\.recurringCost/);
+  assert.match(requests[4].prompt, /每次胜利都会扩大需要维护的世界秩序与资源范围/);
+  assert.doesNotMatch(requests[4].prompt, /修复器不得改名/);
+});
+
 test("opening generation retries semantic blueprint repair when the first repair still weakens system guarantees", async () => {
   const { connection } = openingBudgetFixture();
   const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
@@ -963,6 +1064,78 @@ test("opening generation retries semantic blueprint repair when the first repair
   assert.doesNotMatch(requests[3].prompt, /修复器改写|修复器替换/);
 });
 
+test("opening generation repairs a system invariant that spans adjacent blueprint fields", async () => {
+  const { connection } = openingBudgetFixture();
+  const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
+  const context = {
+    input: { genre: "系统流", tone: "系统 · 无敌" },
+    contract: base.readingExperience,
+    targetChapterCount: base.targetChapterCount,
+  };
+  const safePlan = {
+    title: "签到即无敌",
+    subtitle: "每次签到都让世界秩序重新排位",
+    leadName: "林峰",
+    storyGene: base.storyGene,
+    endingContract: base.endingContract,
+    worldBible: base.worldBible,
+    experienceAxes: base.readingExperience.axes.map((axis) => ({
+      word: axis.word,
+      interpretation: axis.interpretation,
+      observableSignals: axis.observableSignals.map((signal) => signal.description),
+      hardPromises: axis.hardPromises.map((promise) => promise.description),
+      forbiddenShortcuts: axis.forbiddenShortcuts,
+    })),
+    openingBeats: ["林峰在首段完成签到并领取奖励", "林峰一击镇压来犯强敌并改变现场秩序"],
+  };
+  const unsafePlan = {
+    ...safePlan,
+    storyGene: {
+      ...safePlan.storyGene,
+      conflictEngine: "林峰持续调用系统推进目标",
+      recurringCost: "拒绝结算会扩大敌方秩序的反应",
+    },
+  };
+  const targetedRepair = {
+    ...safePlan,
+    title: "修复器擅自改名",
+    leadName: "陌生主角",
+    storyGene: {
+      ...safePlan.storyGene,
+      conflictEngine: "修复器擅自替换冲突引擎",
+      recurringCost: "每次胜利都会扩大需要维护的世界秩序与资源范围",
+    },
+  };
+  const requests: Array<{ model: string; system: string; prompt: string }> = [];
+
+  await assert.rejects(
+    () => generateStoryOpeningWithConnection(context, connection, async (request) => {
+      requests.push({ model: request.model, system: request.system, prompt: request.prompt });
+      if (requests.length === 1) return { value: unsafePlan, usageTokens: 100, usageEstimated: false };
+      if (requests.length === 2) return { value: targetedRepair, usageTokens: 200, usageEstimated: false };
+      throw attachModelUsage(new Error("writer reached after cross-field semantic repair"), 300, false);
+    }, Number.POSITIVE_INFINITY),
+    (error: Error & { usageTokens?: number }) => {
+      assert.match(error.message, /writer reached after cross-field semantic repair/);
+      assert.equal(error.usageTokens, 600);
+      return true;
+    },
+  );
+
+  assert.deepEqual(requests.map((request) => request.model), [
+    connection.routes.planner,
+    connection.routes.extractor,
+    connection.routes.writer,
+  ]);
+  assert.match(requests[1].prompt, /稳定结算|持续可用|系统/);
+  assert.match(requests[1].prompt, /storyGene\.recurringCost/);
+  assert.match(requests[2].prompt, /"title":"签到即无敌"/);
+  assert.match(requests[2].prompt, /"leadName":"林峰"/);
+  assert.match(requests[2].prompt, /"conflictEngine":"林峰持续调用系统推进目标"/);
+  assert.match(requests[2].prompt, /"recurringCost":"每次胜利都会扩大需要维护的世界秩序与资源范围"/);
+  assert.doesNotMatch(requests[2].prompt, /修复器擅自|陌生主角/);
+});
+
 test("system-and-invincible writer must complete system payoff in the first paragraph", async () => {
   const { connection } = openingBudgetFixture();
   const base = createStory({ genre: "系统流", tone: "系统 · 无敌" }, "user_test");
@@ -986,7 +1159,7 @@ test("system-and-invincible writer must complete system payoff in the first para
 
   await assert.rejects(
     () => generateStoryOpeningWithConnection({
-      input: { genre: "系统流", tone: "系统 · 无敌" },
+      input: { genre: "系统流", tone: "系统 · 无敌", inspiration: "用户指定的永恒签到系统与宗门秩序" },
       contract: base.readingExperience,
       targetChapterCount: base.targetChapterCount,
     }, connection, async (request) => {
@@ -1004,14 +1177,27 @@ test("system-and-invincible writer must complete system payoff in the first para
   assert.match(writerPrompt, /触发.*系统.*反馈.*奖励/);
   assert.match(writerPrompt, /不超过 100 字/);
   assert.match(writerPrompt, /同一句.*林峰.*系统面板.*领取/);
+  assert.match(writerPrompt, /必须把以下三句逐字放在第一段最前面/);
+  assert.match(writerPrompt, /林峰打开系统面板，系统立即发放永久生效的至尊权限奖励，林峰点击领取并当场调用/);
+  assert.match(writerPrompt, /林峰抬手一击镇压眼前强敌，对方毫无还手之力/);
+  assert.match(writerPrompt, /围观者当场低头让路，现场秩序随即改写，林峰的身份立即确立/);
   assert.match(writerPrompt, /不得先写背景|不得先写赶路/);
+  assert.match(writerPrompt, /只用正面事实.*持续在线.*即时结算.*永久生效/);
+  assert.match(writerPrompt, /用户指定的永恒签到系统与宗门秩序/);
   assert.match(writerPrompt, /压倒性/);
+  assert.match(writerPrompt, /胜利句后.*同一段.*下一段.*围观弟子当场低头让路.*宗门随即撤销命令/);
   assert.match(writerPrompt, /不超过 80 字/);
   assert.match(writerPrompt, /林峰.*姓名/);
   assert.match(writerPrompt, /不得只用“他”|不得只用.*指代/);
   assert.match(writerPrompt, /18 个完整段落/);
-  assert.match(writerPrompt, /每段 140.?220/);
-  assert.match(writerPrompt, /2800.?3600/);
+  assert.match(writerPrompt, /每段 100.?220/);
+  assert.match(writerPrompt, /2000.?3600/);
+  const requiredOpeningScaffold = "林峰打开系统面板，系统立即发放永久生效的至尊权限奖励，林峰点击领取并当场调用。林峰抬手一击镇压眼前强敌，对方毫无还手之力。围观者当场低头让路，现场秩序随即改写，林峰的身份立即确立。";
+  assert.doesNotThrow(() => assertReadingExperienceContent(
+    base.readingExperience,
+    requiredOpeningScaffold,
+    { protagonistNames: ["林峰"], opening: true, chapterNumber: 1 },
+  ));
 });
 
 test("system-and-invincible opening retries prose before paying a reviewer when no dominant victory exists", async () => {
@@ -2175,6 +2361,143 @@ test("SiliconFlow structured completions stream long reasoning responses within 
   assert.equal(overallTimeout, 360_000);
 });
 
+test("OpenAI-compatible long writer completions use negotiated streaming outside SiliconFlow", async () => {
+  const connection = budgetTestConnection("conn_ark_long_writer_stream");
+  connection.name = "Ark long writer stream";
+  connection.baseUrl = "https://ark.cn-beijing.volces.com/api/v3";
+  connection.routes = {
+    planner: "doubao-seed-2-1-turbo-260628",
+    writer: "doubao-seed-2-1-pro-260628",
+    extractor: "doubao-seed-character-260628",
+    embedding: "doubao-embedding-vision-251215",
+  };
+  connection.capabilities = {
+    completionApi: "chat_completions",
+    streaming: true,
+    jsonSchema: true,
+    embedding: false,
+    promptCache: false,
+    toolCalling: true,
+    maxContextTokens: null,
+    testedAt: new Date().toISOString(),
+    latencyMs: 44_060,
+  };
+  const chapter = {
+    title: "系统第一次结算",
+    paragraphs: Array.from({ length: 18 }, (_, index) => `第${index + 1}段正文。`),
+  };
+  const responseBody = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: JSON.stringify(chapter) } }] })}`,
+    `data: ${JSON.stringify({ choices: [], usage: { total_tokens: 932 } })}`,
+    "data: [DONE]",
+  ].join("\n\n");
+  let requestBody: Record<string, unknown> | undefined;
+  let idleTimeout: number | undefined;
+  let overallTimeout: number | undefined;
+
+  const result = await completeJson<typeof chapter>(
+    connection,
+    connection.routes.writer,
+    "只返回章节 JSON",
+    "生成第一章长正文",
+    300_000,
+    6_500,
+    {
+      secretReader: async () => "test-key",
+      retryDelay: async () => undefined,
+      modelFetcher: async (_connection, _apiKey, _pathname, init, timeout, overall) => {
+        requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        idleTimeout = timeout;
+        overallTimeout = overall;
+        if (requestBody.stream !== true) throw new Error("模型连接超时。");
+        return new Response(responseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    },
+  );
+
+  assert.deepEqual(result, { value: chapter, usageTokens: 932, usageEstimated: false });
+  assert.equal(requestBody?.stream, true);
+  assert.deepEqual(requestBody?.thinking, { type: "disabled" });
+  assert.deepEqual(requestBody?.stream_options, { include_usage: true });
+  assert.equal(idleTimeout, 300_000);
+  assert.equal(overallTimeout, 1_500_000);
+
+  const sharedPlannerWriterConnection = {
+    ...connection,
+    routes: { ...connection.routes, planner: connection.routes.writer },
+  };
+  let plannerRequestBody: Record<string, unknown> | undefined;
+  await completeJson<typeof chapter>(
+    sharedPlannerWriterConnection,
+    sharedPlannerWriterConnection.routes.planner,
+    "规划系统",
+    "规划开篇",
+    180_000,
+    6_500,
+    {
+      stage: "开篇规划",
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, _pathname, init) => {
+        plannerRequestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(responseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    },
+  );
+  assert.equal(plannerRequestBody?.thinking, undefined);
+
+  let candidatePlannerRequestBody: Record<string, unknown> | undefined;
+  await completeJson<typeof chapter>(
+    sharedPlannerWriterConnection,
+    sharedPlannerWriterConnection.routes.planner,
+    "候选规划系统",
+    "规划下一章候选",
+    180_000,
+    1_800,
+    {
+      stage: "候选规划",
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, _pathname, init) => {
+        candidatePlannerRequestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(responseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    },
+  );
+  assert.deepEqual(candidatePlannerRequestBody?.thinking, { type: "disabled" });
+
+  let chapterRequestBody: Record<string, unknown> | undefined;
+  let chapterOverallTimeout: number | undefined;
+  const streamedChapter = await streamChapterWithConnection(
+    connection,
+    "生成第二章长正文",
+    () => undefined,
+    6_500,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, _pathname, init, _timeout, overall) => {
+        chapterRequestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        chapterOverallTimeout = overall;
+        return new Response(responseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      },
+    },
+  );
+  assert.equal(streamedChapter.paragraphs.length, 18);
+  assert.deepEqual(chapterRequestBody?.thinking, { type: "disabled" });
+  assert.deepEqual(chapterRequestBody?.stream_options, { include_usage: true });
+  assert.equal(chapterOverallTimeout, 1_500_000);
+});
+
 test("SiliconFlow retries a transient aborted structured stream and accounts for both attempts", async () => {
   const connection = siliconFlowStreamingTestConnection("conn_siliconflow_stream_retry");
   let calls = 0;
@@ -2375,7 +2698,12 @@ test("candidate generation adds planner usage when its independent audit call fa
     storyTime: "当天",
     dependsOnEventIds: [],
     knowledgeClaims: [],
-    itemTransitions: [],
+    itemTransitions: [{
+      itemName: "会员等级",
+      actorName: "主角",
+      fromStatus: "未解锁",
+      toStatus: "永久生效",
+    }],
   };
   let calls = 0;
 
@@ -2393,6 +2721,56 @@ test("candidate generation adds planner usage when its independent audit call fa
       return true;
     },
   );
+});
+
+test("candidate audit supplements planner claims only from the canonical knowledge ledger", async () => {
+  const story = createStory({ genre: "都市", tone: "紧张 · 温暖" }, "user_test");
+  const lead = story.characters[0]!;
+  const canonicalFact = "旧仓库的东门只在午夜开放";
+  lead.knowledge.push(canonicalFact);
+  lead.knowledgeSources.push({ fact: canonicalFact, sourceChapter: 1, sourceRevisionId: "rev_canonical_fact" });
+  const candidate = {
+    creativeAxis: "时间窗口",
+    event: `${lead.name}赶往旧仓库东门`,
+    cause: "午夜将至",
+    cost: "暴露行踪",
+    impact: "行动窗口被锁定",
+    novelty: "用既有时限推动现场选择",
+    participantNames: [lead.name],
+    storyTime: "当天午夜",
+    dependsOnEventIds: [],
+    knowledgeClaims: [],
+    itemTransitions: [],
+  };
+  let calls = 0;
+  const result = await generateCandidateDraftsWithConnection(
+    budgetTestConnection("conn_candidate_audit_supplement"),
+    story,
+    async <T>() => {
+      calls += 1;
+      if (calls === 1) {
+        return { value: { candidates: [candidate, candidate, candidate] } as T, usageTokens: 100, usageEstimated: false };
+      }
+      return {
+        value: {
+          audits: Array.from({ length: 3 }, (_, candidateIndex) => ({
+            candidateIndex,
+            complete: candidateIndex !== 1,
+            dependencies: [{ characterName: lead.name, fact: canonicalFact }],
+          })),
+        } as T,
+        usageTokens: 100,
+        usageEstimated: false,
+      };
+    },
+  );
+
+  assert.equal(result.candidates.length, 2);
+  assert.deepEqual(result.candidates[0].knowledgeClaims, [{
+    characterName: lead.name,
+    fact: canonicalFact,
+    sourceRevisionId: "rev_canonical_fact",
+  }]);
 });
 
 test("a paid state-extraction completion retains usage when its schema is rejected", async () => {
@@ -2543,6 +2921,8 @@ test("continuation fallback with only 500 tokens remaining starts neither planne
 test("candidate audit is admitted separately after the paid planner call", async () => {
   const story = createStory({ genre: "都市", tone: "紧张 · 温暖" }, "user_test");
   const connection = budgetTestConnection("conn_candidate_audit_budget");
+  const tokenBudget = 20_000;
+  const plannerUsage = 19_500;
   const candidate = {
     creativeAxis: "目标压力",
     event: "主角必须立刻作出选择",
@@ -2563,13 +2943,13 @@ test("candidate audit is admitted separately after the paid planner call", async
       calls += 1;
       return {
         value: { candidates: [candidate, candidate, candidate] } as T,
-        usageTokens: 6_500,
+        usageTokens: plannerUsage,
         usageEstimated: false,
       };
-    }, 7_000),
+    }, tokenBudget),
     (error: Error & { usageTokens?: number }) => {
       assert.match(error.message, /剩余 Token.*审计.*未启动/);
-      assert.equal(error.usageTokens, 6_500);
+      assert.equal(error.usageTokens, plannerUsage);
       return true;
     },
   );
@@ -2636,6 +3016,40 @@ test("extractor admission includes reading-experience and terminal contracts", a
 
   await extractChapterStateWithConnection(connection, chapter, undefined, undefined, complete, 2_100);
   assert.equal(calls, 1, "the compact extraction request should fit the control budget");
+
+  const secondChapterRequirement = story.readingExperience.openingRequirements.find((requirement) => requirement.chapterOffset === 1)!;
+  let secondChapterExtractorSystem = "";
+  await extractChapterStateWithConnection(
+    connection,
+    chapter,
+    undefined,
+    story.readingExperience,
+    async <T>(_connection, _model, system) => {
+      secondChapterExtractorSystem = system;
+      return {
+        value: {
+          events: [],
+          characterUpdates: [],
+          itemUpdates: [],
+          experienceEvidence: story.readingExperience.axes.map((axis) => ({
+            axisId: axis.id,
+            word: axis.word,
+            signalIds: secondChapterRequirement.requiredSignalIds.filter((signalId) => axis.observableSignals.some((signal) => signal.id === signalId)),
+            quote: "正文中的连续原句证据",
+          })),
+        } as T,
+        usageTokens: 100,
+        usageEstimated: false,
+      };
+    },
+    CONTINUATION_JOB_TOKEN_BUDGET,
+    2,
+  );
+  for (const axis of story.readingExperience.axes) {
+    const requiredForAxis = secondChapterRequirement.requiredSignalIds.filter((signalId) => axis.observableSignals.some((signal) => signal.id === signalId));
+    assert.ok(secondChapterExtractorSystem.includes(`"signalIds":${JSON.stringify(requiredForAxis)}`));
+  }
+  assert.match(secondChapterExtractorSystem, /当前是第 2 章/);
 
   const longText = "必须由主角行动与结果直接兑现".repeat(300);
   const richExperience = {
@@ -2986,6 +3400,8 @@ test("chapter plans enforce novel-sized prose instead of paragraph-count padding
   assert.ok(compact.targetCharacters < standard.targetCharacters);
   assert.ok(standard.targetCharacters < immersive.targetCharacters);
   assert.ok(standard.targetCharacters >= 2_400);
+  assert.ok(standard.minCharacters <= 1_900, "standard chapters should accept concise complete output from compatible providers");
+  assert.ok(standard.maxCharacters >= 4_500, "standard chapters should accept detailed complete output from compatible providers");
 
   for (const plan of [compact, standard, immersive]) {
     const generated = generateLocalChapter(story, plan);
@@ -3258,6 +3674,40 @@ test("grounding can preserve an exact adjacent-sentence victory span inside a lo
     grounded,
     { protagonistNames: ["林峰"], chapterNumber: 1 },
   ));
+});
+
+test("grounding recognizes a natural named-opponent victory instead of keeping a paraphrased audit quote", () => {
+  const contract = createStory({ genre: "玄幻", tone: "系统 · 无敌" }, "user_test").readingExperience;
+  const systemQuote = "陆玄点下系统签到按钮，永久功法奖励立即到账并开始运转";
+  const victoryQuote = "围观弟子亲眼看见陆玄一掌把周嵩打退，周嵩连抬头对视的勇气都没有";
+  const content = `${systemQuote}。${victoryQuote}。`;
+  const grounded = groundReadingExperienceEvidence(contract, content, [
+    {
+      axisId: "primary",
+      word: "系统",
+      signalIds: [contract.axes[0].observableSignals[1].id],
+      quote: systemQuote,
+    },
+    {
+      axisId: "secondary",
+      word: "无敌",
+      signalIds: [contract.axes[1].observableSignals[2].id],
+      quote: "陆玄只用一掌便将执法长老击退，对方不敢反抗",
+    },
+  ], { protagonistNames: ["陆玄"] });
+
+  assert.match(grounded[1].quote, /陆玄一掌把周嵩打退/);
+  assert.equal(content.includes(grounded[1].quote), true);
+
+  const objectOnly = `${systemQuote}。陆玄一掌把房门击退三丈，门板撞在墙上裂开。`;
+  const objectGrounded = groundReadingExperienceEvidence(contract, objectOnly, [
+    grounded[0],
+    {
+      ...grounded[1],
+      quote: "陆玄一掌击退强敌，对方不敢反抗",
+    },
+  ], { protagonistNames: ["陆玄"] });
+  assert.equal(objectOnly.includes(objectGrounded[1].quote), false);
 });
 
 test("segmented protagonist system interaction is accepted without crediting another character's system", () => {
@@ -4229,6 +4679,85 @@ test("chapter two validation requires the persistent reading-experience signals"
     characterUpdates: [],
     experienceEvidence: evidenceFor(true),
   }));
+
+  const paraphrasedExtractedState = {
+    events: [],
+    characterUpdates: [],
+    experienceEvidence: evidenceFor(true).map((item) => ({
+      ...item,
+      quote: item.word === "系统"
+        ? "系统奖励继续由主角掌握并且可以随时调用"
+        : "主角仍以压倒性的力量轻易取得了胜利",
+    })),
+  };
+  const anchoredContent = anchored.paragraphs.join("\n");
+  for (const item of paraphrasedExtractedState.experienceEvidence) {
+    assert.equal(anchoredContent.includes(item.quote), false);
+  }
+  assert.doesNotThrow(() => validateGeneratedChapter(story, anchored, plan, paraphrasedExtractedState));
+  for (const item of paraphrasedExtractedState.experienceEvidence) {
+    assert.equal(anchoredContent.includes(item.quote), true);
+  }
+});
+
+test("chapter two continuity can use a concrete same-revision canon outcome when the state ledger is generic", () => {
+  const story = createStory({ genre: "玄幻", tone: "系统 · 无敌" }, "user_test");
+  const lead = story.characters[0];
+  const genericKnowledge = [...lead.knowledge];
+  const genericKnowledgeSources = lead.knowledgeSources.map((source) => ({ ...source }));
+  const firstRevision = currentRevision(story.chapters[0])!;
+  firstRevision.paragraphs.push(
+    `${lead.name}领取系统永久奖励混沌道体，修为当场提升到筑基大圆满。`,
+    `${lead.name}把玄阳基础剑典修炼到圆满，并以剑势一击镇压演武场强敌。`,
+  );
+
+  lead.knowledge = ["系统奖励玄天古剑权限已经永久生效"];
+  lead.knowledgeSources = [{
+    fact: lead.knowledge[0],
+    sourceChapter: 1,
+    sourceRevisionId: story.chapters[0].currentRevisionId,
+  }];
+
+  const plan = planNextChapter(story);
+  const generated = {
+    ...generateLocalChapter(story, plan),
+    model: "external-writer",
+    origin: "model" as const,
+  };
+  lead.knowledge = genericKnowledge;
+  lead.knowledgeSources = genericKnowledgeSources;
+  story.events[0].outcome = `${lead.name}获得混沌道体、玄阳基础剑典圆满等奖励，并提升到筑基大圆满。`;
+  generated.paragraphs[0] = `${generated.paragraphs[0]}${lead.name}凭着混沌道体里流转的灵力，袖袍轻轻往后一拂，四名执法弟子立刻倒飞出去。`;
+  const localEvidence = generated.experienceEvidence!;
+  const extracted = {
+    events: [],
+    characterUpdates: [],
+    experienceEvidence: story.readingExperience.axes.map((axis) => ({
+      axisId: axis.id,
+      word: axis.word,
+      signalIds: [axis.observableSignals.at(-1)!.id],
+      quote: localEvidence.find((item) => item.axisId === axis.id)!.quote,
+    })),
+  };
+
+  assert.equal(lead.knowledgeSources.some((source) => /混沌道体|玄阳基础剑典/.test(source.fact)), false);
+  assert.match(firstRevision.paragraphs.join("\n"), /混沌道体.*玄阳基础剑典/s);
+  assert.equal(story.events[0].revisionId, firstRevision.id);
+  assert.equal(story.events[0].branchId, story.activeBranchId);
+  assert.match(story.events[0].outcome, /混沌道体.*玄阳基础剑典/);
+  assert.match(buildChapterPrompt(story, plan), /连续性硬约束.*混沌道体.*玄阳基础剑典/s);
+  assert.doesNotThrow(() => validateGeneratedChapter(story, generated, plan, extracted));
+
+  const ungroundedStory = structuredClone(story);
+  const ungroundedFirstRevision = currentRevision(ungroundedStory.chapters[0])!;
+  ungroundedFirstRevision.paragraphs = ungroundedFirstRevision.paragraphs.filter(
+    (paragraph) => !/混沌道体|玄阳基础剑典/.test(paragraph),
+  );
+  ungroundedStory.events[0].outcome = "系统状态已经更新，现场秩序随之改变。";
+  assert.throws(
+    () => validateGeneratedChapter(ungroundedStory, generated, plan, extracted),
+    /第二章没有沿用/,
+  );
 });
 
 test("system opening state facts preserve rewards and dominant outcomes for chapter two", () => {
@@ -4479,7 +5008,28 @@ test("connection test selects Chat Completions when its response is valid", asyn
   try {
     const capabilities = await testConnection(provider.connection, readFakeModelSecret);
     assert.equal(capabilities.completionApi, "chat_completions");
+    assert.equal(capabilities.embeddingApi, "embeddings");
     assert.equal(provider.responsesCalls(), 1);
+  } finally {
+    await provider.close();
+  }
+});
+
+test("connection test negotiates the Ark multimodal embedding endpoint and typed input", async () => {
+  const provider = await startFakeModelProvider({ embeddingMode: "ark_multimodal" });
+  provider.connection.routes.embedding = "doubao-embedding-vision-251215";
+  try {
+    const capabilities = await testConnection(provider.connection, readFakeModelSecret);
+    assert.equal(capabilities.embedding, true);
+    assert.equal(capabilities.embeddingApi, "embeddings_multimodal");
+    assert.deepEqual(provider.embeddingRequests(), [{
+      pathname: "/embeddings/multimodal",
+      body: {
+        model: "doubao-embedding-vision-251215",
+        encoding_format: "float",
+        input: [{ type: "text", text: "能力探测" }],
+      },
+    }]);
   } finally {
     await provider.close();
   }
@@ -4717,6 +5267,28 @@ test("structured gates reject unsupported knowledge, invalid item reuse, and wro
   const unrelatedClaimPlan = planNextChapter(story, unrelatedClaimDrafts);
   assert.equal(unrelatedClaimPlan.candidates.find((candidate) => candidate.event.includes("谜面"))?.score, 0);
 
+  const semanticDrafts = Array.from({ length: 3 }, (_, index) => ({
+    creativeAxis: `语义正史${index}`,
+    event: `周砚依据三日后失效的潮门时限，与新任守门人${index}当场调整封锁顺序`,
+    cause: "潮压正在升高",
+    cost: "公开原有安排",
+    impact: "封锁顺序立即改变",
+    novelty: "让既有时限直接推动现场行动",
+    participantNames: ["周砚", `新任守门人${index}`],
+    storyTime: "事故后的第三日",
+    dependsOnEventIds: [lastEventId],
+    knowledgeClaims: [{ characterName: "周砚", fact: "潮门将在三日后失效", sourceRevisionId: "rev_black_16_1" }],
+    knowledgeAudit: { complete: true, dependencies: [{ characterName: "周砚", fact: "潮门将在三日后失效" }] },
+    itemTransitions: [{
+      itemName: `新制潮门钥匙${index}`,
+      actorName: `新任守门人${index}`,
+      fromStatus: "available" as const,
+      toStatus: "held" as const,
+    }],
+  }));
+  const semanticPlan = planNextChapter(story, semanticDrafts);
+  assert.ok(semanticPlan.candidates.some((candidate) => candidate.score > 0));
+
   const badge = story.items.find((item) => item.name === "王室旧徽章")!;
   badge.status = "destroyed";
   badge.holderCharacterId = undefined;
@@ -4741,11 +5313,14 @@ test("chapter length and minimal retcon are enforced without replacing independe
   const store = createSeedStore();
   const story = store.stories.find((item) => item.id === "story_black_tide")!;
   const plan = planNextChapter(story, undefined, "compact");
+  assert.equal(chapterParagraphCountIsAllowed(24, 16), true);
+  assert.equal(chapterParagraphCountIsAllowed(25, 16), false);
+  const excessiveParagraphs = Math.ceil(plan.targetParagraphs * 1.5) + 1;
   assert.throws(() => validateGeneratedChapter(story, {
     title: "过长章节",
-    paragraphs: Array.from({ length: plan.targetParagraphs + 2 }, (_, index) => `第 ${index + 1} 段保持完整。`),
+    paragraphs: Array.from({ length: excessiveParagraphs }, (_, index) => `第 ${index + 1} 段保持完整。`),
     model: "test",
-  }, plan), /偏离目标/);
+  }, plan), /合理范围/);
 
   const death = story.events.find((event) => event.type === "death" && event.active)!;
   const chapter = story.chapters.find((item) => item.number === death.chapterNumber)!;

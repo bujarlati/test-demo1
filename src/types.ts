@@ -451,9 +451,11 @@ export interface ModelRoutes {
 }
 
 export type OpenAICompletionApi = "chat_completions" | "responses";
+export type OpenAIEmbeddingApi = "embeddings" | "embeddings_multimodal";
 
 export interface CapabilitySnapshot {
   completionApi?: OpenAICompletionApi;
+  embeddingApi?: OpenAIEmbeddingApi;
   streaming: boolean;
   jsonSchema: boolean;
   embedding: boolean;

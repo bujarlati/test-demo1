@@ -65,7 +65,7 @@ const projectRoot = path.resolve(currentDirectory, "..");
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const USER_DAILY_TOKEN_BUDGET = 1_500_000;
-const STORY_DAILY_TOKEN_BUDGET = 120_000;
+const STORY_DAILY_TOKEN_BUDGET = 500_000;
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
@@ -637,15 +637,20 @@ async function generateChapter(
       for (let qualityAttempt = 1; qualityAttempt <= maxQualityAttempts; qualityAttempt += 1) {
         generated = undefined;
         extracted = undefined;
+        const rewriteTargetMin = Math.max(plan.minCharacters + 200, plan.targetCharacters - 100);
+        const rewriteTargetMax = Math.min(plan.maxCharacters - 100, plan.targetCharacters + 300);
         const prompt = qualityAttempt === 1
           ? basePrompt
-          : `${basePrompt}\n上一次正文没有同时通过双阅读体验证据与沉浸感检查，请彻底重写，不要解释，也不要在正文提到检查过程。失败原因：${qualityFailure instanceof Error ? qualityFailure.message : "质量证据不足"}`;
+          : `${basePrompt}\n请另起思路生成一份全新成稿，只呈现人物在故事世界中当下可感知的行动、对话与结果，不要解释或复述任何写作要求。成稿长度请稳定落在 ${rewriteTargetMin}—${rewriteTargetMax} 字，并用具体动作分别兑现两个阅读体验。`;
         const writerInputBudget = estimateChapterWriterInputTokenBudget(
           prompt,
           Boolean(effectiveConnection.capabilities?.streaming),
         );
+        const writerOutputLimit = body.chapterLength === "compact"
+          ? 4_500
+          : body.chapterLength === "standard" ? 5_800 : 6_500;
         const writerTokenBudget = Math.min(
-          6_500,
+          writerOutputLimit,
           Math.floor(JOB_TOKEN_BUDGET - usedTokens - writerInputBudget - CHAPTER_EXTRACTION_ADMISSION_RESERVE),
         );
         if (!isManagedLocal && writerTokenBudget < 2_000) {
@@ -697,6 +702,7 @@ async function generateChapter(
             story.readingExperience,
             undefined,
             JOB_TOKEN_BUDGET - usedTokens,
+            story.chapters.length + 1,
           );
           usedTokens += extracted.usageTokens ?? 0;
           usageEstimated ||= extracted.usageEstimated ?? true;
@@ -1352,6 +1358,7 @@ app.post("/api/model-connections/:connectionId/test", requireAdmin, async (reque
       streaming: connection.capabilities.streaming,
       jsonSchema: connection.capabilities.jsonSchema,
       embedding: connection.capabilities.embedding,
+      embeddingApi: connection.capabilities.embeddingApi ?? "none",
     });
     await persist();
     response.json(connection);

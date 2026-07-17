@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
-import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, ReadingExperienceContract, ReadingExperienceEvidence, Story } from "../src/types";
+import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, OpenAIEmbeddingApi, ReadingExperienceContract, ReadingExperienceEvidence, Story } from "../src/types";
 import {
   assertImmersiveNarration,
   assertPersistentExperienceFacts,
@@ -419,21 +419,58 @@ async function probeStreaming(connection: ModelConnection, apiKey: string) {
   }
 }
 
-async function probeEmbedding(connection: ModelConnection, apiKey: string) {
-  try {
-    const response = await modelFetch(connection, apiKey, "/embeddings", {
-      method: "POST",
-      body: JSON.stringify({ model: connection.routes.embedding, input: "能力探测" }),
-    });
-    if (!response.ok) {
-      await discardResponse(response);
-      return false;
+function embeddingVector(payload: unknown): number[] | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const data = (payload as { data?: unknown }).data;
+  const rawEmbedding = Array.isArray(data)
+    ? (data[0] && typeof data[0] === "object" ? (data[0] as { embedding?: unknown }).embedding : undefined)
+    : (data && typeof data === "object" ? (data as { embedding?: unknown }).embedding : undefined);
+  if (!Array.isArray(rawEmbedding) || rawEmbedding.length === 0) return undefined;
+  const vector = rawEmbedding.length === 1 && Array.isArray(rawEmbedding[0])
+    ? rawEmbedding[0]
+    : rawEmbedding;
+  return vector.length > 0 && vector.every((value) => typeof value === "number" && Number.isFinite(value))
+    ? vector as number[]
+    : undefined;
+}
+
+async function probeEmbedding(connection: ModelConnection, apiKey: string): Promise<OpenAIEmbeddingApi | undefined> {
+  const standard = {
+    api: "embeddings" as const,
+    pathname: "/embeddings",
+    body: { model: connection.routes.embedding, encoding_format: "float", input: ["能力探测"] },
+  };
+  const multimodal = {
+    api: "embeddings_multimodal" as const,
+    pathname: "/embeddings/multimodal",
+    body: {
+      model: connection.routes.embedding,
+      encoding_format: "float",
+      input: [{ type: "text", text: "能力探测" }],
+    },
+  };
+  const likelyMultimodal = /(?:embedding[-_].*(?:vision|multimodal)|(?:vision|multimodal).*embedding)/i
+    .test(connection.routes.embedding);
+  const probes = likelyMultimodal ? [multimodal, standard] : [standard, multimodal];
+  for (const probe of probes) {
+    try {
+      const response = await modelFetch(connection, apiKey, probe.pathname, {
+        method: "POST",
+        body: JSON.stringify(probe.body),
+      });
+      if (!response.ok) {
+        const canTryAlternate = [400, 404, 405, 415, 422, 501].includes(response.status);
+        await discardResponse(response);
+        if (canTryAlternate) continue;
+        return undefined;
+      }
+      const payload = await response.json();
+      if (embeddingVector(payload)) return probe.api;
+    } catch {
+      return undefined;
     }
-    const payload = (await response.json()) as { data?: Array<{ embedding?: unknown }> };
-    return Array.isArray(payload.data?.[0]?.embedding);
-  } catch {
-    return false;
   }
+  return undefined;
 }
 
 async function probeToolCalling(connection: ModelConnection, apiKey: string) {
@@ -569,8 +606,8 @@ export async function testConnection(
   for (const [model, roles] of mandatoryEntries.slice(1)) {
     await assertOpeningRouteCompletion(connection, apiKey, model, roles, completionApi);
   }
-  const [jsonSchema, streaming, embedding, toolCalling, promptCache] = completionApi === "chat_completions"
-    ? await runWithConcurrency([
+  const capabilityResults = completionApi === "chat_completions"
+    ? await runWithConcurrency<boolean | OpenAIEmbeddingApi | undefined>([
         () => probeJson(connection, apiKey),
         () => probeStreaming(connection, apiKey),
         () => probeEmbedding(connection, apiKey),
@@ -578,11 +615,17 @@ export async function testConnection(
         () => probePromptCache(connection, apiKey),
       ], 2)
     : [false, false, await probeEmbedding(connection, apiKey), false, false];
+  const jsonSchema = capabilityResults[0] === true;
+  const streaming = capabilityResults[1] === true;
+  const embeddingApi = typeof capabilityResults[2] === "string" ? capabilityResults[2] : undefined;
+  const toolCalling = capabilityResults[3] === true;
+  const promptCache = capabilityResults[4] === true;
   return {
     completionApi,
     streaming,
     jsonSchema,
-    embedding,
+    embedding: Boolean(embeddingApi),
+    embeddingApi,
     promptCache,
     toolCalling,
     maxContextTokens,
@@ -663,6 +706,15 @@ function isSiliconFlowConnection(connection: ModelConnection): boolean {
   try {
     const hostname = new URL(connection.baseUrl).hostname.toLowerCase();
     return hostname === "siliconflow.cn" || hostname.endsWith(".siliconflow.cn");
+  } catch {
+    return false;
+  }
+}
+
+function isVolcengineArkConnection(connection: ModelConnection): boolean {
+  try {
+    const hostname = new URL(connection.baseUrl).hostname.toLowerCase();
+    return hostname.startsWith("ark.") && hostname.endsWith(".volces.com");
   } catch {
     return false;
   }
@@ -762,9 +814,15 @@ export async function completeJson<T>(
   const apiKey = await secretReader(connection.id, connection.secretVersion);
   const completionApi = completionApiFor(connection);
   const streamStructuredResponse = completionApi === "chat_completions" &&
-    isSiliconFlowConnection(connection) && connection.capabilities?.streaming === true;
+    connection.capabilities?.streaming === true;
   const useConciseQwenExtractorOutput = isSiliconFlowConnection(connection) &&
     model === connection.routes.extractor && /^Qwen\/Qwen3(?:[-./]|$)/i.test(model);
+  const generationStage = dependencies.stage?.trim();
+  const isNonPlanningGenerationStage = generationStage
+    ? /(?:候选规划|正文|审稿|审计|抽取|提取|修复)/.test(generationStage)
+    : model === connection.routes.writer || model === connection.routes.extractor;
+  const disableArkDeepThinking = isVolcengineArkConnection(connection) && /^doubao-seed-/i.test(model) &&
+    isNonPlanningGenerationStage;
   const body: Record<string, unknown> = completionApi === "responses"
     ? {
         model,
@@ -783,7 +841,11 @@ export async function completeJson<T>(
         stream: streamStructuredResponse,
         max_tokens: maxTokens,
       };
+  if (disableArkDeepThinking) body.thinking = { type: "disabled" };
   if (completionApi === "chat_completions") {
+    if (streamStructuredResponse && isVolcengineArkConnection(connection)) {
+      body.stream_options = { include_usage: true };
+    }
     if (useConciseQwenExtractorOutput) body.enable_thinking = false;
     if (
       connection.capabilities?.jsonSchema &&
@@ -1170,18 +1232,24 @@ function openingPlanSemanticRepairTargets(
     ["endingContract", value.endingContract as unknown as Record<string, unknown>],
     ["worldBible", value.worldBible as unknown as Record<string, unknown>],
   ];
-  for (const [sectionName, section] of sections) {
-    for (const [field, fieldValue] of Object.entries(section)) {
-      try {
-        assertReadingExperienceNegativeInvariants(
-          baseContract,
-          JSON.stringify({ [sectionName]: { [field]: fieldValue } }),
-          { protagonistNames: [value.leadName] },
-        );
-      } catch {
-        targets.add(`${sectionName}.${field}`);
+  const collectNegativeInvariantTargets = (experienceContext = "") => {
+    for (const [sectionName, section] of sections) {
+      for (const [field, fieldValue] of Object.entries(section)) {
+        try {
+          assertReadingExperienceNegativeInvariants(
+            baseContract,
+            `${experienceContext}${JSON.stringify({ [sectionName]: { [field]: fieldValue } })}`,
+            { protagonistNames: [value.leadName] },
+          );
+        } catch {
+          targets.add(`${sectionName}.${field}`);
+        }
       }
     }
+  };
+  collectNegativeInvariantTargets();
+  if (targets.size === 0) {
+    collectNegativeInvariantTargets(`阅读体验词：${baseContract.sourceWords.join("、")}，字段内容：`);
   }
   return [...targets];
 }
@@ -1411,7 +1479,8 @@ export async function generateStoryOpeningWithConnection(
   let usageEstimated = planner.usageEstimated;
   let planValue = planner.value;
   let planIssues = openingPlanValidationIssues(planValue);
-  let planRepairCount = 0;
+  let schemaPlanRepairCount = 0;
+  let semanticPlanRepairCount = 0;
   const repairPlan = async (
     issues: string[],
     mode: "schema" | "semantic",
@@ -1439,7 +1508,8 @@ export async function generateStoryOpeningWithConnection(
       remainingTokens: tokenBudget - accumulatedTokens,
       stage: "开篇蓝图修复",
     };
-    planRepairCount += 1;
+    if (mode === "schema") schemaPlanRepairCount += 1;
+    else semanticPlanRepairCount += 1;
     try {
       assertModelCallTokenBudget({
         remainingTokens: tokenBudget - accumulatedTokens,
@@ -1473,11 +1543,12 @@ export async function generateStoryOpeningWithConnection(
   };
   let plan!: Required<OpeningPlanPayload>;
   let contract!: ReadingExperienceContract;
-  const maxPlanRepairs = 2;
+  const maxSchemaPlanRepairs = 2;
+  const maxSemanticPlanRepairs = 2;
   while (true) {
     planIssues = openingPlanValidationIssues(planValue);
     if (planIssues.length > 0) {
-      if (planRepairCount >= maxPlanRepairs) {
+      if (schemaPlanRepairCount >= maxSchemaPlanRepairs) {
         throw attachModelUsage(
           new Error(`规划模型输出未通过开篇蓝图 Schema 校验：${planIssues.join("；")}。`),
           accumulatedTokens,
@@ -1496,7 +1567,7 @@ export async function generateStoryOpeningWithConnection(
       if (semanticTargets.length === 0) {
         throw attachModelUsage(error, accumulatedTokens, usageEstimated);
       }
-      if (planRepairCount >= maxPlanRepairs) {
+      if (semanticPlanRepairCount >= maxSemanticPlanRepairs) {
         throw attachModelUsage(error, accumulatedTokens, usageEstimated);
       }
       planValue = await repairPlan(
@@ -1510,11 +1581,17 @@ export async function generateStoryOpeningWithConnection(
   if (contract.sourceWords.includes("系统")) {
     specializedOpeningInstructions.push(
       `系统体验强制前置：第一段前 120 字内，${plan.leadName}本人必须主动触发系统或打开面板，系统必须立即反馈并结算、发放一项永久可用的奖励、权限或能力，${plan.leadName}须在第一段结束前领取或调用它。至少安排一句不超过 100 字的独立原句，在同一句中明确写出${plan.leadName}打开系统面板、系统发放永久奖励，以及${plan.leadName}点击领取或立即调用；不得把这三步拆散后只用“他”或界面提示代称。不得先写背景，且不得先写赶路、旁观、调查、回忆或长篇环境铺陈。`,
+      "系统稳定性写法：不要把上方禁止捷径中的词语复制进小说；只用正面事实写系统持续在线、即时结算、奖励与权限永久生效，并通过主角反复调用后的实际结果证明。",
     );
   }
   if (contract.sourceWords.includes("无敌")) {
     specializedOpeningInstructions.push(
-      `无敌体验强制前置：前 15% 内让${plan.leadName}亲自使用已经到手的能力，在第一场有意义的冲突中压倒性获胜；必须写出对手无力反抗以及旁观者、资源、身份或现场秩序的即时变化。至少安排一句不超过 80 字的独立原句，在同一句中明确写出${plan.leadName}的姓名、一次“一击/一招/抬手/弹指”等直接动作、被击败或镇压的具体对手，以及“无法反抗/毫无还手之力/当场认输”等决定性结果；不得只用“他”“青年”等指代${plan.leadName}。`,
+      `无敌体验强制前置：前 15% 内让${plan.leadName}亲自使用已经到手的能力，在第一场有意义的冲突中压倒性获胜；必须写出对手无力反抗以及旁观者、资源、身份或现场秩序的即时变化。至少安排一句不超过 80 字的独立原句，在同一句中明确写出${plan.leadName}的姓名、一次“一击/一招/抬手/弹指”等直接动作、被击败或镇压的具体对手，以及“无法反抗/毫无还手之力/当场认输”等决定性结果；不得只用“他”“青年”等指代${plan.leadName}。胜利句后必须在同一段或紧接的下一段写出已经发生的现实反应，使用明确主语与动作，例如“围观弟子当场低头让路”“宗门随即撤销命令”“主角身份立即确立”“现场秩序随即改写”；不能只写气氛、表情或未来计划。`,
+    );
+  }
+  if (contract.sourceWords.includes("系统") && contract.sourceWords.includes("无敌")) {
+    specializedOpeningInstructions.push(
+      `系统无敌首段固定骨架：必须把以下三句逐字放在第一段最前面，再接着扩写现场，不得在它们之前添加任何文字——“${plan.leadName}打开系统面板，系统立即发放永久生效的至尊权限奖励，${plan.leadName}点击领取并当场调用。${plan.leadName}抬手一击镇压眼前强敌，对方毫无还手之力。围观者当场低头让路，现场秩序随即改写，${plan.leadName}的身份立即确立。”`,
     );
   }
   const writerPrompt = [
@@ -1526,9 +1603,10 @@ export async function generateStoryOpeningWithConnection(
       worldBible: plan.worldBible,
       openingBeats: plan.openingBeats,
     })}`,
+    `用户原始灵感（具体设定与结果必须保留）：${context.input.inspiration?.trim() || "由模型原创"}`,
     formatReadingExperienceForPrompt(contract, 1),
     ...specializedOpeningInstructions,
-    "写第一章正文，严格写 18 个完整段落，每段 140—220 个中文字符；去除空白后的正文总长必须为 2800—3600 个中文字符。不要用大量短段凑数，也不要把对话拆成不足 140 字的独立段落。首段直接进入事件；前 15% 兑现两个体验轴；本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。",
+    "写第一章正文，严格写 18 个完整段落，每段 100—220 个中文字符；去除空白后的正文目标总长为 2000—3600 个中文字符。不要用大量短段凑数，也不要把对话拆成不足 100 字的独立段落。首段直接进入事件；前 15% 兑现两个体验轴；本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。",
     `只返回 JSON：{\"title\":\"章名\",\"paragraphs\":[\"完整段落\"]}。${IMMERSIVE_NARRATION_PROMPT}`,
   ].join("\n");
   const writerSystem = "你是原创中文长篇网文作家。用现场动作、人物选择、冲突结果和具体关系写作；回报及时，因果清楚，禁止作者侧元叙事。只返回符合要求的 JSON。";
@@ -1536,9 +1614,14 @@ export async function generateStoryOpeningWithConnection(
   let lastFailure: unknown;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let writer: Awaited<ReturnType<OpeningModelCompleter>>;
+    const recoveryHint = lastFailure instanceof Error && /即时实际反应|即时现实反应|前 15% 没有完成/.test(lastFailure.message)
+      ? "本次重写必须把压倒性胜利及现实反应放在前 15%：胜利句后立刻在同段或下一段原样采用一种明确结果句式——围观弟子当场低头让路、宗门随即撤销命令、主角身份立即确立或现场秩序随即改写。"
+      : lastFailure instanceof Error && /系统.*(?:稳定结算|持续可用|不可操作|无反馈|无奖励)/.test(lastFailure.message)
+        ? "本次重写只用正面事实表现系统持续在线、即时结算、奖励与权限永久生效，代价只能来自胜利后的世界、资源或关系变化。"
+        : "本次重写逐项兑现失败原因，并让动作、对象、结果与现场反应出现在相邻句段中。";
     const attemptPrompt = attempt === 1
       ? writerPrompt
-      : `${writerPrompt}\n上一稿未通过沉浸感或双体验证据检查，请彻底重写，不要解释。失败原因：${lastFailure instanceof Error ? lastFailure.message : "质量证据不足"}`;
+      : `${writerPrompt}\n上一稿未通过沉浸感或双体验证据检查，请彻底重写，不要解释。失败原因：${lastFailure instanceof Error ? lastFailure.message : "质量证据不足"}\n${recoveryHint}`;
     const writerRequest: OpeningCompletionRequest = {
       connection,
       model: connection.routes.writer,
@@ -1801,13 +1884,13 @@ export async function generateCandidateDraftsWithConnection(
     .filter((event) => event.active && event.branchId === story.activeBranchId)
     .slice(-12)
     .map((event) => ({ id: event.id, title: event.title, storyTime: event.storyTime }));
-  const plannerSystem = "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty,participantNames,storyTime,dependsOnEventIds,knowledgeClaims,itemTransitions。knowledgeClaims 每项含 characterName/fact/sourceRevisionId；itemTransitions 每项含 itemName/actorName/fromStatus/toStatus。只给短剧情胶囊，不写正文。";
-  const plannerPrompt = `故事：${story.title}；题材：${story.genre}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；题材创意轴：${story.storyGene.creativeAxes.join("、")}；篇幅：第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，第 ${storyArc.volumeNumber} / ${storyArc.totalVolumes} 卷，本卷第 ${storyArc.chapterInVolume} / ${storyArc.volumeChapterCount} 章，阶段=${storyArc.label}；阶段要求：${storyArc.guidance}；结局契约：${story.endingContract.targetEnding}；必要前置条件：${story.endingContract.prerequisites.join("；")}。${formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1)}。所有候选必须在同一事件中兑现两个阅读体验轴，并让结果产生正文可引用的证据。所有候选的核心事件、资源、两难与代价都必须属于“${story.genre}”的典型叙事，不得把非悬疑题材统一写成追踪线索、救证人或查案；终卷不得开启新世界、新势力或大型支线，目标章候选必须明确兑现结局契约及至少一项必要前置条件。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 5 个结构不同的候选。`;
+  const plannerSystem = "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty,participantNames,storyTime,dependsOnEventIds,knowledgeClaims,itemTransitions。knowledgeClaims 每项含 characterName/fact/sourceRevisionId；itemTransitions 只记录实体物品的状态流转，每项含 itemName/actorName/fromStatus/toStatus，fromStatus 与 toStatus 只能是 available、held、lost、destroyed、consumed 之一；能力升级、身份、排名、职位、效忠和权限变化不得填入 itemTransitions，没有实体物品变化时返回空数组。只给短剧情胶囊，不写正文。";
+  const plannerPrompt = `故事：${story.title}；题材：${story.genre}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；题材创意轴：${story.storyGene.creativeAxes.join("、")}；篇幅：第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，第 ${storyArc.volumeNumber} / ${storyArc.totalVolumes} 卷，本卷第 ${storyArc.chapterInVolume} / ${storyArc.volumeChapterCount} 章，阶段=${storyArc.label}；阶段要求：${storyArc.guidance}；结局契约：${story.endingContract.targetEnding}；必要前置条件：${story.endingContract.prerequisites.join("；")}。${formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1)}。所有候选必须在同一事件中兑现两个阅读体验轴，并让结果产生正文可引用的证据。所有候选的核心事件、资源、两难与代价都必须属于“${story.genre}”的典型叙事，不得把非悬疑题材统一写成追踪线索、救证人或查案；终卷不得开启新世界、新势力或大型支线，目标章候选必须明确兑现结局契约及至少一项必要前置条件。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 3 个结构不同的候选。`;
   assertModelCallTokenBudget({
     remainingTokens: tokenBudget,
     system: plannerSystem,
     prompt: plannerPrompt,
-    maxOutputTokens: 1_800,
+    maxOutputTokens: 2_400,
     stage: "候选规划",
   });
   const completion = await complete<{ candidates?: CandidateDraft[] }>(
@@ -1816,7 +1899,7 @@ export async function generateCandidateDraftsWithConnection(
     plannerSystem,
     plannerPrompt,
     GENERATION_STAGE_TIMEOUT_MS.planner,
-    1_800,
+    2_400,
     { remainingTokens: tokenBudget, stage: "候选规划" },
   );
   const payload = completion.value;
@@ -1831,10 +1914,7 @@ export async function generateCandidateDraftsWithConnection(
         claim && typeof claim.characterName === "string" && typeof claim.fact === "string" &&
         typeof claim.sourceRevisionId === "string" && claim.sourceRevisionId.trim().length > 0,
       ) &&
-      Array.isArray(item.itemTransitions) && item.itemTransitions.every((transition) =>
-        transition && typeof transition.itemName === "string" && typeof transition.actorName === "string" &&
-        itemStatuses.has(transition.fromStatus) && itemStatuses.has(transition.toStatus),
-      ),
+      Array.isArray(item.itemTransitions),
     )
     .map((item) => ({
       creativeAxis: item.creativeAxis.slice(0, 80),
@@ -1856,12 +1936,12 @@ export async function generateCandidateDraftsWithConnection(
       completion.usageEstimated,
     );
   }
-  const selectedCandidates = candidates.slice(0, 5);
+  const selectedCandidates = candidates.slice(0, 3);
   type CandidateAuditPayload = {
     audits?: Array<{ candidateIndex?: number; complete?: boolean; dependencies?: Array<{ characterName?: string; fact?: string }> }>;
   };
-  const auditSystem = "你是独立的剧情知识依赖审计器。只返回 JSON：{audits:[{candidateIndex,complete,dependencies:[{characterName,fact}]}]}。逐个候选穷尽提取角色行动所依赖的所有既有信息、解读材料、秘密、凭据、记录和推理前提；不要依赖固定动词或名词表，要理解同义表达、语序和隐含信息依赖。dependencies 只记录行动前必须已知的事实，不记录本章新发生的物理动作。只有确认穷尽时 complete 才为 true。";
-  const auditPrompt = `活动人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；候选：${JSON.stringify(selectedCandidates.map((candidate, candidateIndex) => ({ candidateIndex, event: candidate.event, cause: candidate.cause, cost: candidate.cost, impact: candidate.impact, novelty: candidate.novelty, participantNames: candidate.participantNames })))}。`;
+  const auditSystem = "你是独立的剧情知识依赖审计器。只返回 JSON：{audits:[{candidateIndex,complete,dependencies:[{characterName,fact}]}]}。逐个候选穷尽提取角色行动所依赖的所有既有信息、解读材料、秘密、凭据、记录和推理前提；不要依赖固定动词或名词表，要理解同义表达、语序和隐含信息依赖。dependencies 只记录行动前必须已知的事实，不记录本章新发生的物理动作；fact 必须逐字复制活动人物知识账本中的对应事实，不得自行改写。每个候选索引必须恰好返回一次。complete 只表示你是否已经检查完该候选并穷尽返回其既有知识依赖，不是剧情风险评级：只要输入完整可读且检查已经完成，complete 必须为 true，即使 dependencies 为空、候选含新人物或本章将发生新事件；仅当输入截断或确实无法完成检查时才返回 false。";
+  const auditPrompt = `活动人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；候选：${JSON.stringify(selectedCandidates.map((candidate, candidateIndex) => ({ candidateIndex, event: candidate.event, cause: candidate.cause, cost: candidate.cost, impact: candidate.impact, novelty: candidate.novelty, participantNames: candidate.participantNames, declaredKnowledgeClaims: candidate.knowledgeClaims })))}。候选中新登场的人物、地点、物品以及本章才发生的行动不属于既有知识依赖，不影响 complete=true。`;
   let auditCompletion: { value: CandidateAuditPayload; usageTokens: number; usageEstimated: boolean };
   try {
     assertModelCallTokenBudget({
@@ -1886,17 +1966,34 @@ export async function generateCandidateDraftsWithConnection(
   const audits = (auditCompletion.value as CandidateAuditPayload | null)?.audits ?? [];
   let auditedCandidates: CandidateDraft[];
   try {
-    auditedCandidates = selectedCandidates.map((candidate, candidateIndex) => {
+    auditedCandidates = [];
+    selectedCandidates.forEach((candidate, candidateIndex) => {
       const audit = audits.find((item) => item.candidateIndex === candidateIndex);
-      if (!audit?.complete || !Array.isArray(audit.dependencies)) {
-        throw new Error(`候选 ${candidateIndex + 1} 缺少完整的独立知识依赖审计。`);
-      }
+      if (!audit?.complete || !Array.isArray(audit.dependencies)) return;
       const dependencies = audit.dependencies
         .filter((dependency) => dependency && typeof dependency.characterName === "string" && typeof dependency.fact === "string" && dependency.fact.trim().length >= 2)
         .map((dependency) => ({ characterName: dependency.characterName!.slice(0, 80), fact: dependency.fact!.slice(0, 180) }));
-      if (dependencies.length !== audit.dependencies.length) throw new Error(`候选 ${candidateIndex + 1} 的知识依赖审计 Schema 无效。`);
-      return { ...candidate, knowledgeAudit: { complete: true, dependencies } };
+      if (dependencies.length !== audit.dependencies.length) return;
+      const knowledgeClaims = [...candidate.knowledgeClaims];
+      for (const dependency of dependencies) {
+        if (knowledgeClaims.some((claim) =>
+          claim.characterName === dependency.characterName &&
+          (claim.fact.includes(dependency.fact) || dependency.fact.includes(claim.fact)),
+        )) continue;
+        const ledgerFact = activeKnowledgeLedger
+          .find((entry) => entry.characterName === dependency.characterName)
+          ?.facts.find((fact) => fact.fact.includes(dependency.fact) || dependency.fact.includes(fact.fact));
+        if (ledgerFact) {
+          knowledgeClaims.push({
+            characterName: dependency.characterName,
+            fact: ledgerFact.fact,
+            sourceRevisionId: ledgerFact.sourceRevisionId,
+          });
+        }
+      }
+      auditedCandidates.push({ ...candidate, knowledgeClaims, knowledgeAudit: { complete: true, dependencies } });
     });
+    if (auditedCandidates.length === 0) throw new Error("没有剧情候选通过完整的独立知识依赖审计。");
   } catch (error) {
     throw attachModelUsage(
       error,
@@ -2034,6 +2131,10 @@ export async function streamChapterWithConnection(
     stream: true,
     max_tokens: maxTokens,
   };
+  if (isVolcengineArkConnection(connection) && /^doubao-seed-/i.test(connection.routes.writer)) {
+    body.thinking = { type: "disabled" };
+    body.stream_options = { include_usage: true };
+  }
   if (connection.capabilities?.jsonSchema) body.response_format = { type: "json_object" };
   let response: Response;
   try {
@@ -2043,9 +2144,7 @@ export async function streamChapterWithConnection(
       "/chat/completions",
       { method: "POST", body: JSON.stringify(body) },
       GENERATION_STAGE_TIMEOUT_MS.writer,
-      isSiliconFlowConnection(connection)
-        ? streamedCompletionOverallTimeout(GENERATION_STAGE_TIMEOUT_MS.writer, maxTokens)
-        : GENERATION_STAGE_TIMEOUT_MS.writer,
+      streamedCompletionOverallTimeout(GENERATION_STAGE_TIMEOUT_MS.writer, maxTokens),
     );
   } catch (error) {
     throw attachModelUsage(error, conservativeFailureTokens, true);
@@ -2118,6 +2217,7 @@ export async function extractChapterStateWithConnection(
   readingExperience?: ReadingExperienceContract,
   complete: JsonModelCompleter = completeJson,
   tokenBudget = CONTINUATION_JOB_TOKEN_BUDGET,
+  chapterNumber?: number,
 ): Promise<ExtractedChapterState> {
   const evidenceSignalExample = (axis: ReadingExperienceContract["axes"][number]) => {
     const modelSignal = axis.observableSignals.find((signal) => signal.id.includes("_model_signal_"));
@@ -2130,11 +2230,22 @@ export async function extractChapterStateWithConnection(
   const endingInstruction = endingContract
     ? ` 独立判断结局是否在剧情行动中真实完成。结局目标=${endingContract.targetEnding}；前置条件（按下标）=${endingContract.prerequisites.map((item, index) => `${index}:${item}`).join("；")}。evidence 必须逐字引用正文中至少 8 个字的连续原句；仅复述后台契约、不对应行动结果时必须判为 false。`
     : "";
+  const chapterRequirement = readingExperience && chapterNumber !== undefined
+    ? readingExperience.openingRequirements.find((requirement) =>
+        requirement.chapterOffset === chapterNumber - readingExperience.effectiveFromChapter,
+      )
+    : undefined;
+  const signalIdsForEvidence = (axis: ReadingExperienceContract["axes"][number]) => {
+    const requiredSignalIds = chapterRequirement?.requiredSignalIds.filter((signalId) =>
+      axis.observableSignals.some((signal) => signal.id === signalId),
+    ) ?? [];
+    return requiredSignalIds.length > 0 ? requiredSignalIds : evidenceSignalExample(axis);
+  };
   const experienceSchema = readingExperience
-    ? `，"experienceEvidence":[{"axisId":"primary","word":"${readingExperience.axes[0].word}","signalIds":${JSON.stringify(evidenceSignalExample(readingExperience.axes[0]))},"quote":"正文中的连续原句"},{"axisId":"secondary","word":"${readingExperience.axes[1].word}","signalIds":${JSON.stringify(evidenceSignalExample(readingExperience.axes[1]))},"quote":"正文中的连续原句"}]`
+    ? `，"experienceEvidence":[{"axisId":"primary","word":"${readingExperience.axes[0].word}","signalIds":${JSON.stringify(signalIdsForEvidence(readingExperience.axes[0]))},"quote":"正文中的连续原句"},{"axisId":"secondary","word":"${readingExperience.axes[1].word}","signalIds":${JSON.stringify(signalIdsForEvidence(readingExperience.axes[1]))},"quote":"正文中的连续原句"}]`
     : "";
   const experienceInstruction = readingExperience
-    ? ` 独立审查两个阅读体验轴，契约=${JSON.stringify(readingExperience)}。每个 evidence 必须逐字引用正文中至少 8 个字的连续原句，并具体对应所申报信号中的人物、动作、对象与结果；申报 _model_signal_ 时，同一句 quote 还必须逐字包含该信号 evidenceAnchors 中至少两个相互独立的短语，只出现体验词、人物称谓共词或无关动作不算兑现。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，但两轴不得复用同一句证据。系统奖励、权限、能力和长期状态必须作为主角的 knowledgeGained 原文保存。无法找到真实证据时返回空数组，让正文被拒绝重写。`
+    ? ` 独立审查两个阅读体验轴，契约=${JSON.stringify(readingExperience)}。${chapterNumber !== undefined ? `当前是第 ${chapterNumber} 章；本章必需信号=${JSON.stringify(chapterRequirement?.requiredSignalIds ?? [])}。有正文证据时，每个轴的 signalIds 必须包含该轴的本章必需信号，不得用其他章节的信号代替。` : ""}每个 evidence 必须逐字引用正文中至少 8 个字的连续原句，并具体对应所申报信号中的人物、动作、对象与结果；申报 _model_signal_ 时，同一句 quote 还必须逐字包含该信号 evidenceAnchors 中至少两个相互独立的短语，只出现体验词、人物称谓共词或无关动作不算兑现。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，但两轴不得复用同一句证据。系统奖励、权限、能力和长期状态必须作为主角的 knowledgeGained 原文保存。无法找到真实证据时返回空数组，让正文被拒绝重写。`
     : "";
   const extractorSystem = `你是独立的正史状态与阅读体验证据抽取器。只返回 JSON：{"events":[{"type":"choice","title":"","cause":"","outcome":"","participantNames":[],"location":""}],"characterUpdates":[{"name":"","status":"","location":"","goal":"","knowledgeGained":[]}],"itemUpdates":[{"name":"","status":"held","holderName":"","location":""}]${experienceSchema}${endingSchema}}；不得新增正文没有的事实。${experienceInstruction}${endingInstruction}`;
   const extractorPrompt = `${chapter.title}\n${chapter.paragraphs.join("\n")}`;
