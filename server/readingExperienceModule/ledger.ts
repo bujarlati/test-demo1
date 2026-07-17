@@ -1,4 +1,4 @@
-import type { ExperienceLedgerV2 } from "../../src/types";
+import type { ExperienceDebtV2, ExperienceLedgerV2 } from "../../src/types";
 import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies } from "./types";
 import { ExperienceSchedulingError, sameMac, signExperiencePlan, signLedgerAuthorizationRoot, verifyExperienceStageTicket } from "./scheduler";
 
