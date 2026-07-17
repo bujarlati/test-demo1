@@ -409,6 +409,8 @@ export interface ExperienceLedgerV2 {
 export interface ExperienceEvidenceV2 {
   id: string;
   contractRevisionId: string;
+  activationId: string;
+  branchId: string;
   dimensionId: string;
   signalId: string;
   chapterId: string;

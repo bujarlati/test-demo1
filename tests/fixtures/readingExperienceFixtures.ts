@@ -2,7 +2,7 @@ import type { ExperienceInterpretationPort, InterpretationDraft } from "../../se
 
 export interface ExperienceFixtureCalls { interpret: number; judge: number; planner: number; writer: number }
 
-export function scriptedExperiencePorts(options: { interpretation?: "ready" | "low_confidence" | "irreconcilable" } = {}) {
+export function scriptedExperiencePorts(options: { interpretation?: "ready" | "low_confidence" | "irreconcilable" | "malformed" } = {}) {
   const calls: ExperienceFixtureCalls = { interpret: 0, judge: 0, planner: 0, writer: 0 };
   const interpretationPort: ExperienceInterpretationPort = {
     async interpret(input) {
@@ -14,6 +14,9 @@ export function scriptedExperiencePorts(options: { interpretation?: "ready" | "l
       }
       if (options.interpretation === "irreconcilable") {
         draft.synthesis = { sharedCause: "", dimensionRoles: ["", ""] };
+      }
+      if (options.interpretation === "malformed") {
+        return { dimensions: [{ descriptor: first }] } as unknown as InterpretationDraft;
       }
       return draft;
     },
