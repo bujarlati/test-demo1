@@ -13,7 +13,7 @@
 - 每个被接受的词对必须编译为两个独立、同等重要、可同时成立的体验维度。
 - 每个 V2 发布或重修章节必须有绑定当前 `chapterRevisionId`、`branchId` 和正文哈希的双维度证据；文风与节奏使用多锚点、全章指标和独立语义裁判。
 - 安全、提示注入和格式拒绝必须发生在任何外部模型调用前；低置信或不可调和输入不得调用 planner/writer。
-- `compile` 之外不得按具体体验词决定行为；调用方不得出现 `sourceWords.includes(...)`、`word === ...` 或等价分支。
+- `compile` 之外不得按具体体验词决定行为；只有 `readingExperienceModule/ruleAdapters.ts` 可保存策展词到白名单规则的静态数据映射，并且只有 compiler 可调用它。业务调用方不得出现 `sourceWords.includes(...)`、`word === ...` 或等价分支。
 - 策展规则只定义语义不变量和证据政策，不定义正文逐字句式；删除固定开头骨架、固定段落池和第二章专用动作链。
 - 本地正文与外部正文使用相同发布门禁；无法取得 `accepted` 许可时失败关闭，不以模板冒充成功。
 - planner、writer、extractor/judge 使用故事已选连接及其既定路由；不得静默切换到未授权连接。
@@ -124,11 +124,11 @@ test("compile rejects unsafe input before any external call", async () => {
 
 Run: `pnpm exec tsx --test tests/readingExperience.compile.test.ts`
 
-Expected: FAIL，提示 `server/readingExperienceModule/index` 或 `scriptedExperiencePorts` 不存在。
+Expected: FAIL，提示 `server/readingExperienceModule/compiler` 或 `scriptedExperiencePorts` 不存在。
 
 - [ ] **Step 3: 定义闭合的持久类型与三入口协议**
 
-在 `src/types.ts` 保留 `ReadingExperienceContractV1`，新增以下持久类型，并把 `Story.readingExperience` 改成 `ReadingExperienceContractV1 | ReadingExperienceStateV2`：
+在 `src/types.ts` 保留现有 `ReadingExperienceContract` 作为 V1 兼容类型，新增以下持久类型，并先给 `Story` 增加可选 `readingExperienceV2?: ReadingExperienceStateV2`。Task 1–4 不把现有属性改成联合类型，保证旧调用点继续通过严格类型检查；Task 5 的迁移与 Task 6/7 的切流才开始写入 V2 aggregate。
 
 ```ts
 export type ExperienceCategory = "mechanic" | "protagonist_action" | "conflict_outcome" | "world_reaction" | "relationship" | "pacing" | "voice";
@@ -523,7 +523,8 @@ export function commitAcceptedChapter(story: Story, candidate: ReservedChapterCa
   const next = structuredClone(story);
   appendChapterAndCanon(next, candidate);
   applyExperienceLedgerPatch(activeLedger(next), permit.ledgerPatch);
-  next.readingExperience.evidence.push(...permit.evidence);
+  if (!next.readingExperienceV2) throw new Error("故事缺少 V2 阅读体验状态。");
+  next.readingExperienceV2.evidence.push(...permit.evidence);
   bindAssessmentToRevision(next, candidate.revisionId, permit);
   assertStoryStateIntegrity(next);
   Object.assign(story, next);
@@ -554,7 +555,7 @@ git commit -m "feat: persist V2 experience publication permits"
 - Modify: `server/modelGateway.ts:1032-1869`
 - Modify: `server/storyService.ts:257-548`
 - Modify: `tests/narrative.test.ts:498-1647`
-- Modify: `tests/readingExperience.pipeline.test.ts` (create)
+- Create: `tests/readingExperience.pipeline.test.ts`
 
 **Interfaces:**
 - Consumes: Task 1–5 的 module、model ports、Story shell、阶段计划与许可。
@@ -567,8 +568,8 @@ test("V2 opening follows compile, blueprint schedule/assess, opening schedule/as
   const trace: string[] = [];
   const story = await createStoryWithOpening(openingInputFixture(), "user_1", connectionFixture(), openingRuntimeFixture(trace));
   assert.deepEqual(trace, ["compile", "schedule:blueprint", "planner", "assess:blueprint", "schedule:opening", "writer", "assess:chapter", "canon-extractor", "commit"]);
-  assert.equal(story.readingExperience.schemaVersion, 2);
-  assert.equal(story.readingExperience.evidence.length, 2);
+  assert.equal(story.readingExperienceV2?.schemaVersion, 2);
+  assert.equal(story.readingExperienceV2?.evidence.length, 2);
 });
 
 test("non-ready compile spends no planner or writer tokens", async () => {
