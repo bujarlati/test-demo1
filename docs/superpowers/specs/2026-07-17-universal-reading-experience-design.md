@@ -62,7 +62,7 @@
 
 ## 4. 核心模块与接口
 
-建立深模块 `ReadingExperienceModule`。唯一原始词输入 Seam 位于故事创建之前；契约生成后，业务调用方只能传递契约、账本和阶段票据，不得读取词语来决定行为。
+建立深模块 `ReadingExperienceModule`。唯一原始词理解 Seam 是 `compile`；开书、换词和 V1 惰性迁移都只能通过该入口提交原词，并且必须在 planner/writer 调用前完成。契约生成后，业务调用方只能传递契约修订、激活记录、账本和阶段票据，不得读取词语来决定行为。
 
 ```ts
 interface ReadingExperienceModule {
@@ -76,11 +76,67 @@ type ExperienceOperationResult<T> =
   | { ok: false; error: ExperienceOperationError };
 ```
 
-预期的意图或质量判断使用领域结果；模型不可用、协议错误、正史过期和提交失败使用稳定的 `ExperienceOperationError`。调用方只处理结果类别，不解析供应商响应或规则内部文本。
+预期的意图或质量判断使用领域结果；解释/裁判模型不可用和协议错误使用稳定的 `ExperienceOperationError`。planner、writer、正史过期和提交失败仍属于应用层生成事务，不伪装成体验模块错误。调用方只处理结果类别，不解析供应商响应或规则内部文本。
+
+公共协议闭合如下；三个阶段使用判别联合，调用方不能把蓝图结果当作章节结果提交：
+
+```ts
+type ExperienceArtifactKind = "blueprint" | "chapter" | "retcon_revision";
+type ExperienceStage = "blueprint" | "opening" | "continuation" | "rewrite" | "retcon";
+
+interface CompileExperienceRequest {
+  intent: ReadingExperienceIntent;
+  context: { genre: string; inspiration: string };
+  parentRevisionId: string | null;
+  requestedRevision: number;
+  jobId: string;
+}
+
+type CompileOutcome =
+  | { status: "ready"; revision: CompiledExperienceContractRevision }
+  | { status: "needs_resolution"; code: "unknown_intent" | "irreconcilable_intent"; message: string }
+  | { status: "rejected"; code: "invalid_intent" | "unsafe_intent"; message: string };
+
+interface ScheduleExperienceRequest {
+  contract: CompiledExperienceContractRevision;
+  activation: ExperienceContractActivation;
+  ledger: ExperienceLedger;
+  canon: ExperienceCanonView;
+  stage: ExperienceStage;
+  artifactKind: ExperienceArtifactKind;
+  chapterNumber?: number;
+  failedRuleIds?: string[];
+  jobId: string;
+  attempt: number;
+}
+
+interface ExperienceStagePlan {
+  stage: ExperienceStage;
+  artifactKind: ExperienceArtifactKind;
+  promptProjection: ExperiencePromptProjection;
+  evidenceSchema: EvidencePolicy[];
+  duePromiseIds: string[];
+  ticket: ExperienceStageTicket;
+}
+
+interface AssessExperienceRequest {
+  plan: ExperienceStagePlan;
+  artifact:
+    | { kind: "blueprint"; value: StoryBlueprintArtifact }
+    | { kind: "chapter"; chapterId: string; revisionId: string; title: string; paragraphs: string[] }
+    | { kind: "retcon_revision"; chapterId: string; revisionId: string; title: string; paragraphs: string[] };
+}
+
+type ExperienceAssessment =
+  | { status: "accepted"; artifactKind: "blueprint"; artifactHash: string }
+  | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; evidence: ExperienceEvidence[]; ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactCandidate[] }
+  | { status: "rewrite"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; repairToken: ExperienceRepairToken; message: string }
+  | { status: "rejected"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; message: string };
+```
 
 ### 4.1 `compile`
 
-把阅读体验意图编译为不可变的体验契约修订和初始体验账本。
+把阅读体验意图编译为尚未绑定故事分支的不可变契约修订。故事 ID、分支 ID 和初始正史版本由应用层先分配；`compile` 成功后，应用层才创建激活记录与初始账本，并把它们和故事放进同一提交事务。
 
 结果只有三种：
 
@@ -88,7 +144,7 @@ type ExperienceOperationResult<T> =
 - `needs_resolution`：词义低置信或两个维度不可可靠合成，前端提示更换或澄清词语。
 - `rejected`：输入不安全、构成提示注入或不符合格式。
 
-`compile` 是唯一允许理解原始词语的入口。其余代码不得出现 `sourceWords.includes(...)`、`word === ...` 或等价词面分支。
+`compile` 是唯一允许理解原始词语的入口。其余代码不得出现 `sourceWords.includes(...)`、`word === ...` 或等价词面分支。策展词的特殊可靠规则只能由 `compile` 内部转换成普通规则图节点，不能泄漏到阶段调用方。
 
 ### 4.2 `schedule`
 
@@ -101,16 +157,37 @@ type ExperienceOperationResult<T> =
 - 抽取：为当前正文和当前契约生成证据 Schema。
 - 修史：确定受影响章节、失效证据和账本重放范围。
 
-阶段计划带不可伪造的票据，固定契约修订、账本修订、正史版本、阶段和规则版本。规划提示、正文提示、抽取要求和发布门禁都从同一规则图投影，消除漂移。
+阶段计划带不可伪造的票据，固定契约修订、激活记录、账本修订、正史版本、阶段和规则版本。规划提示、正文提示、抽取要求和发布门禁都从同一规则图投影，消除漂移。
+
+```ts
+interface ExperienceStageTicket {
+  id: string;
+  contractRevisionId: string;
+  activationId: string;
+  ledgerRevision: number;
+  branchId: string;
+  expectedCanonVersion: number;
+  ruleGraphVersion: string;
+  stage: ExperienceStage;
+  artifactKind: ExperienceArtifactKind;
+  jobId: string;
+  attempt: number;
+  expiresAt: string;
+  signature: string;
+}
+```
+
+票据由进程内 HMAC 密钥签名；`assess` 检查签名、过期时间、阶段、产物类别和所有绑定版本。重写会签发递增 `attempt` 的新票据，旧票据不可重放。验收结果带本地计算的 `artifactHash`；应用层提交时必须同时比较 `expectedCanonVersion` 和 `ledgerRevision`。
 
 ### 4.3 `assess`
 
-验证规划蓝图、正文、抽取声明或修史结果，并返回：
+验证规划蓝图、正文或修史结果，并返回：
 
-- `needs_extraction`：本地预检通过，需要外部模型抽取或语义裁判。
-- `accepted`：硬承诺全部通过，返回已落地证据和账本补丁。
-- `rewrite`：可修复的体验违约，返回稳定规则编号和定向重写令牌。
-- `rejected`：安全、契约冲突或修史破坏正史等不可发布结果。
+- `accepted`：本章到期硬承诺全部通过，返回已落地证据、账本补丁和候选正史事实。
+- `rewrite`：可修复的体验违约，返回稳定规则编号和带签名、限当前作业/尝试的定向重写令牌。
+- `rejected`：安全、票据、契约冲突或修史破坏正史等不可发布结果。
+
+`assess` 内部依次执行确定性预检、调用抽取/语义裁判 Adapter、校验结构、把声明落到原文，再生成结果；不存在公开的隐式第四阶段。抽取格式失败只重试 Adapter，不要求调用方重写已合格正文。
 
 只有 `accepted` 能进入正史提交事务。
 
@@ -133,13 +210,11 @@ interface ReadingExperienceIntent {
 ### 5.2 体验契约修订 V2
 
 ```ts
-interface ExperienceContractRevision {
+interface CompiledExperienceContractRevision {
   id: string;
   schemaVersion: 2;
   revision: number;
   parentRevisionId: string | null;
-  status: "draft" | "active" | "superseded";
-  effectiveFrom: { branchId: string; chapterNumber: number; canonVersion: number };
   dimensions: readonly [ExperienceDimension, ExperienceDimension];
   synthesis: ExperienceSynthesis;
   promises: DeliveryPromise[];
@@ -148,9 +223,19 @@ interface ExperienceContractRevision {
   provenance: ExperienceProvenance[];
   createdAt: string;
 }
+
+interface ExperienceContractActivation {
+  id: string;
+  contractRevisionId: string;
+  branchId: string;
+  effectiveFromChapter: number;
+  effectiveFromCanonVersion: number;
+  effectiveThroughCanonVersion: number | null;
+  activatedAt: string;
+}
 ```
 
-契约修订不可变。用户未来换词会创建新修订并从指定章节起生效；追溯修改既有章节必须进入修史流程。
+契约修订与激活记录都不可变。用户未来换词会创建新修订和新激活记录，旧激活记录通过新增关闭记录界定有效范围；追溯修改既有章节必须进入修史流程。分支绑定只存在于激活记录与账本，不存在于编译产物。
 
 ### 5.3 体验维度
 
@@ -223,7 +308,7 @@ interface DeliveryPromise {
 - 状态型机制、关系、身份或资源可以要求跨章沿用具体旧状态。
 - 文风和节奏通过本章分布持续兑现，不伪造“持久物品”。
 - “慢热”在开篇通过克制推进、保持距离和延迟确认来兑现，而不是被错误要求快速完成关系。
-- 硬承诺每章必须通过；软承诺可形成体验债，但必须在补偿窗口内偿还。
+- 每个维度自动拥有一个 `every_chapter` 的硬性“可感知存在”承诺，因此每个发布章都必须有双维度证据。滚动窗口、篇章和全书承诺只控制更强信号的轮换与强度；软承诺可形成体验债，但不能替代当章的双维度存在，且必须在补偿窗口内偿还。
 
 ### 5.6 体验禁忌
 
@@ -338,14 +423,14 @@ interface ExperienceLedger {
 
 ### 7.1 开书与第一章
 
-1. 预检并编译体验契约修订。
+1. 应用层分配故事、活动分支和初始正史版本标识，预检并编译尚未绑定分支的体验契约修订，再创建激活记录与空账本。
 2. 规划模型依据契约生成故事基因、世界规则、结局契约和开篇事件。
 3. `assess` 验证蓝图没有预设会破坏体验的代价或结局。
 4. `schedule(opening)` 选择两个维度的开篇激活信号和出现窗口。
 5. 正文模型写第一章；禁止固定逐字骨架。
 6. 本地确定性预检先过滤结构、安全、元叙事、明确禁忌和未实际发生的信号。
-7. 抽取/裁判模型返回结构化声明；本地将声明落到当前正文原文与全章指标。
-8. `assess` 合并确定性与语义结果。通过后才生成体验证据、体验账本补丁和正史事实补丁。
+7. `assess` 内部调用抽取/裁判 Adapter 获取结构化声明，并将声明落到当前正文原文与全章指标。
+8. `assess` 合并确定性与语义结果。通过后才生成体验证据、体验账本补丁和候选正史事实。
 9. 故事、第一章修订、契约修订、证据、账本与正史在同一事务提交。
 
 ### 7.2 续章
@@ -368,6 +453,8 @@ interface ExperienceLedger {
 2. 语义证据不足时只修复对应维度和共享因果链。
 3. 结构化抽取格式失败时先修复抽取结果，不重写已经合格的正文。
 4. 达到有界重试上限仍失败时，作业明确失败，不发布、不提交账本、不静默使用本地模板。
+
+应用层每次重写都以失败规则重新调用 `schedule(rewrite)`，并使用新 `attempt` 票据；任何旧票据、旧正文哈希或旧账本修订的验收结果都不能提交。
 
 ### 7.4 修史
 
@@ -441,8 +528,8 @@ interface ExperienceSemanticJudgePort {
 
 故事保存：
 
-- 活动体验契约修订 ID。
-- 体验契约修订历史。
+- 编译后的体验契约修订历史。
+- 每个分支的体验契约激活记录与当前活动激活 ID。
 - 当前活动分支的体验账本和检查点。
 - 绑定章节修订的体验证据。
 - 编译器、规则图、提示投影和评测版本。
@@ -479,10 +566,10 @@ interface ExperienceSemanticJudgePort {
 - `model_unavailable`：所选连接或任务路由不可用。
 - `invalid_model_output`：模型输出无法通过结构修复。
 - `delivery_unsatisfied`：正文重试后仍未兑现契约。
-- `stale_canon`：生成期间正史已经变化。
-- `commit_failed`：原子提交失败，保证没有部分发布。
+- `stale_canon`：生成期间正史已经变化（应用层事务错误）。
+- `commit_failed`：原子提交失败，保证没有部分发布（应用层事务错误）。
 
-其中 `invalid_intent`、`unsafe_intent`、`unknown_intent` 和 `irreconcilable_intent` 是编译阶段的领域结果；`delivery_unsatisfied` 是验收阶段的领域结果。基础设施与并发错误通过 `ExperienceOperationResult` 的错误分支返回，至少包含稳定 `code`、安全用户消息、阶段、是否可重试和关联作业 ID。程序错误仍可抛出，但必须在应用边界转换为未知内部错误并关闭发布路径。
+其中 `invalid_intent`、`unsafe_intent`、`unknown_intent` 和 `irreconcilable_intent` 是编译阶段的领域结果；`delivery_unsatisfied` 是验收阶段的领域结果。体验模块只把解释/裁判 Port 的基础设施故障通过 `ExperienceOperationResult` 的错误分支返回，至少包含稳定 `code`、安全用户消息、阶段、是否可重试和关联作业 ID。`stale_canon`、`commit_failed`、planner/writer 故障由应用层生成事务返回。程序错误仍可抛出，但必须在应用边界转换为未知内部错误并关闭发布路径。
 
 日志与前端错误不得泄露密钥、完整系统提示或供应商敏感响应。失败作业保存阶段、规则编号、重试次数、Token 和安全摘要，便于诊断。
 
@@ -528,6 +615,14 @@ interface ExperienceSemanticJudgePort {
 - 第二章体验保持率至少 90%。
 - 文风/节奏盲测中，独立裁判对目标版本的偏好至少 80%。
 - 冲突词对的双轴兑现与整体连贯率至少 80%。
+
+指标分成两个互不混淆的分母：
+
+- `job_success_rate`：在固定词对、题材、连接、两章和五次重复的生成作业中，最终产生两章已提交正文的作业数 / 总作业数；每个词对/题材要求至少 `4/5`。
+- `published_compliance_rate`：所有已经提交的 V2 章节中，同时通过当章到期硬承诺且证据绑定当前修订的章节数 / 已提交 V2 章节数；必须为 `100%`。
+- `chapter_two_retention_rate`：第一章双轴通过的作业中，第二章仍双轴通过的作业数 / 第一章双轴通过的作业数；至少 `90%`。
+
+两章矩阵验证开篇和最短连续性；另设 6 章确定性场景验证滚动窗口、体验债到期、换契约、分支和修史重放，避免用两章样本声称已经覆盖长窗口生命周期。
 
 独立裁判记录每轴、共同因果、自然度和可读性分数及证据；至少 10% 样本采用双裁判或人工复核校准。不能只看总体平均值掩盖某个词对完全失败。
 
