@@ -1,5 +1,5 @@
 import type { ExperienceLedgerV2 } from "../../src/types";
-import type { ExperienceLedgerPatch, LedgerDependencies } from "./types";
+import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies } from "./types";
 import { ExperienceSchedulingError, verifyExperienceStageTicket } from "./scheduler";
 
 function deepFreeze<T>(value: T): T {
@@ -8,6 +8,18 @@ function deepFreeze<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+
+const authenticAuthorizations = new WeakSet<object>();
+
+export function createLedgerAuthorization(
+  plan: LedgerAuthorization["plan"],
+  canon: LedgerAuthorization["canon"],
+  evidenceIds: string[],
+): LedgerAuthorization {
+  const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceIds })) as LedgerAuthorization;
+  authenticAuthorizations.add(snapshot);
+  return snapshot;
 }
 
 function sameTicket(left: ExperienceLedgerPatch["ticket"], right: ExperienceLedgerPatch["ticket"]): boolean {
@@ -32,6 +44,7 @@ function sameFact(left: { id: string; revisionId: string; kind: string }, right:
 
 function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: ExperienceLedgerPatch, deps: LedgerDependencies): void {
   const { plan, canon, evidenceIds } = deps.authorization;
+  if (!authenticAuthorizations.has(deps.authorization)) throw new ExperienceSchedulingError("plan_mismatch");
   if (!sameTicket(plan.ticket, patch.ticket)
     || plan.chapterNumber !== patch.chapterNumber
     || plan.stage !== patch.ticket.stage
@@ -39,6 +52,9 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
     || canon.branchId !== ledger.branchId
     || canon.canonVersion !== ledger.throughCanonVersion) {
     throw new ExperienceSchedulingError("plan_mismatch");
+  }
+  if (deps.liveCanon.branchId !== ledger.branchId || deps.liveCanon.branchId !== patch.ticket.branchId || deps.liveCanon.canonVersion !== ledger.throughCanonVersion || deps.liveCanon.canonVersion !== patch.ticket.expectedCanonVersion) {
+    throw new ExperienceSchedulingError("canon_version_mismatch");
   }
   const plannedDimensions = new Map(plan.promptProjection.dimensions.map((dimension) => [dimension.id, dimension]));
   const suppliedDimensionIds = new Set([
@@ -50,9 +66,9 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
   if ([...plannedDimensions.keys()].some((dimensionId) => !Object.hasOwn(patch.deliveredSignalIdsByDimension, dimensionId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   for (const [dimensionId, signalIds] of Object.entries(patch.deliveredSignalIdsByDimension)) {
     const planned = plannedDimensions.get(dimensionId)!;
-    if (signalIds.some((signalId) => !planned.signalIds.includes(signalId))) throw new ExperienceSchedulingError("unauthorized_delivery");
+    if (new Set(signalIds).size !== signalIds.length || signalIds.length !== planned.signalIds.length || signalIds.some((signalId) => !planned.signalIds.includes(signalId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   }
-  if (patch.deliveredPromiseIds.some((promiseId) => !plan.duePromiseIds.includes(promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
+  if (new Set(patch.deliveredPromiseIds).size !== patch.deliveredPromiseIds.length || patch.deliveredPromiseIds.some((promiseId) => !plan.duePromiseIds.includes(promiseId)) || plan.hardPresencePromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   for (const promiseId of patch.deliveredPromiseIds) {
     const promise = deps.contract.promises.find((candidate) => candidate.id === promiseId)!;
     const relevantDimensions = promise.dimensionId === "both"
@@ -62,11 +78,11 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
       throw new ExperienceSchedulingError("unauthorized_delivery");
     }
   }
-  if (patch.evidenceIds.some((evidenceId) => !evidenceIds.includes(evidenceId))) throw new ExperienceSchedulingError("unauthorized_delivery");
+  if (new Set(patch.evidenceIds).size !== patch.evidenceIds.length || patch.evidenceIds.length !== evidenceIds.length || patch.evidenceIds.some((evidenceId) => !evidenceIds.includes(evidenceId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   for (const [dimensionId, facts] of Object.entries(patch.persistentResultsByDimension)) {
     const planned = plannedDimensions.get(dimensionId)!;
     const hasCarrySignal = planned.signalIds.some((signalId) => deps.contract.dimensions.find((dimension) => dimension.id === dimensionId)?.observableSignals.some((signal) => signal.id === signalId && (signal.kind === "mechanic" || signal.kind === "relationship") && (signal.persistence === "cross_chapter" || signal.persistence === "whole_story")));
-    if (!hasCarrySignal || facts.some((fact) => !canon.factReferences.some((reference) => sameFact(reference, fact)))) throw new ExperienceSchedulingError("unauthorized_fact");
+    if (!hasCarrySignal || facts.some((fact) => !canon.factReferences.some((reference) => sameFact(reference, fact)) || !deps.liveCanon.factReferences.some((reference) => sameFact(reference, fact)))) throw new ExperienceSchedulingError("unauthorized_fact");
   }
   for (const [dimensionId, debts] of Object.entries(patch.newDebtsByDimension)) {
     if (debts.some((debt) => !plan.newDebts.some((plannedDebt) => plannedDebt.promiseId === debt.promiseId && plannedDebt.dueByChapter === debt.dueByChapter))) {
@@ -74,6 +90,11 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
     }
     if (!plannedDimensions.has(dimensionId)) throw new ExperienceSchedulingError("unauthorized_delivery");
   }
+  const plannedDebtKeys = plan.newDebts.map((debt) => `${debt.promiseId}\u001f${debt.dueByChapter}`).sort();
+  const suppliedDebtKeys = Object.values(patch.newDebtsByDimension).flat().map((debt) => `${debt.promiseId}\u001f${debt.dueByChapter}`).sort();
+  if (new Set(suppliedDebtKeys).size !== suppliedDebtKeys.length || plannedDebtKeys.join("\u001f") !== suppliedDebtKeys.join("\u001f")) throw new ExperienceSchedulingError("unauthorized_delivery");
+  if (plan.softRollingPromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId) && !plan.newDebts.some((debt) => debt.promiseId === promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
+  if (ledger.dimensions.flatMap((dimension) => dimension.persistentResults).some((fact) => !deps.liveCanon.factReferences.some((reference) => sameFact(reference, fact)))) throw new ExperienceSchedulingError("unauthorized_fact");
 }
 
 function assertPatchCompatibility(ledger: ExperienceLedgerV2, patch: ExperienceLedgerPatch, deps: LedgerDependencies): void {

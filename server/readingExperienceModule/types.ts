@@ -127,15 +127,19 @@ export interface SchedulerDependencies {
   createTicketId?: (request: ScheduleExperienceRequest) => string;
 }
 
+export interface LedgerAuthorization {
+  readonly plan: ExperienceStagePlan;
+  readonly canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
+  readonly evidenceIds: string[];
+}
+
 export interface LedgerDependencies extends SchedulerDependencies {
   /** Immutable revision resolved by the ticket's contractRevisionId before the CAS write. */
   contract: CompiledExperienceContractRevision;
   /** Trusted record saved at scheduling time and looked up by the signed ticket/job. */
-  authorization: {
-    plan: ExperienceStagePlan;
-    canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
-    evidenceIds: string[];
-  };
+  authorization: LedgerAuthorization;
+  /** Canon is resolved again at CAS time; schedule-time canon is not sufficient. */
+  liveCanon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
 }
 
 export interface ExperienceLedgerPatch {
@@ -170,7 +174,8 @@ export type ExperienceSchedulingErrorCode =
   | "invalid_distribution"
   | "plan_mismatch"
   | "unauthorized_delivery"
-  | "unauthorized_fact";
+  | "unauthorized_fact"
+  | "insufficient_signals";
 
 export interface AssessExperienceRequest {
   plan: ExperienceStagePlan;

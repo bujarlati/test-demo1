@@ -56,9 +56,9 @@ function stableToken(value: string): string {
 }
 
 function derivedStage(request: ScheduleExperienceRequest): ExperienceStage {
-  if (request.failedRuleIds?.length) return "rewrite";
   if (request.artifactKind === "blueprint") return "blueprint";
   if (request.artifactKind === "retcon_revision") return "retcon";
+  if (request.failedRuleIds?.length) return "rewrite";
   return request.chapterNumber === request.activation.effectiveFromChapter ? "opening" : "continuation";
 }
 
@@ -163,6 +163,14 @@ function canonFactsFor(selected: ObservableSignalV2[], facts: CanonFactReference
   return needsCarry ? facts.map((fact) => ({ ...fact })) : [];
 }
 
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
   const chapter = chapterNumber(request);
@@ -183,6 +191,12 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
       selected,
     };
   });
+  for (const promise of [...hard, ...soft.due]) {
+    const relevant = promise.dimensionId === "both" ? request.contract.dimensions.map((dimension) => dimension.id) : [promise.dimensionId];
+    if (relevant.some((dimensionId) => new Set(dimensions.find((dimension) => dimension.id === dimensionId)?.signalIds ?? []).size < promise.minimumSignals)) {
+      throw new ExperienceSchedulingError("insufficient_signals");
+    }
+  }
   const expiresAt = new Date(deps.now().getTime() + deps.ticketTtlMs).toISOString();
   const ticketId = deps.createTicketId?.(request) ?? `ticket_${stableToken([request.contract.id, request.activation.id, request.ledger.revision, request.canon.branchId, request.canon.canonVersion, stage, request.artifactKind, request.jobId, request.attempt].join(ticketSeparator))}`;
   const unsigned: Omit<ExperienceStageTicket, "signature"> = {
@@ -199,7 +213,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     attempt: request.attempt,
     expiresAt,
   };
-  return {
+  return deepFreeze({
     chapterNumber: chapter,
     stage,
     artifactKind: request.artifactKind,
@@ -213,5 +227,5 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     softRollingPromiseIds: request.contract.promises.filter((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window").map((promise) => promise.id),
     newDebts: soft.debts,
     ticket: { ...unsigned, signature: signExperienceStageTicket(unsigned, deps.ticketSecret) },
-  };
+  });
 }
