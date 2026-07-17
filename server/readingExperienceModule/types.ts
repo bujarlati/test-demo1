@@ -69,8 +69,30 @@ export interface ExperienceInterpretationPort {
   interpret(input: InterpretationCase): Promise<InterpretationDraft>;
 }
 
-export interface SemanticEvidenceCase { contract: CompiledExperienceContractRevision; text: string; stage: ExperienceStage }
-export interface SemanticVerdict { supported: boolean; confidence: number; message?: string }
+export interface SemanticEvidenceAnchor { start: number; end: number; quote: string }
+
+/** Versioned, source-grounded judgement input/output.  The assessor never accepts prose summaries. */
+export interface SemanticEvidenceClaim {
+  version: 1;
+  dimensionId: string;
+  signalId: string;
+  supported: boolean;
+  confidence: number;
+  anchors: SemanticEvidenceAnchor[];
+  slots?: Partial<Record<"actor" | "action" | "object" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", string>>;
+  metrics?: Record<string, number>;
+}
+
+export interface SemanticEvidenceCase {
+  version: 1;
+  contractRevisionId: string;
+  stage: ExperienceStage;
+  artifactKind: ExperienceArtifactKind;
+  source: string;
+  sourceHash: string;
+  signals: Array<{ dimensionId: string; signalId: string; kind: string; policy: EvidencePolicy }>;
+}
+export interface SemanticVerdict { version: 1; claims: SemanticEvidenceClaim[] }
 
 export interface ExperienceSemanticJudgePort {
   judge(input: SemanticEvidenceCase): Promise<SemanticVerdict>;
@@ -100,6 +122,8 @@ export interface ScheduleExperienceRequest {
   /** When omitted, the stage is derived from artifact kind, activation, and retry state. */
   stage?: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
+  /** Required by assessment for chapter/retcon artifacts; signed by the plan MAC. */
+  chapterId?: string;
   chapterNumber?: number;
   failedRuleIds?: string[];
   jobId: string;
@@ -114,6 +138,7 @@ export interface ScheduledExperienceDebt extends ExperienceDebtV2 {
 export interface ExperienceStagePlan {
   /** Bound to the signed ticket through the trusted plan record, not extra ticket payload fields. */
   chapterNumber: number;
+  chapterId?: string;
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
   promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
@@ -195,9 +220,35 @@ export interface AssessExperienceRequest {
     | { kind: "retcon_revision"; chapterId: string; revisionId: string; title: string; paragraphs: string[] };
 }
 
+export interface ExperiencePublicationPermit {
+  version: 1;
+  ticketId: string;
+  jobId: string;
+  attempt: number;
+  contractRevisionId: string;
+  activationId: string;
+  branchId: string;
+  chapterId: string;
+  revisionId: string;
+  artifactHash: string;
+  expiresAt: string;
+  signature: string;
+}
+
+export interface AssessorDependencies {
+  ticketSecret: string;
+  now: () => Date;
+  /** The immutable revision resolved from the signed ticket before assessment. */
+  contract: CompiledExperienceContractRevision;
+  semanticJudgePort: ExperienceSemanticJudgePort;
+  createEvidenceId?: (input: { ticketId: string; signalId: string; chapterId: string; revisionId: string }) => string;
+  repairTtlMs?: number;
+  permitTtlMs?: number;
+}
+
 export type ExperienceAssessment =
   | { status: "accepted"; artifactKind: "blueprint"; artifactHash: string }
-  | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; evidence: ExperienceEvidenceV2[]; ledgerPatch: unknown; canonFactCandidates: unknown[] }
+  | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; permit: ExperiencePublicationPermit; evidence: ExperienceEvidenceV2[]; ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactReferenceV2[] }
   | { status: "rewrite"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; repairToken: string; message: string }
   | { status: "rejected"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; message: string };
 
@@ -206,4 +257,8 @@ export interface ReadingExperienceModule {
   compile(request: CompileExperienceRequest): Promise<ExperienceOperationResult<CompileOutcome>>;
   schedule(request: ScheduleExperienceRequest): ExperienceStagePlan;
   assess(request: AssessExperienceRequest): Promise<ExperienceOperationResult<ExperienceAssessment>>;
+}
+
+export interface ReadingExperienceModuleDependencies extends AssessorDependencies, SchedulerDependencies {
+  interpretationPort: ExperienceInterpretationPort;
 }

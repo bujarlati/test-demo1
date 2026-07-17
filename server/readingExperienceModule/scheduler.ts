@@ -264,6 +264,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
   };
   const unsignedPlan: Omit<ExperienceStagePlan, "authorizationMac"> = {
     chapterNumber: chapter,
+    ...(request.chapterId ? { chapterId: request.chapterId } : {}),
     stage,
     artifactKind: request.artifactKind,
     promptProjection: {

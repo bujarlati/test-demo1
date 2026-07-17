@@ -133,3 +133,15 @@ export function curatedSynthesis(left: string, right: string): { sharedCause: st
 export function evidencePolicyFor(category: ExperienceCategory): EvidencePolicy {
   return verificationFor(category);
 }
+
+/** Generic, data-selected deterministic shortcuts.  These are never keyed by a descriptor. */
+const genericAdapters: Record<string, RegExp> = {
+  "contains-negated-claim": /\b(?:not|never|cannot|didn't)\b|(?:不|未|没有)/i,
+  "contains-intent-not-event": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?|attempt(?:s|ed)?)\b|(?:计划|打算|试图)/i,
+  "contains-simulation": /\b(?:dream|simulation|prediction|conditional)\b|(?:梦境|模拟|预测)/i,
+  "contains-pasted-label": /\b(?:label|descriptor)\b|(?:标签|描述词)/i,
+};
+
+export function runRuleAdapter(id: string, source: string): boolean {
+  return genericAdapters[id]?.test(source) ?? false;
+}
