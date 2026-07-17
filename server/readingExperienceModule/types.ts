@@ -1,7 +1,9 @@
 import type {
+  CanonFactReferenceV2,
   CompiledExperienceContractRevision,
   EvidencePolicy,
   ExperienceContractActivation,
+  ExperienceDebtV2,
   ExperienceEvidenceV2,
   ExperienceLedgerV2,
   ReadingExperienceIntent,
@@ -94,8 +96,9 @@ export interface ScheduleExperienceRequest {
   contract: CompiledExperienceContractRevision;
   activation: ExperienceContractActivation;
   ledger: ExperienceLedgerV2;
-  canon: { branchId: string; canonVersion: number; factReferences: unknown[] };
-  stage: ExperienceStage;
+  canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
+  /** When omitted, the stage is derived from artifact kind, activation, and retry state. */
+  stage?: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
   chapterNumber?: number;
   failedRuleIds?: string[];
@@ -106,11 +109,55 @@ export interface ScheduleExperienceRequest {
 export interface ExperienceStagePlan {
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
-  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[] }>; prohibitions: string[] };
+  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
   evidenceSchema: EvidencePolicy[];
   duePromiseIds: string[];
+  hardPresencePromiseIds: string[];
+  softRollingPromiseIds: string[];
+  newDebts: ExperienceDebtV2[];
   ticket: ExperienceStageTicket;
 }
+
+export interface SchedulerDependencies {
+  now: () => Date;
+  ticketSecret: string;
+  ticketTtlMs: number;
+  createTicketId?: (request: ScheduleExperienceRequest) => string;
+}
+
+export interface LedgerDependencies extends SchedulerDependencies {
+  /** Immutable revision resolved by the ticket's contractRevisionId before the CAS write. */
+  contract: CompiledExperienceContractRevision;
+}
+
+export interface ExperienceLedgerPatch {
+  ticket: ExperienceStageTicket;
+  expectedRevision: number;
+  nextRevision: number;
+  contractRevisionId: string;
+  activationId: string;
+  branchId: string;
+  expectedCanonVersion: number;
+  chapterNumber: number;
+  deliveredSignalIdsByDimension: Record<string, string[]>;
+  persistentResultsByDimension: Record<string, CanonFactReferenceV2[]>;
+  newDebtsByDimension: Record<string, ExperienceDebtV2[]>;
+  deliveredPromiseIds: string[];
+  evidenceIds: string[];
+}
+
+export type ExperienceSchedulingErrorCode =
+  | "activation_not_effective"
+  | "activation_mismatch"
+  | "contract_mismatch"
+  | "branch_mismatch"
+  | "canon_version_mismatch"
+  | "stale_ledger"
+  | "ledger_revision_mismatch"
+  | "ticket_tampered"
+  | "ticket_expired"
+  | "ticket_reused"
+  | "invalid_debt";
 
 export interface AssessExperienceRequest {
   plan: ExperienceStagePlan;

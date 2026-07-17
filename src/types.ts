@@ -396,14 +396,29 @@ export interface ExperienceContractActivation {
 export interface TextAnchorV2 { start: number; end: number; text: string }
 export interface CanonFactReferenceV2 { id: string; revisionId: string; kind: string }
 export interface ExperienceDebtV2 { promiseId: string; dueByChapter: number }
+export interface ExperiencePromiseStateV2 { promiseId: string; deliveredChapters: number[] }
+export interface ExperienceLedgerHistoryEntryV2 {
+  ticketId: string;
+  expectedRevision: number;
+  nextRevision: number;
+  chapterNumber: number;
+  appliedAt: string;
+}
 
 export interface ExperienceLedgerV2 {
   contractRevisionId: string;
+  activationId: string;
   revision: number;
   branchId: string;
   throughCanonVersion: number;
   dimensions: Array<{ dimensionId: string; lastDeliveredChapter: number; silentChapters: number; deliveredSignalIds: string[]; persistentResults: CanonFactReferenceV2[]; debts: ExperienceDebtV2[] }>;
   evidenceIds: string[];
+  /** Delivery history is structured data only; it never stores invented narrative facts. */
+  promiseStates: ExperiencePromiseStateV2[];
+  /** Consumed signed tickets make a successful ledger update single-use. */
+  consumedTicketIds: string[];
+  /** Append-only audit entries preserve prior successful CAS transitions. */
+  history: ExperienceLedgerHistoryEntryV2[];
 }
 
 export interface ExperienceEvidenceV2 {
