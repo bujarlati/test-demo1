@@ -2,8 +2,20 @@ import type {
   AppStore,
   GenerationModelOption,
   ModelConnection,
+  ModelConnectionStatus,
   UserAccount,
 } from "../src/types";
+
+export function connectionStatusAfterTestFailure(error: unknown): ModelConnectionStatus {
+  const providerStatus = error && typeof error === "object" && "providerStatus" in error
+    ? Number((error as { providerStatus?: unknown }).providerStatus)
+    : undefined;
+  if (providerStatus === 401) return "revoked";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /(?:invalid|expired|revoked)\s+(?:api\s*)?key|unauthori[sz]ed|凭据(?:无效|失效|过期|已撤销)|密钥(?:无效|失效|过期|已撤销)/i.test(message)
+    ? "revoked"
+    : "degraded";
+}
 
 export function isManagedLocalConnection(connection: ModelConnection): boolean {
   return connection.secretRef.startsWith("platform://managed");

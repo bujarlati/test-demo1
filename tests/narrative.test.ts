@@ -42,7 +42,7 @@ import {
   createStoryWithOpening,
   storyOpeningPublicationText,
 } from "../server/openingService";
-import { listGenerationModelOptions } from "../server/modelConnectionAccess";
+import { connectionStatusAfterTestFailure, listGenerationModelOptions } from "../server/modelConnectionAccess";
 import {
   assertGenerationTokenBudget,
   CHAPTER_EXTRACTION_ADMISSION_RESERVE,
@@ -75,6 +75,7 @@ const readFakeModelSecret = async () => "test-api-key";
 async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
   let activeRequests = 0;
   let maxConcurrentRequests = 0;
+  let responsesCalls = 0;
   const mandatoryProbeModels: string[] = [];
   let resolveWriterProbeSeen: (() => void) | undefined;
   let resolveWriterHeadersSent: (() => void) | undefined;
@@ -94,6 +95,7 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
     const chunks: Buffer[] = [];
     request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
+      if (request.url === "/responses") responsesCalls += 1;
       activeRequests += 1;
       maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
@@ -199,6 +201,119 @@ async function startFakeModelProvider(options: FakeModelProviderOptions = {}) {
     writerProbeSeen,
     mandatoryProbeModels: () => [...mandatoryProbeModels],
     maxConcurrentRequests: () => maxConcurrentRequests,
+    responsesCalls: () => responsesCalls,
+    async close() {
+      if (previousAllowPrivate === undefined) delete process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
+      else process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS = previousAllowPrivate;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    },
+  };
+}
+
+async function startResponsesModelProvider(options: { chatDelayMs?: number; modelsStatus?: number } = {}) {
+  const mandatoryProbeModels: string[] = [];
+  let chatCompletionCalls = 0;
+  let responsesCalls = 0;
+  let resolveChatProbeSeen: (() => void) | undefined;
+  const chatProbeSeen = new Promise<void>((resolve) => { resolveChatProbeSeen = resolve; });
+  const server = createServer((request, response) => {
+    if (request.method === "GET" && request.url === "/models") {
+      if (options.modelsStatus && options.modelsStatus !== 200) {
+        response.statusCode = options.modelsStatus;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ error: { message: "model listing is unavailable" } }));
+        return;
+      }
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        data: [
+          { id: "planner-responses", context_window: 200_000 },
+          { id: "writer-responses", context_window: 200_000 },
+          { id: "extractor-responses", context_window: 200_000 },
+        ],
+      }));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as {
+        input?: string;
+        model?: string;
+      };
+      if (request.url === "/chat/completions") {
+        chatCompletionCalls += 1;
+        resolveChatProbeSeen?.();
+        resolveChatProbeSeen = undefined;
+        const sendFailure = () => {
+          response.statusCode = 404;
+          response.end(JSON.stringify({ error: { message: "chat endpoint unavailable" } }));
+        };
+        if (options.chatDelayMs) setTimeout(sendFailure, options.chatDelayMs);
+        else sendFailure();
+        return;
+      }
+      if (request.url === "/embeddings") {
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+        return;
+      }
+      if (request.url === "/responses" && request.method === "POST") {
+        responsesCalls += 1;
+        if (body.input === "回复：好" && body.model) mandatoryProbeModels.push(body.model);
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "好" }],
+          }],
+          usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 },
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: { message: "not found" } }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const connection: ModelConnection = {
+    id: "conn_test_responses_provider",
+    name: "Responses model provider",
+    ownerScope: "platform",
+    ownerId: null,
+    protocol: "openai_compatible",
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    maskedKey: "test••••key",
+    secretRef: "test://responses-provider",
+    secretVersion: 1,
+    status: "draft",
+    routes: {
+      planner: "planner-responses",
+      writer: "writer-responses",
+      extractor: "extractor-responses",
+      embedding: "embedding-responses",
+    },
+    fallbackPolicy: "none",
+    capabilities: null,
+    updatedAt: new Date().toISOString(),
+  };
+  const previousAllowPrivate = process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
+  process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS = "true";
+  return {
+    connection,
+    chatProbeSeen,
+    mandatoryProbeModels: () => [...mandatoryProbeModels],
+    chatCompletionCalls: () => chatCompletionCalls,
+    responsesCalls: () => responsesCalls,
     async close() {
       if (previousAllowPrivate === undefined) delete process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS;
       else process.env.ALLOW_PRIVATE_MODEL_ENDPOINTS = previousAllowPrivate;
@@ -1375,6 +1490,137 @@ test("opening gateway failures expose consumed model usage", async () => {
       return /Schema/.test(error.message);
     },
   );
+});
+
+test("completeJson uses the negotiated OpenAI Responses API and normalizes output_text", async () => {
+  const connection: ModelConnection = {
+    id: "conn_responses_completion",
+    name: "Responses completion",
+    ownerScope: "personal",
+    ownerId: "user_test",
+    protocol: "openai_compatible",
+    baseUrl: "https://example.test/v1",
+    maskedKey: "sk••••test",
+    secretRef: "vault://responses-completion",
+    secretVersion: 1,
+    status: "active",
+    routes: { planner: "planner", writer: "writer", extractor: "extractor", embedding: "embedding" },
+    fallbackPolicy: "none",
+    capabilities: {
+      completionApi: "responses",
+      streaming: false,
+      jsonSchema: false,
+      embedding: false,
+      promptCache: false,
+      toolCalling: false,
+      maxContextTokens: null,
+      testedAt: new Date().toISOString(),
+      latencyMs: 1,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+  let pathname = "";
+  let requestBody: Record<string, unknown> = {};
+
+  const result = await completeJson<{ ok: boolean }>(
+    connection,
+    connection.routes.writer,
+    "只返回 JSON",
+    "生成正文",
+    10_000,
+    400,
+    {
+      secretReader: async () => "test-key",
+      modelFetcher: async (_connection, _apiKey, nextPathname, init) => {
+        pathname = nextPathname;
+        requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "{\"ok\":true}" }],
+          }],
+          usage: { input_tokens: 35, output_tokens: 8, total_tokens: 43 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    },
+  );
+
+  assert.deepEqual(result, { value: { ok: true }, usageTokens: 43, usageEstimated: false });
+  assert.equal(pathname, "/responses");
+  assert.equal(requestBody.model, "writer");
+  assert.equal(requestBody.instructions, "只返回 JSON");
+  assert.equal(requestBody.input, "生成正文");
+  assert.equal(requestBody.max_output_tokens, 400);
+  assert.equal(requestBody.messages, undefined);
+  assert.equal(requestBody.temperature, undefined);
+});
+
+test("chapter generation uses a negotiated Responses API connection through the non-streaming gateway", async () => {
+  const connection = budgetTestConnection("conn_responses_chapter");
+  connection.capabilities = {
+    completionApi: "responses",
+    streaming: false,
+    jsonSchema: false,
+    embedding: false,
+    promptCache: false,
+    toolCalling: false,
+    maxContextTokens: null,
+    testedAt: new Date().toISOString(),
+    latencyMs: 1,
+  };
+  const paragraphs = ["第一段发生行动。".repeat(600), "第二段冲突升级。", "第三段付出代价。", "第四段改变局面。"];
+  const normalizedParagraphs = paragraphs.map((paragraph) => paragraph.slice(0, 4_000));
+  let pathname = "";
+  let requestBody: Record<string, unknown> = {};
+
+  const result = await generateChapterWithConnection(
+    connection,
+    "继续生成下一章",
+    2_000,
+    async <T>(nextConnection, model, system, prompt, timeout, maxTokens, dependencies) => completeJson<T>(
+      nextConnection,
+      model,
+      system,
+      prompt,
+      timeout,
+      maxTokens,
+      {
+        ...dependencies,
+        secretReader: async () => "test-key",
+        modelFetcher: async (_connection, _apiKey, nextPathname, init) => {
+          pathname = nextPathname;
+          requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+          return new Response(JSON.stringify({
+            object: "response",
+            status: "completed",
+            output: [{
+              type: "message",
+              role: "assistant",
+              content: [{
+                type: "output_text",
+                text: JSON.stringify({ title: "局面逆转", paragraphs }),
+              }],
+            }],
+            usage: { input_tokens: 80, output_tokens: 50, total_tokens: 130 },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        },
+      },
+    ),
+  );
+
+  assert.equal(pathname, "/responses");
+  assert.equal(requestBody.stream, false);
+  assert.deepEqual(result, {
+    title: "局面逆转",
+    paragraphs: normalizedParagraphs,
+    model: "writer",
+    origin: "model",
+    usageTokens: 130,
+    usageEstimated: false,
+  });
 });
 
 test("completeJson preserves call-local usage for every provider failure shape", async () => {
@@ -4201,12 +4447,95 @@ test("connection test accepts a writer response beyond the former 12-second time
   }
 });
 
+test("connection test accepts a reasoning route response beyond the former 30-second timeout", async (context) => {
+  const provider = await startFakeModelProvider({ writerDelayMs: 35_000 });
+  try {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const testResult = testConnection(provider.connection, readFakeModelSecret);
+    await provider.writerProbeSeen;
+    context.mock.timers.tick(35_000);
+    const capabilities = await testResult;
+    assert.equal(capabilities.completionApi, "chat_completions");
+    assert.equal(capabilities.embedding, true);
+  } finally {
+    context.mock.timers.reset();
+    await provider.close();
+  }
+});
+
 test("connection test gives reasoning routes enough output allowance to return content", async () => {
   const provider = await startFakeModelProvider({ mandatoryMinCompletionTokens: 16 });
   try {
     const capabilities = await testConnection(provider.connection, readFakeModelSecret);
     assert.equal(capabilities.models.includes("writer-test"), true);
     assert.deepEqual(provider.mandatoryProbeModels().sort(), ["extractor-test", "planner-test", "writer-test"]);
+  } finally {
+    await provider.close();
+  }
+});
+
+test("connection test selects Chat Completions when its response is valid", async () => {
+  const provider = await startFakeModelProvider();
+  try {
+    const capabilities = await testConnection(provider.connection, readFakeModelSecret);
+    assert.equal(capabilities.completionApi, "chat_completions");
+    assert.equal(provider.responsesCalls(), 1);
+  } finally {
+    await provider.close();
+  }
+});
+
+test("connection test negotiates the OpenAI Responses API for responses-only text providers", async () => {
+  const provider = await startResponsesModelProvider();
+  try {
+    const capabilities = await testConnection(provider.connection, readFakeModelSecret);
+    assert.equal(capabilities.completionApi, "responses");
+    assert.equal(capabilities.embedding, true);
+    assert.equal(capabilities.maxContextTokens, 200_000);
+    assert.deepEqual(provider.mandatoryProbeModels().sort(), [
+      "extractor-responses",
+      "planner-responses",
+      "writer-responses",
+    ]);
+    assert.equal(provider.chatCompletionCalls(), 1);
+  } finally {
+    await provider.close();
+  }
+});
+
+test("connection negotiation starts Responses without waiting for a stalled Chat endpoint", async (context) => {
+  const provider = await startResponsesModelProvider({ chatDelayMs: 35_000 });
+  let responsesStartedBeforeChatFinished = false;
+  try {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const testResult = testConnection(provider.connection, readFakeModelSecret);
+    await provider.chatProbeSeen;
+    for (let turn = 0; turn < 10; turn += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    responsesStartedBeforeChatFinished = provider.responsesCalls() > 0;
+    context.mock.timers.tick(35_000);
+    const capabilities = await testResult;
+    assert.equal(capabilities.completionApi, "responses");
+  } finally {
+    context.mock.timers.reset();
+    await provider.close();
+  }
+  assert.equal(responsesStartedBeforeChatFinished, true);
+});
+
+test("connection test treats model listing as optional when configured text routes work", async () => {
+  const provider = await startResponsesModelProvider({ modelsStatus: 404 });
+  try {
+    const capabilities = await testConnection(provider.connection, readFakeModelSecret);
+    assert.equal(capabilities.completionApi, "responses");
+    assert.deepEqual(capabilities.models, []);
+    assert.equal(capabilities.maxContextTokens, null);
+    assert.deepEqual(provider.mandatoryProbeModels().sort(), [
+      "extractor-responses",
+      "planner-responses",
+      "writer-responses",
+    ]);
   } finally {
     await provider.close();
   }
@@ -4222,6 +4551,26 @@ test("connection test preserves the writer provider status and error detail", as
   } finally {
     await provider.close();
   }
+});
+
+test("connection failure status does not mistake request-id digits for an authentication failure", () => {
+  const modelError = Object.assign(
+    new Error("规划路由返回 404：ModelNotOpen，request id req_abc403xyz。"),
+    { providerStatus: 404 },
+  );
+  assert.equal(connectionStatusAfterTestFailure(modelError), "degraded");
+  assert.equal(
+    connectionStatusAfterTestFailure(Object.assign(new Error("writer access denied"), { providerStatus: 403 })),
+    "degraded",
+  );
+  assert.equal(
+    connectionStatusAfterTestFailure(Object.assign(new Error("认证失败"), { providerStatus: 401 })),
+    "revoked",
+  );
+  assert.equal(
+    connectionStatusAfterTestFailure(Object.assign(new Error("invalid API key"), { providerStatus: 403 })),
+    "revoked",
+  );
 });
 
 test("connection test rejects an unavailable planner opening route", async () => {
@@ -4285,8 +4634,8 @@ test("connection test reports a writer timeout when the response body stalls", a
     for (let turn = 0; turn < 10; turn += 1) {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    context.mock.timers.tick(30_000);
-    await assert.rejects(testResult, /writer.*超时（30 秒）/i);
+    context.mock.timers.tick(90_000);
+    await assert.rejects(testResult, /writer.*超时（90 秒）/i);
   } finally {
     context.mock.timers.reset();
     await provider.close();

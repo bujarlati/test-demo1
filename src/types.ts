@@ -450,7 +450,10 @@ export interface ModelRoutes {
   embedding: string;
 }
 
+export type OpenAICompletionApi = "chat_completions" | "responses";
+
 export interface CapabilitySnapshot {
+  completionApi?: OpenAICompletionApi;
   streaming: boolean;
   jsonSchema: boolean;
   embedding: boolean;

@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
-import type { CapabilitySnapshot, EndingContract, ModelConnection, ReadingExperienceContract, ReadingExperienceEvidence, Story } from "../src/types";
+import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, ReadingExperienceContract, ReadingExperienceEvidence, Story } from "../src/types";
 import {
   assertImmersiveNarration,
   assertPersistentExperienceFacts,
@@ -325,23 +325,35 @@ async function assertOpeningRouteCompletion(
   apiKey: string,
   model: string,
   roles: MandatoryOpeningRouteRole[],
+  completionApi: OpenAICompletionApi,
+  externalSignal?: AbortSignal,
 ) {
-  const timeoutMs = 30_000;
+  const timeoutMs = 90_000;
   const route = `${roles.map((role) => mandatoryOpeningRouteLabels[role]).join("、")}路由 ${model}`;
   const controller = new AbortController();
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let response: Response;
     try {
-      response = await modelFetch(connection, apiKey, "/chat/completions", {
+      response = await modelFetch(connection, apiKey, completionApi === "responses" ? "/responses" : "/chat/completions", {
         method: "POST",
         signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: "回复：好" }],
-          max_tokens: 64,
-          stream: false,
-        }),
+        body: JSON.stringify(completionApi === "responses"
+          ? {
+              model,
+              input: "回复：好",
+              max_output_tokens: 64,
+              stream: false,
+            }
+          : {
+              model,
+              messages: [{ role: "user", content: "回复：好" }],
+              max_tokens: 64,
+              stream: false,
+            }),
       }, timeoutMs);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "未知传输错误";
@@ -353,12 +365,15 @@ async function assertOpeningRouteCompletion(
 
     if (!response.ok) {
       const detail = await readProviderError(response, 4_096, [apiKey]);
-      throw new Error(`${route}返回 ${response.status}${detail ? `：${detail}` : ""}。`);
+      throw Object.assign(
+        new Error(`${route}返回 ${response.status}${detail ? `：${detail}` : ""}。`),
+        { providerStatus: response.status },
+      );
     }
 
-    let payload: { choices?: Array<{ message?: { content?: string } }> };
+    let payload: unknown;
     try {
-      payload = (await response.json()) as typeof payload;
+      payload = await response.json();
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`${route}的最小请求超时（${timeoutMs / 1_000} 秒）。`);
@@ -367,11 +382,15 @@ async function assertOpeningRouteCompletion(
       throw new Error(`${route}返回的响应不是有效 JSON：${reason.slice(0, 160)}。`);
     }
 
-    if (typeof payload.choices?.[0]?.message?.content !== "string" || !payload.choices[0].message.content.trim()) {
+    const content = completionApi === "responses"
+      ? responsesOutputText(payload)
+      : (payload as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) {
       throw new Error(`${route}返回 200，但没有可用内容。`);
     }
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
 }
 
@@ -487,17 +506,26 @@ export async function testConnection(
   await assertSafeEndpoint(connection.baseUrl);
   const apiKey = await secretReader(connection.id, connection.secretVersion);
   const startedAt = performance.now();
-  const response = await modelFetch(connection, apiKey, "/models", { method: "GET" }, 10_000);
-  if (!response.ok) {
-    const detail = await readProviderError(response, 4_096, [apiKey]);
-    throw new Error(`连接返回 ${response.status}${detail ? `：${detail}` : ""}，请检查地址、Key 与访问权限。`);
+  let modelItems: Array<{ id?: string; context_window?: number; max_context_length?: number }> = [];
+  try {
+    const response = await modelFetch(connection, apiKey, "/models", { method: "GET" }, 10_000);
+    if (response.ok) {
+      const payload = (await response.json()) as { data?: unknown };
+      if (Array.isArray(payload.data)) {
+        modelItems = payload.data as typeof modelItems;
+      }
+    } else {
+      await discardResponse(response);
+    }
+  } catch {
+    // Model discovery is not part of every OpenAI-compatible data plane. The
+    // configured text routes below are the authoritative connection test.
   }
-  const payload = (await response.json()) as { data?: Array<{ id?: string; context_window?: number; max_context_length?: number }> };
-  const models = (payload.data ?? [])
+  const models = modelItems
     .map((item) => item.id)
     .filter((item): item is string => Boolean(item))
     .slice(0, 20);
-  const maxContextTokens = Math.max(0, ...(payload.data ?? []).map((item) => item.context_window ?? item.max_context_length ?? 0)) || null;
+  const maxContextTokens = Math.max(0, ...modelItems.map((item) => item.context_window ?? item.max_context_length ?? 0)) || null;
   const mandatoryRoutes = new Map<string, MandatoryOpeningRouteRole[]>();
   for (const role of ["planner", "writer", "extractor"] as const) {
     const model = connection.routes[role];
@@ -505,17 +533,53 @@ export async function testConnection(
     roles.push(role);
     mandatoryRoutes.set(model, roles);
   }
-  for (const [model, roles] of mandatoryRoutes) {
-    await assertOpeningRouteCompletion(connection, apiKey, model, roles);
+  const mandatoryEntries = [...mandatoryRoutes.entries()];
+  const firstMandatoryRoute = mandatoryEntries[0];
+  if (!firstMandatoryRoute) throw new Error("连接没有配置可测试的文本模型路由。");
+  let completionApi: OpenAICompletionApi | undefined;
+  let negotiationErrors: unknown[] = [];
+  const candidates = ["chat_completions", "responses"] as const;
+  const negotiationControllers = candidates.map(() => new AbortController());
+  try {
+    completionApi = await Promise.any(candidates.map(async (candidate, index) => {
+      await assertOpeningRouteCompletion(
+        connection,
+        apiKey,
+        firstMandatoryRoute[0],
+        firstMandatoryRoute[1],
+        candidate,
+        negotiationControllers[index].signal,
+      );
+      return candidate;
+    }));
+  } catch (error) {
+    negotiationErrors = error instanceof AggregateError ? error.errors : [error];
+  } finally {
+    negotiationControllers.forEach((controller) => controller.abort());
   }
-  const [jsonSchema, streaming, embedding, toolCalling, promptCache] = await runWithConcurrency([
-    () => probeJson(connection, apiKey),
-    () => probeStreaming(connection, apiKey),
-    () => probeEmbedding(connection, apiKey),
-    () => probeToolCalling(connection, apiKey),
-    () => probePromptCache(connection, apiKey),
-  ], 2);
+  if (!completionApi) {
+    const providerErrors = negotiationErrors.filter((error) =>
+      error && typeof error === "object" && Number.isFinite(Number((error as { providerStatus?: unknown }).providerStatus)));
+    const authorizationError = providerErrors.find((error) => {
+      const status = Number((error as { providerStatus?: unknown }).providerStatus);
+      return status === 401 || status === 403;
+    });
+    throw authorizationError ?? providerErrors.at(-1) ?? negotiationErrors.at(-1);
+  }
+  for (const [model, roles] of mandatoryEntries.slice(1)) {
+    await assertOpeningRouteCompletion(connection, apiKey, model, roles, completionApi);
+  }
+  const [jsonSchema, streaming, embedding, toolCalling, promptCache] = completionApi === "chat_completions"
+    ? await runWithConcurrency([
+        () => probeJson(connection, apiKey),
+        () => probeStreaming(connection, apiKey),
+        () => probeEmbedding(connection, apiKey),
+        () => probeToolCalling(connection, apiKey),
+        () => probePromptCache(connection, apiKey),
+      ], 2)
+    : [false, false, await probeEmbedding(connection, apiKey), false, false];
   return {
+    completionApi,
     streaming,
     jsonSchema,
     embedding,
@@ -566,6 +630,33 @@ function reportedCompletionUsage(payload: unknown): number | undefined {
   if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
   const rounded = Math.round(total);
   return rounded > 0 ? rounded : undefined;
+}
+
+function completionApiFor(connection: ModelConnection): OpenAICompletionApi {
+  return connection.capabilities?.completionApi ?? "chat_completions";
+}
+
+function responsesOutputText(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const direct = (payload as { output_text?: unknown }).output_text;
+  if (typeof direct === "string" && direct.trim()) return direct;
+  const output = (payload as { output?: unknown }).output;
+  if (!Array.isArray(output)) return undefined;
+  const fragments: string[] = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const typedPart = part as { type?: unknown; text?: unknown };
+      if (typedPart.type === "output_text" && typeof typedPart.text === "string") {
+        fragments.push(typedPart.text);
+      }
+    }
+  }
+  const joined = fragments.join("");
+  return joined.trim() ? joined : undefined;
 }
 
 function isSiliconFlowConnection(connection: ModelConnection): boolean {
@@ -669,25 +760,37 @@ export async function completeJson<T>(
     new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const now = dependencies.now ?? Date.now;
   const apiKey = await secretReader(connection.id, connection.secretVersion);
-  const streamStructuredResponse = isSiliconFlowConnection(connection) && connection.capabilities?.streaming === true;
+  const completionApi = completionApiFor(connection);
+  const streamStructuredResponse = completionApi === "chat_completions" &&
+    isSiliconFlowConnection(connection) && connection.capabilities?.streaming === true;
   const useConciseQwenExtractorOutput = isSiliconFlowConnection(connection) &&
     model === connection.routes.extractor && /^Qwen\/Qwen3(?:[-./]|$)/i.test(model);
-  const body: Record<string, unknown> = {
-    model,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: prompt },
-    ],
-    temperature: model === connection.routes.extractor ? 0.2 : 0.7,
-    stream: streamStructuredResponse,
-    max_tokens: maxTokens,
-  };
-  if (useConciseQwenExtractorOutput) body.enable_thinking = false;
-  if (
-    connection.capabilities?.jsonSchema &&
-    (model === connection.routes.writer || useConciseQwenExtractorOutput)
-  ) {
-    body.response_format = { type: "json_object" };
+  const body: Record<string, unknown> = completionApi === "responses"
+    ? {
+        model,
+        instructions: system,
+        input: prompt,
+        max_output_tokens: maxTokens,
+        stream: false,
+      }
+    : {
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: prompt },
+        ],
+        temperature: model === connection.routes.extractor ? 0.2 : 0.7,
+        stream: streamStructuredResponse,
+        max_tokens: maxTokens,
+      };
+  if (completionApi === "chat_completions") {
+    if (useConciseQwenExtractorOutput) body.enable_thinking = false;
+    if (
+      connection.capabilities?.jsonSchema &&
+      (model === connection.routes.writer || useConciseQwenExtractorOutput)
+    ) {
+      body.response_format = { type: "json_object" };
+    }
   }
   const conservativeFailureTokens = estimatedCompletionFailureTokens(system, prompt, maxTokens);
   const maximumAttempts = 3;
@@ -747,7 +850,7 @@ export async function completeJson<T>(
       response = await completionFetcher(
         connection,
         apiKey,
-        "/chat/completions",
+        completionApi === "responses" ? "/responses" : "/chat/completions",
         { method: "POST", body: JSON.stringify(body) },
         Math.max(1, Math.min(timeout, remainingOverallTimeout)),
         Math.max(1, remainingOverallTimeout),
@@ -797,12 +900,9 @@ export async function completeJson<T>(
         throw attachModelUsage(streamFailure, priorFailureTokens, priorUsageEstimated);
       }
     } else {
-      let payload: {
-        choices?: Array<{ message?: { content?: string } }>;
-        usage?: { total_tokens?: number };
-      };
+      let payload: unknown;
       try {
-        payload = (await response.json()) as typeof payload;
+        payload = await response.json();
       } catch (error) {
         const reason = error instanceof Error ? error.message : "未知响应错误";
         const invalidResponse = new Error(`模型 ${model} 返回的响应不是有效 JSON：${reason.slice(0, 160)}。`);
@@ -813,7 +913,9 @@ export async function completeJson<T>(
         }
         throw attachModelUsage(invalidResponse, priorFailureTokens, priorUsageEstimated);
       }
-      content = payload.choices?.[0]?.message?.content;
+      content = completionApi === "responses"
+        ? responsesOutputText(payload)
+        : (payload as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
       reportedTokens = reportedCompletionUsage(payload);
     }
     const failureTokens = reportedTokens ?? conservativeFailureTokens;

@@ -34,7 +34,7 @@ import {
   toggleCharacterProtection,
 } from "./storyService";
 import { createStoryWithOpening, storyOpeningPublicationText } from "./openingService";
-import { accessibleConnectionOrThrow, isManagedLocalConnection, listGenerationModelOptions } from "./modelConnectionAccess";
+import { accessibleConnectionOrThrow, connectionStatusAfterTestFailure, isManagedLocalConnection, listGenerationModelOptions } from "./modelConnectionAccess";
 import {
   assertGenerationTokenBudget,
   CHAPTER_EXTRACTION_ADMISSION_RESERVE,
@@ -1348,6 +1348,7 @@ app.post("/api/model-connections/:connectionId/test", requireAdmin, async (reque
     connection.status = "active";
     connection.updatedAt = new Date().toISOString();
     audit(store, user.id, "connection.test-success", "connection", connection.id, {
+      completionApi: connection.capabilities.completionApi ?? "chat_completions",
       streaming: connection.capabilities.streaming,
       jsonSchema: connection.capabilities.jsonSchema,
       embedding: connection.capabilities.embedding,
@@ -1356,7 +1357,7 @@ app.post("/api/model-connections/:connectionId/test", requireAdmin, async (reque
     response.json(connection);
   } catch (error) {
     const message = error instanceof Error ? error.message : "连接测试失败。";
-    connection.status = /401|403|凭据/.test(message) ? "revoked" : "degraded";
+    connection.status = connectionStatusAfterTestFailure(error);
     connection.lastError = message;
     connection.updatedAt = new Date().toISOString();
     audit(store, user.id, "connection.test-failed", "connection", connection.id, { reason: message });
