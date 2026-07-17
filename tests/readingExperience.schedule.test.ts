@@ -295,7 +295,11 @@ test("authorization canonicalization is strict and deterministic", () => {
   assert.throws(() => canonicalAuthorizationPayload(arrayWithHiddenExtra), { code: "invalid_authorization_payload" });
 
   class ArraySubclass extends Array<unknown> {}
-  for (const value of [[undefined], [Number.NaN], (() => { const sparse: unknown[] = []; sparse.length = 1; return sparse; })(), new Date(), Object.create({ x: 1 }), undefined, () => undefined, Symbol("value"), 1n, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, new ArraySubclass(1)]) {
+  const denseArraySubclass = new ArraySubclass();
+  denseArraySubclass.push(1);
+  assert.equal(denseArraySubclass.length, 1);
+  assert.equal(0 in denseArraySubclass, true);
+  for (const value of [[undefined], [Number.NaN], (() => { const sparse: unknown[] = []; sparse.length = 1; return sparse; })(), new Date(), Object.create({ x: 1 }), undefined, () => undefined, Symbol("value"), 1n, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, denseArraySubclass]) {
     assert.throws(() => canonicalAuthorizationPayload(value), { code: "invalid_authorization_payload" });
   }
   const cycle: Record<string, unknown> = {}; cycle.self = cycle;
