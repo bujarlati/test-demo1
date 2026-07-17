@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
-import { scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2 } from "../src/types";
 
 const secret = "schedule-test-secret";
@@ -263,4 +263,13 @@ test("CAS rejects an authorization MACed with an attacker-chosen key", () => {
   const forged = createLedgerAuthorization(forgedPlan, request().canon, ["evidence-1"], "attacker-key");
   const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
   assert.throws(() => applyExperienceLedgerPatch(ledger(), patch, { ...deps, authorization: forged, liveCanon: request().canon }), { code: "plan_mismatch" });
+});
+
+test("authorization canonicalization is strict and deterministic", () => {
+  assert.equal(canonicalAuthorizationPayload({ b: [null, 1], a: true }), canonicalAuthorizationPayload({ a: true, b: [null, 1] }));
+  for (const value of [[undefined], [Number.NaN], (() => { const sparse: unknown[] = []; sparse.length = 1; return sparse; })(), new Date(), Object.create({ x: 1 }), Object.defineProperty({}, "x", { get: () => 1, enumerable: true })]) {
+    assert.throws(() => canonicalAuthorizationPayload(value), { code: "invalid_authorization_payload" });
+  }
+  const cycle: Record<string, unknown> = {}; cycle.self = cycle;
+  assert.throws(() => canonicalAuthorizationPayload(cycle), { code: "invalid_authorization_payload" });
 });

@@ -48,18 +48,36 @@ export function verifyExperienceStageTicket(ticket: ExperienceStageTicket, deps:
 
 function stableToken(value: string): string { return createHash("sha256").update(value).digest("base64url"); }
 
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`;
+export function canonicalAuthorizationPayload(value: unknown): string {
+  const seen = new WeakSet<object>();
+  const invalid = (): never => { throw new ExperienceSchedulingError("invalid_authorization_payload"); };
+  const visit = (input: unknown): string => {
+    if (input === null) return "null";
+    if (typeof input === "boolean" || typeof input === "string") return JSON.stringify(input);
+    if (typeof input === "number") return Number.isFinite(input) ? JSON.stringify(input) : invalid();
+    if (typeof input !== "object") return invalid();
+    if (seen.has(input)) return invalid();
+    seen.add(input);
+    if (Array.isArray(input)) {
+      if (Object.keys(input).some((key) => !/^(0|[1-9][0-9]*)$/.test(key)) || input.length !== Object.keys(input).length) return invalid();
+      return `[${Array.from({ length: input.length }, (_, index) => visit(input[index])).join(",")}]`;
+    }
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Object.keys(descriptors).sort();
+    if (keys.some((key) => !("value" in descriptors[key]) || !descriptors[key].enumerable)) return invalid();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${visit(descriptors[key].value)}`).join(",")}}`;
+  };
+  try { return visit(value); } catch (error) { if (error instanceof ExperienceSchedulingError) throw error; throw new ExperienceSchedulingError("invalid_authorization_payload"); }
 }
 
 export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizationMac">, secret: string): string {
-  return createHmac("sha256", secret).update(canonical(plan)).digest("base64url");
+  return createHmac("sha256", secret).update(canonicalAuthorizationPayload(plan)).digest("base64url");
 }
 
 export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceIds: string[], secret: string): string {
-  return createHmac("sha256", secret).update(canonical({ plan, canon, evidenceIds })).digest("base64url");
+  return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceIds })).digest("base64url");
 }
 
 export function sameMac(left: string, right: string): boolean {
@@ -216,7 +234,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     }
   }
   const expiresAt = new Date(deps.now().getTime() + deps.ticketTtlMs).toISOString();
-  const ticketId = deps.createTicketId?.(request) ?? `ticket_${stableToken([request.contract.id, request.activation.id, request.ledger.revision, request.canon.branchId, request.canon.canonVersion, stage, request.artifactKind, request.jobId, request.attempt].join(ticketSeparator))}`;
+  const ticketId = deps.createTicketId?.(request) ?? `ticket_${stableToken(canonicalAuthorizationPayload([request.contract.id, request.activation.id, request.ledger.revision, request.canon.branchId, request.canon.canonVersion, stage, request.artifactKind, request.jobId, request.attempt]))}`;
   const unsigned: Omit<ExperienceStageTicket, "signature"> = {
     id: ticketId,
     contractRevisionId: request.contract.id,

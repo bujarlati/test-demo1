@@ -179,7 +179,8 @@ export type ExperienceSchedulingErrorCode =
   | "plan_mismatch"
   | "unauthorized_delivery"
   | "unauthorized_fact"
-  | "insufficient_signals";
+  | "insufficient_signals"
+  | "invalid_authorization_payload";
 
 export interface AssessExperienceRequest {
   plan: ExperienceStagePlan;
