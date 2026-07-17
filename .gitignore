@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .scratch/
+.worktrees/
 .playwright-cli/
 output/
 test-results/
