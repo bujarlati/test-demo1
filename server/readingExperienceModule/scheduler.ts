@@ -272,7 +272,12 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     softRollingPromiseIds: request.contract.promises.filter((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window").map((promise) => promise.id),
     dueSoftPromiseIds: soft.due.map((promise) => promise.id),
     carriedDebtPromiseIds: soft.carried,
-    newDebts: soft.debts,
+    newDebts: soft.debts.flatMap((debt) => {
+      const promise = request.contract.promises.find((candidate) => candidate.id === debt.promiseId);
+      if (!promise) return [];
+      const dimensionIds = promise.dimensionId === "both" ? request.contract.dimensions.map((dimension) => dimension.id) : [promise.dimensionId];
+      return dimensionIds.map((dimensionId) => ({ ...debt, dimensionId }));
+    }),
     ticket: { ...unsigned, signature: signExperienceStageTicket(unsigned, deps.ticketSecret) },
   };
   return deepFreeze(structuredClone({ ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, deps.ticketSecret) }));

@@ -86,7 +86,7 @@ test("schedule binds stage, contract, branch, canon, ledger and attempt", () => 
 test("hard presence cannot become debt while soft rolling promises can", () => {
   const plan = scheduleExperience(request({ chapterNumber: 5, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }) }), deps);
   assert.deepEqual(plan.hardPresencePromiseIds, ["hard-action", "hard-voice"]);
-  assert.deepEqual(plan.newDebts, [{ promiseId: "soft-rolling", dueByChapter: 6 }]);
+  assert.deepEqual(plan.newDebts, [{ dimensionId: "dimension_action", promiseId: "soft-rolling", dueByChapter: 6 }]);
 });
 
 test("stage selection and rolling boundaries are deterministic at N-1, N and N+1", () => {
@@ -169,8 +169,8 @@ test("rolling windows start at activation and evaluate only after N active prior
   const atN = scheduleExperience(request({ chapterNumber: 5, ledger: initial }), deps);
   const atNPlusOne = scheduleExperience(request({ chapterNumber: 6, ledger: initial }), deps);
   assert.deepEqual(atNMinusOne.newDebts, []);
-  assert.deepEqual(atN.newDebts, [{ promiseId: "soft-rolling", dueByChapter: 6 }]);
-  assert.deepEqual(atNPlusOne.newDebts, [{ promiseId: "soft-rolling", dueByChapter: 7 }]);
+  assert.deepEqual(atN.newDebts, [{ dimensionId: "dimension_action", promiseId: "soft-rolling", dueByChapter: 6 }]);
+  assert.deepEqual(atNPlusOne.newDebts, [{ dimensionId: "dimension_action", promiseId: "soft-rolling", dueByChapter: 7 }]);
 });
 
 test("supplied stage must agree with artifact, activation chapter, and retry state", () => {

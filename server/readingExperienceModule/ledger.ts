@@ -97,7 +97,7 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
   }
   const compareText = (left: string, right: string) => left === right ? 0 : left < right ? -1 : 1;
   const compareDebt = (left: { dimensionId: string; promiseId: string; dueByChapter: number }, right: { dimensionId: string; promiseId: string; dueByChapter: number }) => compareText(left.dimensionId, right.dimensionId) || compareText(left.promiseId, right.promiseId) || left.dueByChapter - right.dueByChapter;
-  const plannedDebts = plan.newDebts.map((debt) => ({ dimensionId: deps.contract.promises.find((promise) => promise.id === debt.promiseId)?.dimensionId ?? "", ...debt })).sort(compareDebt);
+  const plannedDebts = plan.newDebts.map((debt) => ({ ...debt })).sort(compareDebt);
   const suppliedDebts = Object.entries(patch.newDebtsByDimension).flatMap(([dimensionId, debts]) => debts.map((debt) => ({ dimensionId, ...debt }))).sort(compareDebt);
   if (suppliedDebts.some((debt, index) => index > 0 && compareDebt(debt, suppliedDebts[index - 1]) === 0) || plannedDebts.length !== suppliedDebts.length || plannedDebts.some((debt, index) => compareDebt(debt, suppliedDebts[index]) !== 0)) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (plan.dueSoftPromiseIds.some((promiseId) => !patch.deliveredPromiseIds.includes(promiseId) && !plan.newDebts.some((debt) => debt.promiseId === promiseId) && !plan.carriedDebtPromiseIds.includes(promiseId))) throw new ExperienceSchedulingError("unauthorized_delivery");
@@ -142,7 +142,7 @@ export function applyExperienceLedgerPatch(ledger: ExperienceLedgerV2, patch: Ex
   const dimensions = ledger.dimensions.map((dimension) => {
     const delivered = patch.deliveredSignalIdsByDimension[dimension.dimensionId] ?? [];
     const persistent = patch.persistentResultsByDimension[dimension.dimensionId];
-    const additions = patch.newDebtsByDimension[dimension.dimensionId] ?? [];
+    const additions = (patch.newDebtsByDimension[dimension.dimensionId] ?? []).map(({ dimensionId: _ignored, ...debt }) => debt);
     const debts = [
       ...dimension.debts.filter((debt) => !patch.deliveredPromiseIds.includes(debt.promiseId)),
       ...additions,
