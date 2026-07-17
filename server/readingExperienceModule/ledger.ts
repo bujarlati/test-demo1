@@ -1,7 +1,6 @@
 import type { ExperienceLedgerV2 } from "../../src/types";
 import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies } from "./types";
-import { ExperienceSchedulingError, verifyExperienceStageTicket } from "./scheduler";
-import { signExperiencePlan } from "./scheduler";
+import { ExperienceSchedulingError, sameMac, signExperiencePlan, signLedgerAuthorizationRoot, verifyExperienceStageTicket } from "./scheduler";
 
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -20,8 +19,8 @@ export function createLedgerAuthorization(
   ticketSecret: string,
 ): LedgerAuthorization {
   const { authorizationMac, ...unsignedPlan } = plan;
-  if (authorizationMac !== signExperiencePlan(unsignedPlan, ticketSecret)) throw new ExperienceSchedulingError("plan_mismatch");
-  const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceIds })) as LedgerAuthorization;
+  if (!sameMac(authorizationMac, signExperiencePlan(unsignedPlan, ticketSecret))) throw new ExperienceSchedulingError("plan_mismatch");
+  const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceIds, authorizationRootMac: signLedgerAuthorizationRoot(plan, canon, evidenceIds, ticketSecret) })) as LedgerAuthorization;
   authenticAuthorizations.add(snapshot);
   return snapshot;
 }
@@ -49,6 +48,8 @@ function sameFact(left: { id: string; revisionId: string; kind: string }, right:
 function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: ExperienceLedgerPatch, deps: LedgerDependencies): void {
   const { plan, canon, evidenceIds } = deps.authorization;
   if (!authenticAuthorizations.has(deps.authorization)) throw new ExperienceSchedulingError("plan_mismatch");
+  const { authorizationMac, ...unsignedPlan } = plan;
+  if (!sameMac(authorizationMac, signExperiencePlan(unsignedPlan, deps.ticketSecret)) || !sameMac(deps.authorization.authorizationRootMac, signLedgerAuthorizationRoot(plan, canon, evidenceIds, deps.ticketSecret))) throw new ExperienceSchedulingError("plan_mismatch");
   if (!sameTicket(plan.ticket, patch.ticket)
     || plan.chapterNumber !== patch.chapterNumber
     || plan.stage !== patch.ticket.stage

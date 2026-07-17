@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
-import { scheduleExperience, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
+import { scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2 } from "../src/types";
 
 const secret = "schedule-test-secret";
@@ -254,4 +254,13 @@ test("authorization rejects fabricated plans and scheduling never freezes caller
 test("satisfied soft promises do not block hard-only patches and debt comparison is dimension-safe", () => {
   const plan = scheduleExperience(request({ activation: { ...activation(), effectiveFromChapter: 1 }, chapterNumber: 4, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1, 2] }] }) }), deps);
   assert.deepEqual(plan.dueSoftPromiseIds, []);
+});
+
+test("CAS rejects an authorization MACed with an attacker-chosen key", () => {
+  const plan = scheduleExperience(request(), deps);
+  const { authorizationMac: _ignored, ...unsignedPlan } = { ...plan, chapterNumber: 99 };
+  const forgedPlan = { ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, "attacker-key") };
+  const forged = createLedgerAuthorization(forgedPlan, request().canon, ["evidence-1"], "attacker-key");
+  const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  assert.throws(() => applyExperienceLedgerPatch(ledger(), patch, { ...deps, authorization: forged, liveCanon: request().canon }), { code: "plan_mismatch" });
 });

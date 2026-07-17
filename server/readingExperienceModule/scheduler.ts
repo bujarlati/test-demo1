@@ -58,6 +58,16 @@ export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizatio
   return createHmac("sha256", secret).update(canonical(plan)).digest("base64url");
 }
 
+export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceIds: string[], secret: string): string {
+  return createHmac("sha256", secret).update(canonical({ plan, canon, evidenceIds })).digest("base64url");
+}
+
+export function sameMac(left: string, right: string): boolean {
+  const a = Buffer.from(left, "base64url");
+  const b = Buffer.from(right, "base64url");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function derivedStage(request: ScheduleExperienceRequest): ExperienceStage {
   if (request.artifactKind === "blueprint") return "blueprint";
   if (request.artifactKind === "retcon_revision") return "retcon";

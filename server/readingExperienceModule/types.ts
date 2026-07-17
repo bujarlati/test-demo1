@@ -134,6 +134,7 @@ export interface LedgerAuthorization {
   readonly plan: ExperienceStagePlan;
   readonly canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
   readonly evidenceIds: string[];
+  readonly authorizationRootMac: string;
 }
 
 export interface LedgerDependencies extends SchedulerDependencies {
