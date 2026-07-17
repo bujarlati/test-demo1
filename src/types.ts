@@ -313,6 +313,133 @@ export interface ReadingExperienceEvidence {
   quote: string;
 }
 
+/** Immutable V2 input retained for display and audit, never as prose keywords. */
+export interface ReadingExperienceIntent {
+  descriptors: readonly [
+    { text: string; clarification?: string },
+    { text: string; clarification?: string },
+  ];
+  locale: "zh-CN";
+}
+
+export type ExperienceCategory = "mechanic" | "protagonist_action" | "conflict_outcome" | "world_reaction" | "relationship" | "pacing" | "voice";
+
+export type EvidencePolicy =
+  | { kind: "event_slots"; requiredSlots: Array<"actor" | "action" | "object" | "outcome" | "reaction">; minimumAnchors: number }
+  | { kind: "relationship_change"; requireReciprocalAction: true; minimumAnchors: number }
+  | { kind: "distribution"; metricIds: string[]; minimumAnchors: number; requireSemanticJudge: true };
+
+export interface ObservableSignalV2 {
+  id: string;
+  dimensionId: string;
+  kind: ExperienceCategory;
+  description: string;
+  semanticSlots?: { actor?: string; action?: string; object?: string; outcome?: string; reaction?: string };
+  verification: EvidencePolicy;
+  persistence: "none" | "chapter" | "cross_chapter" | "whole_story";
+}
+
+export interface ExperienceProhibition {
+  id: string;
+  dimensionId: string | "both";
+  kind: "invariant" | "shortcut" | "style_cliche";
+  description: string;
+  severity: "block" | "rewrite" | "penalty";
+  ruleAdapterId?: string;
+}
+
+export interface ExperienceDimension {
+  id: string;
+  descriptor: string;
+  interpretation: string;
+  categories: ExperienceCategory[];
+  observableSignals: ObservableSignalV2[];
+  prohibitions: ExperienceProhibition[];
+  confidence: number;
+}
+
+export interface DeliveryPromiseV2 {
+  id: string;
+  dimensionId: string | "both";
+  scope: { kind: "chapter"; chapterNumber: number } | { kind: "every_chapter" } | { kind: "rolling_window"; chapters: number; minimumDeliveries: number } | { kind: "every_arc" } | { kind: "whole_story" };
+  hardness: "hard" | "soft";
+  minimumSignals: number;
+  carryRuleIds: string[];
+  compensationWindow?: number;
+}
+
+export interface CompiledExperienceContractRevision {
+  id: string;
+  schemaVersion: 2;
+  revision: number;
+  parentRevisionId: string | null;
+  intent: ReadingExperienceIntent;
+  dimensions: [ExperienceDimension, ExperienceDimension];
+  synthesis: { sharedCause: string; dimensionRoles: [string, string] };
+  promises: DeliveryPromiseV2[];
+  prohibitions: ExperienceProhibition[];
+  ruleGraphVersion: string;
+  provenance: Array<{ kind: "curated" | "model" | "migration"; descriptor: string; version: string }>;
+  createdAt: string;
+}
+
+export interface ExperienceContractActivation {
+  id: string;
+  contractRevisionId: string;
+  branchId: string;
+  effectiveFromChapter: number;
+  effectiveFromCanonVersion: number;
+  effectiveThroughCanonVersion: number | null;
+  activatedAt: string;
+}
+
+export interface TextAnchorV2 { start: number; end: number; text: string }
+export interface CanonFactReferenceV2 { id: string; revisionId: string; kind: string }
+export interface ExperienceDebtV2 { promiseId: string; dueByChapter: number }
+
+export interface ExperienceLedgerV2 {
+  contractRevisionId: string;
+  revision: number;
+  branchId: string;
+  throughCanonVersion: number;
+  dimensions: Array<{ dimensionId: string; lastDeliveredChapter: number; silentChapters: number; deliveredSignalIds: string[]; persistentResults: CanonFactReferenceV2[]; debts: ExperienceDebtV2[] }>;
+  evidenceIds: string[];
+}
+
+export interface ExperienceEvidenceV2 {
+  id: string;
+  contractRevisionId: string;
+  dimensionId: string;
+  signalId: string;
+  chapterId: string;
+  chapterRevisionId: string;
+  sourceHash: string;
+  anchors: TextAnchorV2[];
+  observation: { action?: string; outcome?: string; reaction?: string; distributionMetrics?: Record<string, number> };
+  confidence: number;
+  status: "supported" | "insufficient" | "contradicted";
+}
+
+export interface ExperienceLedgerCheckpoint {
+  id: string;
+  branchId: string;
+  throughCanonVersion: number;
+  ledger: ExperienceLedgerV2;
+  createdAt: string;
+}
+
+export interface ReadingExperienceStateV2 {
+  schemaVersion: 2;
+  activeActivationId: string;
+  contractRevisions: CompiledExperienceContractRevision[];
+  activations: ExperienceContractActivation[];
+  ledgers: ExperienceLedgerV2[];
+  evidence: ExperienceEvidenceV2[];
+  checkpoints: ExperienceLedgerCheckpoint[];
+  compilerVersion: string;
+  evaluatorVersion: string;
+}
+
 export interface EndingContract {
   version: number;
   targetEnding: string;
@@ -405,6 +532,7 @@ export interface Story {
   unreadCanonChanges: number;
   readingProgress: ReadingProgress;
   readingExperience: ReadingExperienceContract;
+  readingExperienceV2?: ReadingExperienceStateV2;
   storyGene: StoryGene;
   endingContract: EndingContract;
   worldBible: WorldBible;
