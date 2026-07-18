@@ -90,6 +90,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Bob opened the gate while Aria watched.", ["Aria", "open", "gate"]), true);
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the window.", ["Aria", "open", "gate"]), true);
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the gate.", ["Aria", "open", "gate"]), false);
+  assert.equal(runRuleAdapter("event-failed-attempt", "她险些打开门。"), true);
+  assert.equal(runRuleAdapter("event-negated", "他没有退后，而是迎面击败守卫。"), false);
+  assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also crossed it."), false);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后他在复赛获胜。"), true);
   for (const [id, text] of [["event-negated", "她并未打开门。"], ["event-intent", "她准备明日行动。"], ["event-failed-attempt", "她尝试打开门。"], ["event-simulation", "她幻想自己已经获胜。"], ["event-hearsay", "听说她打开了门。"]] as const) assert.equal(runRuleAdapter(id, text), true, `${id}:${text}`);
 });
 

@@ -165,7 +165,7 @@ function validBlueprint(value: Record<string, unknown>, plan: ExperienceStagePla
   const expectedDimensions = plan.promptProjection.dimensions.map((dimension) => dimension.id).sort();
   if (!shared || typeof shared.event !== "string" || !shared.event.trim() || !Array.isArray(shared.dimensionIds) || [...shared.dimensionIds].sort().join("|") !== expectedDimensions.join("|")) return false;
   if (!Array.isArray(value.chapters) || !value.chapters.length) return false;
-  return value.chapters.every((chapter) => { if (!chapter || typeof chapter !== "object" || Array.isArray(chapter)) return false; const record = chapter as Record<string, unknown>; return Number.isInteger(record.number) && Array.isArray(record.signalIds) && record.signalIds.every((id) => typeof id === "string") && Array.isArray(record.promiseIds) && record.promiseIds.every((id) => typeof id === "string") && typeof record.event === "string" && !!record.event.trim() && typeof record.cost === "string" && !!record.cost.trim(); });
+  return value.chapters.every((chapter) => { if (!chapter || typeof chapter !== "object" || Array.isArray(chapter)) return false; const record = chapter as Record<string, unknown>; if (Object.keys(record).some((key) => !["number", "signalIds", "promiseIds", "event", "cause", "outcome", "cost"].includes(key))) return false; return Number.isInteger(record.number) && Array.isArray(record.signalIds) && record.signalIds.every((id) => typeof id === "string") && Array.isArray(record.promiseIds) && record.promiseIds.every((id) => typeof id === "string") && [record.event, record.cause, record.outcome, record.cost].every((field) => typeof field === "string" && !!field.trim()); });
 }
 function blueprintPointer(root: unknown, pointer: string): unknown {
   if (pointer === "") return root; if (!pointer.startsWith("/")) return undefined;
@@ -187,7 +187,7 @@ function validBlueprintVerdict(value: unknown): value is SemanticBlueprintVerdic
   const ending = verdict.ending; const shared = verdict.sharedCause;
   return exact(ending, ["targetPointer", "costPointer", "supported", "systemState", "protagonistOutcome", "hasRealCost"]) && typeof ending.targetPointer === "string" && typeof ending.costPointer === "string" && typeof ending.supported === "boolean" && ["available", "unavailable", "not_applicable"].includes(ending.systemState as string) && ["fulfilled", "defeated", "unresolved"].includes(ending.protagonistOutcome as string) && typeof ending.hasRealCost === "boolean" && exact(shared, ["pointer", "dimensionIds", "supported"]) && typeof shared.pointer === "string" && Array.isArray(shared.dimensionIds) && shared.dimensionIds.every((id) => typeof id === "string") && typeof shared.supported === "boolean";
 }
-function validateBlueprintSemantics(value: Record<string, unknown>, verdict: SemanticBlueprintVerdict, plan: ExperienceStagePlan): EvidenceFinding | undefined {
+function validateBlueprintSemantics(value: Record<string, unknown>, verdict: SemanticBlueprintVerdict, plan: ExperienceStagePlan, signals: ObservableSignalV2[]): EvidenceFinding | undefined {
   if (verdict.confidence < .65) return { ruleId: "blueprint.confidence_insufficient", severity: "rewrite" };
   const ids = unique([...plan.promptProjection.dimensions.flatMap((dimension) => [dimension.id, ...dimension.signalIds]), ...plan.hardPresencePromiseIds]);
   const substantive = (candidate: unknown): candidate is string => {
@@ -195,6 +195,7 @@ function validateBlueprintSemantics(value: Record<string, unknown>, verdict: Sem
     if (/(?:本章|信号|承诺|维度|标签|读者|作者|体验词)|\b(?:chapter|signal|promise|dimension|label|reader|author|descriptor)s?\b/iu.test(candidate)) return false;
     let remainder = candidate.normalize("NFKC").toLocaleLowerCase();
     for (const id of [...ids].sort((left, right) => right.length - left.length)) remainder = remainder.split(id.normalize("NFKC").toLocaleLowerCase()).join(" ");
+    for (const description of signals.map((signal) => signal.description.normalize("NFKC").toLocaleLowerCase().trim()).filter((text) => text.length >= 4).sort((left, right) => right.length - left.length)) remainder = remainder.split(description).join(" ");
     return remainder.replace(/[^\p{L}\p{N}]+/gu, "").length >= 6;
   };
   const chapterAt = (pointer: string): Record<string, unknown> | undefined => {
@@ -207,13 +208,15 @@ function validateBlueprintSemantics(value: Record<string, unknown>, verdict: Sem
   const expectedPromises = [...plan.hardPresencePromiseIds].sort(); const suppliedPromises = verdict.promises.map((item) => item.promiseId).sort();
   if (new Set(suppliedPromises).size !== suppliedPromises.length || suppliedPromises.join("|") !== expectedPromises.join("|") || verdict.promises.some((item) => { const chapter = chapterAt(item.pointer); return !item.supported || !chapter || !substantive(blueprintPointer(value, item.pointer)) || !Array.isArray(chapter.promiseIds) || !chapter.promiseIds.includes(item.promiseId); })) return { ruleId: "blueprint.promise_unsupported", severity: "rewrite" };
   const target = blueprintPointer(value, verdict.ending.targetPointer); const cost = blueprintPointer(value, verdict.ending.costPointer);
+  const canonicalEnding = value.endingContract as Record<string, unknown>; const canonicalShared = value.sharedCause as Record<string, unknown>; const chapters = value.chapters as Array<Record<string, unknown>>;
+  const canonicalTarget = canonicalEnding.target; const canonicalCost = canonicalEnding.cost;
   const mechanicGuarantee = plan.ruleAdapterIds.includes("curated-mechanic-unavailable"); const outcomeGuarantee = plan.ruleAdapterIds.includes("curated-outcome-weakened");
-  const endingText = [target, cost, ...(value.chapters as Array<Record<string, unknown>>).flatMap((chapter) => [chapter.event, chapter.outcome])].filter((item): item is string => typeof item === "string").join("\n");
-  const violatedGuarantee = plan.ruleAdapterIds.some((id) => (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") && runRuleAdapter(id, endingText));
-  if (!verdict.ending.supported || !substantive(target) || (mechanicGuarantee && verdict.ending.systemState !== "available") || (outcomeGuarantee && verdict.ending.protagonistOutcome !== "fulfilled") || verdict.ending.hasRealCost && (!substantive(cost) || verdict.ending.targetPointer === verdict.ending.costPointer) || violatedGuarantee) return { ruleId: "blueprint.ending_unsupported", severity: "rewrite" };
+  const canonicalNarrative = [canonicalTarget, canonicalCost, canonicalShared.event, ...chapters.flatMap((chapter) => [chapter.event, chapter.outcome, chapter.cost, chapter.cause])].filter((item): item is string => typeof item === "string");
+  const violatedGuarantee = plan.ruleAdapterIds.some((id) => (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") && canonicalNarrative.some((field) => runRuleAdapter(id, field)));
+  if (!verdict.ending.supported || !substantive(canonicalTarget) || !substantive(target) || (mechanicGuarantee && verdict.ending.systemState !== "available") || (outcomeGuarantee && verdict.ending.protagonistOutcome !== "fulfilled") || verdict.ending.hasRealCost && (!substantive(canonicalCost) || !substantive(cost) || verdict.ending.targetPointer === verdict.ending.costPointer) || violatedGuarantee) return { ruleId: "blueprint.ending_unsupported", severity: "rewrite" };
   const expectedDimensions = plan.promptProjection.dimensions.map((dimension) => dimension.id).sort(); const shared = blueprintPointer(value, verdict.sharedCause.pointer);
   const sharedChapter = chapterAt(verdict.sharedCause.pointer); const linkedDimensions = verdict.signals.filter((item) => item.pointer === verdict.sharedCause.pointer).map((item) => item.dimensionId);
-  if (!verdict.sharedCause.supported || !sharedChapter || !substantive(shared) || [...verdict.sharedCause.dimensionIds].sort().join("|") !== expectedDimensions.join("|") || [...new Set(linkedDimensions)].sort().join("|") !== expectedDimensions.join("|")) return { ruleId: "blueprint.shared_cause_unsupported", severity: "rewrite" };
+  if (!verdict.sharedCause.supported || !sharedChapter || !substantive(canonicalShared.event) || !substantive(shared) || [...verdict.sharedCause.dimensionIds].sort().join("|") !== expectedDimensions.join("|") || [...new Set(linkedDimensions)].sort().join("|") !== expectedDimensions.join("|")) return { ruleId: "blueprint.shared_cause_unsupported", severity: "rewrite" };
   return undefined;
 }
 function patch(request: AssessExperienceRequest, signals: ObservableSignalV2[], evidence: ReturnType<typeof evidenceFromClaim>[], deps: AssessorDependencies): { patch: ExperienceLedgerPatch; candidates: CanonFactCandidateV2[]; missingPromises: string[] } {
@@ -262,7 +265,7 @@ export async function assessExperience(input: AssessExperienceRequest, inputDeps
     try { const deadline = new Promise<never>((_, reject) => { blueprintTimer = setTimeout(() => { blueprintController.abort(); reject(new Error("timeout")); }, judgeTimeoutMs); blueprintTimer.unref?.(); }); blueprintResult = await Promise.race([judge(blueprintCase, { signal: blueprintController.signal }), deadline]); }
     catch { return unavailable(request.plan.ticket.jobId); } finally { if (blueprintTimer) clearTimeout(blueprintTimer); }
     blueprintResult = snapshot(blueprintResult); if (!validBlueprintVerdict(blueprintResult)) return invalidModel(request.plan.ticket.jobId); freeze(blueprintResult);
-    const blueprintFinding = validateBlueprintSemantics(blueprint, blueprintResult, request.plan); if (blueprintFinding) return issueRewrite(request, [blueprintFinding], deps, consumeTicket, before, artifactHash);
+    const blueprintFinding = validateBlueprintSemantics(blueprint, blueprintResult, request.plan, signals); if (blueprintFinding) return issueRewrite(request, [blueprintFinding], deps, consumeTicket, before, artifactHash);
     let current: AssessmentState; try { const value = snapshot(await read({ ticketId: request.plan.ticket.id, jobId: request.plan.ticket.jobId })); if (!validState(value)) return failure(request, "state_unavailable"); current = freeze(value); } catch { return failure(request, "state_unavailable"); }
     if (!stateMatches(request.plan, current) || canonicalAuthorizationPayload(before) !== canonicalAuthorizationPayload(current)) return failure(request, "state_changed");
     if (!await consumeTicketSafely(consumeTicket, casInput(request, current, artifactHash, `blueprint_${artifactHash}`, "blueprint"))) return failure(request, "ticket_reused");

@@ -137,7 +137,7 @@ export function evidencePolicyFor(category: ExperienceCategory): EvidencePolicy 
 const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
   "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能|并未|未曾|不曾)/i,
   "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?|prepar(?:e|es|ed|ing))\b|(?:计划|打算|准备|将要)/i,
-  "event-failed-attempt": /\b(?:attempt(?:s|ed)?|tr(?:y|ies|ied)|fail(?:s|ed)?)\b|(?:试图|尝试|失败)/i,
+  "event-failed-attempt": /\b(?:attempt(?:s|ed)?|tr(?:y|ies|ied)|fail(?:s|ed)?)\b|(?:试图|尝试|险些|差点|失败)/i,
   "event-simulation": /\b(?:dream|simulation|predict(?:s|ed|ion)?|conditional|would|might|imagin(?:e|es|ed|ation))\b|(?:梦境|做梦|模拟|预测|预言|如果|幻想|想象)/i,
   "event-hearsay": /\b(?:hearsay|rumou?r|heard)\b|(?:据说|传闻|听说)/i,
   "helper-substitution": /\bhelper\b|(?:他人代做|旁人替代)/i,
@@ -160,7 +160,7 @@ export function adapterAppliesTo(id: GenericRuleAdapterId, category: ExperienceC
   return eventCategories.has(category);
 }
 
-const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|实际上|现实中|尘埃散去|紧接着)/i;
+const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|而是|实际上|现实中|尘埃散去|紧接着)/i;
 const realizedAfterReversal = /(?:\b(?:opened?|defeated?|won|succeeded?|activated?|responded?|confirmed?|acted?)\b|打开|开启|击败|获胜|制胜|成功|生效|反馈|奖励|弹出|记录|改变|确认|亲眼看见|毫发无损)/i;
 function termStem(value: string): string {
   const normalized = value.normalize("NFKC").toLocaleLowerCase().trim();
@@ -209,10 +209,11 @@ function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realizati
 export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realization: readonly string[] | RealizationBinding = []): boolean {
   const pattern = genericAdapters[id];
   const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
-  const matches = [...source.matchAll(matcher)];
+  const matches = [...source.matchAll(matcher)].filter((match) => id !== "event-negated" || !/^not\s+only\b/iu.test(source.slice(match.index!)));
   if (!matches.length) return false;
   if (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") {
     return matches.some((match, index) => {
+      if (id === "curated-outcome-weakened" && !/(?:误以为|以为|看似|仿佛|似乎|seem(?:s|ed)?|appear(?:s|ed)?|thought|mistook|mistaken)/iu.test(source.slice(Math.max(0, match.index! - 32), match.index!))) return true;
       const next = matches[index + 1]?.index ?? source.length;
       return !hasRealizedReversal(id, source.slice(match.index!, next), realization);
     });
