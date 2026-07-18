@@ -69,7 +69,7 @@ test("rewrite scheduling carries a valid repair token into a fresh synchronous p
 });
 
 test("failedRuleIds is a compatibility assertion, never a rewrite authorization", () => {
-  assert.throws(() => scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, failedRuleIds: ["evidence.not_realized"], jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 }), { code: "plan_mismatch" });
+  assert.throws(() => scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, failedRuleIds: ["evidence.not_realized"], jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 }), { code: "repair_authorization_required" });
 
   const token = signedRepair();
   const expected = { ticketId: token.ticketId, jobId: token.jobId, attempt: token.attempt, contractRevisionId: token.contractRevisionId, activationId: token.activationId, branchId: token.branchId, stage: token.stage, artifactKind: token.artifactKind, ruleGraphVersion: token.ruleGraphVersion, expectedCanonVersion: token.expectedCanonVersion, ledgerRevision: token.ledgerRevision, chapterNumber: token.chapterNumber, chapterId: token.chapterId!, revisionId: token.revisionId!, artifactBindingId: token.artifactBindingId, roleBindings: token.roleBindings, artifactHash: token.artifactHash, failedRuleIds: token.failedRuleIds };
@@ -195,4 +195,10 @@ test("pacing evidence uses whole-body event density, pressure window, and length
   const sparseAt = (index: number) => ({ start: sparse.indexOf(sparseParagraphs[index]), end: sparse.indexOf(sparseParagraphs[index]) + sparseParagraphs[index].length, quote: sparseParagraphs[index] });
   const sparseClaim = { ...claim, anchors: [sparseAt(0), sparseAt(8), sparseAt(12), sparseAt(20), sparseAt(31)] };
   assert.deepEqual(groundClaim(sparse, sparseClaim, signal, { bodyStart }), { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
+
+  const longParagraphs = paragraphs.map((paragraph, index) => index < 5 ? `${paragraph.replace(/\.$/u, "")} ${"extended explanation ".repeat(24)}.` : paragraph);
+  const longSource = `${title}\n${longParagraphs.join("\n")}`;
+  const longAt = (index: number) => ({ start: longSource.indexOf(longParagraphs[index]), end: longSource.indexOf(longParagraphs[index]) + longParagraphs[index].length, quote: longParagraphs[index] });
+  const longClaim = { ...claim, anchors: [longAt(0), longAt(2), longAt(3), longAt(5), longAt(7)] };
+  assert.deepEqual(groundClaim(longSource, longClaim, signal, { bodyStart }), { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
 });

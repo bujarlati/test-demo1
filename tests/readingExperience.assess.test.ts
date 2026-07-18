@@ -193,8 +193,9 @@ test("invalid schema, unavailable model, distribution failure, and stale tickets
 
 test("real chapter and blueprint deadlines abort a pending judge once without consuming authorization", async () => {
   for (const artifactKind of ["chapter", "blueprint"] as const) {
-    let aborts = 0; let initiallyAborted: boolean | undefined;
+    let aborts = 0; let initiallyAborted: boolean | undefined; let capturedSignal: AbortSignal | undefined;
     const pendingJudge: AssessorDependencies["semanticJudgePort"]["judge"] = async (_input, options) => new Promise((_resolve) => {
+      capturedSignal = options?.signal;
       initiallyAborted = options?.signal.aborted;
       options?.signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
     });
@@ -206,7 +207,7 @@ test("real chapter and blueprint deadlines abort a pending judge once without co
     }
     const started = Date.now(); const result = await assessExperience(request, { ...base.deps, judgeTimeoutMs: 25 }); const elapsed = Date.now() - started;
     assert.equal(result.ok, false, artifactKind); if (!result.ok) assert.equal(result.error.code, "model_unavailable");
-    assert.equal(initiallyAborted, false, artifactKind); assert.equal(aborts, 1, artifactKind); assert.equal(elapsed >= 15 && elapsed < 1_000, true, `${artifactKind}:${elapsed}`);
+    assert.equal(initiallyAborted, false, artifactKind); assert.equal(capturedSignal?.aborted, true, artifactKind); assert.equal(aborts, 1, artifactKind); assert.equal(elapsed >= 15 && elapsed < 1_000, true, `${artifactKind}:${elapsed}`);
     assert.deepEqual(base.state.consumedTicketIds, []); assert.deepEqual(base.state.existingEvidenceIds, []);
   }
 });
@@ -226,8 +227,14 @@ test("all five event categories cover positive, exact-confidence boundary, and n
   for (const [kind, policy, slots, anchors] of rows) {
     const id = `scheduled-${kind}`;
     const slotAnchorIndices = Object.fromEntries(Object.keys(slots).filter((slot) => !slot.endsWith("Id")).map((slot) => { const found = anchors.findIndex((item) => item.quote.includes(slots[slot].split(" ").at(-1))); return [slot, found < 0 ? 0 : found]; }));
-    for (const [caseName, confidence, expectedStatus] of [["positive", .9, "accepted"], ["boundary", .65, "accepted"], ["negative", .649, "rewrite"]] as const) {
-      const claim = { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: id, supported: true, confidence, anchors, slotAnchorIndices, slots };
+    const negativeSlots = { ...slots }; let negativeRule = "evidence.required_slot_missing";
+    if (kind === "mechanic") delete negativeSlots.object;
+    else if (kind === "protagonist_action") delete negativeSlots.action;
+    else if (kind === "conflict_outcome") { negativeSlots.opponentId = "unknown-opponent"; negativeRule = "evidence.opponent_untrusted"; }
+    else if (kind === "world_reaction") delete negativeSlots.outcome;
+    else { negativeSlots.counterpartId = "unknown-counterpart"; negativeRule = "evidence.counterpart_untrusted"; }
+    for (const [caseName, confidence, caseSlots, expectedStatus] of [["positive", .9, slots, "accepted"], ["boundary", .65, slots, "accepted"], ["negative", .9, negativeSlots, "rewrite"]] as const) {
+      const claim = { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: id, supported: true, confidence, anchors, slotAnchorIndices, slots: caseSlots };
       const judged = async () => {
         const base = verdict();
         const effectSlot = kind === "relationship" ? "reciprocalAction" : kind === "world_reaction" ? "reaction" : "outcome";
@@ -240,6 +247,7 @@ test("all five event categories cover positive, exact-confidence boundary, and n
       };
       const { request, deps } = fixture(judged, (c) => { c.dimensions[0].observableSignals = [{ id, dimensionId: "d1", kind: kind as any, description: "scheduled concrete event", semanticSlots: kind === "world_reaction" || kind === "relationship" ? undefined : { actor: "Aria" }, verification: policy, persistence: kind === "relationship" || kind === "mechanic" ? "cross_chapter" : "chapter" }]; });
       const result = await assessExperience(request, deps); assert.equal(result.ok, true, `${kind}:${caseName}`); if (!result.ok) continue; assert.equal(result.value.status, expectedStatus, `${kind}:${caseName}:${JSON.stringify(result.value)}`);
+      if (caseName === "negative" && result.value.status === "rewrite") assert.deepEqual(result.value.failedRuleIds, [negativeRule], kind);
     }
   }
 });
@@ -248,7 +256,7 @@ test("voice and pacing cover positive, exact-confidence boundary, and negative e
   for (const signalId of ["voice", "pacing"] as const) for (const [caseName, confidence, expectedStatus] of [["positive", .9, "accepted"], ["boundary", .65, "accepted"], ["negative", .649, "rewrite"]] as const) {
     const input = fixture(async () => { const value = verdict(); value.claims = value.claims.map((claim) => claim.signalId === signalId ? { ...claim, confidence } : claim); return value; });
     const result = await assessExperience(input.request, input.deps);
-    assert.equal(result.ok, true, `${signalId}:${caseName}`); if (result.ok) assert.equal(result.value.status, expectedStatus, `${signalId}:${caseName}:${JSON.stringify(result.value)}`);
+    assert.equal(result.ok, true, `${signalId}:${caseName}`); if (result.ok) { assert.equal(result.value.status, expectedStatus, `${signalId}:${caseName}:${JSON.stringify(result.value)}`); if (caseName === "negative" && result.value.status === "rewrite") assert.deepEqual(result.value.failedRuleIds, ["evidence.judge_unsupported"]); }
   }
 });
 

@@ -274,6 +274,7 @@ export type ExperienceSchedulingErrorCode =
   | "invalid_debt"
   | "invalid_stage"
   | "invalid_distribution"
+  | "repair_authorization_required"
   | "plan_mismatch"
   | "unauthorized_delivery"
   | "unauthorized_fact"

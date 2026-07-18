@@ -362,7 +362,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     if (!Array.isArray(request.failedRuleIds) || request.failedRuleIds.some((id) => typeof id !== "string" || !id.trim())) throw new ExperienceSchedulingError("plan_mismatch");
     const canonical = [...new Set(request.failedRuleIds)].sort();
     if (canonicalAuthorizationPayload(request.failedRuleIds) !== canonicalAuthorizationPayload(canonical)) throw new ExperienceSchedulingError("plan_mismatch");
-    if (!request.repair && canonical.length > 0) throw new ExperienceSchedulingError("plan_mismatch");
+    if (!request.repair && canonical.length > 0) throw new ExperienceSchedulingError("repair_authorization_required");
     if (request.repair && canonicalAuthorizationPayload(canonical) !== canonicalAuthorizationPayload([...new Set(request.repair.token.failedRuleIds)].sort())) throw new ExperienceSchedulingError("plan_mismatch");
   }
   if (request.repair) return authorizeRepair(request, deps);
