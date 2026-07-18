@@ -7,7 +7,9 @@ import type {
   ObservableSignalV2,
   ReadingExperienceIntent,
 } from "../../src/types";
-import { curatedInterpretation, curatedSynthesis, evidencePolicyFor } from "./ruleAdapters";
+import { createHash } from "node:crypto";
+import { canonicalAuthorizationPayload } from "./scheduler";
+import { curatedInterpretation, curatedSynthesis, evidencePolicyFor, isRuleAdapterId } from "./ruleAdapters";
 import type {
   CompileExperienceRequest,
   CompileOutcome,
@@ -27,6 +29,7 @@ const persistenceValues = new Set(["none", "chapter", "cross_chapter", "whole_st
 const prohibitionKinds = new Set(["invariant", "shortcut", "style_cliche"]);
 const prohibitionSeverities = new Set(["block", "rewrite", "penalty"]);
 const eventSlots = new Set(["actor", "action", "object", "outcome", "reaction"]);
+const distributionMetricIds = new Set(["anchor_spread", "scene_coverage", "paragraph_consistency", "beat_density", "turn_position"]);
 
 type RejectedOutcome = Extract<CompileOutcome, { status: "rejected" }>;
 type NeedsResolutionOutcome = Extract<CompileOutcome, { status: "needs_resolution" }>;
@@ -162,7 +165,7 @@ function validVerification(value: unknown): value is EvidencePolicy {
     const regions = value.requiredRegions;
     const thresholds = value.metricThresholds;
     const metricIds = Array.isArray(value.metricIds) ? value.metricIds : [];
-    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && normalizedText(metric).length > 0) && new Set(metricIds).size === metricIds.length && (regions === undefined || Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length) && (value.regionSemantics === undefined || value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && (thresholds === undefined || isRecord(thresholds) && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold)));
+    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && distributionMetricIds.has(metric)) && new Set(metricIds).size === metricIds.length && Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length && (value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && isRecord(thresholds) && Object.keys(thresholds).length === metricIds.length && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0 && threshold <= 1);
   }
   return false;
 }
@@ -179,7 +182,7 @@ function validSignal(value: unknown): value is InterpretationDimensionDraft["obs
 }
 
 function validProhibition(value: unknown): boolean {
-  return isRecord(value) && hasOnlyKeys(value, ["kind", "description", "severity"]) && typeof value.description === "string" && normalizedText(value.description).length >= 4 && normalizedText(value.description).length <= 300 && typeof value.kind === "string" && prohibitionKinds.has(value.kind) && typeof value.severity === "string" && prohibitionSeverities.has(value.severity);
+  return isRecord(value) && hasOnlyKeys(value, ["kind", "description", "severity", "ruleAdapterId"]) && typeof value.description === "string" && normalizedText(value.description).length >= 4 && normalizedText(value.description).length <= 300 && typeof value.kind === "string" && prohibitionKinds.has(value.kind) && typeof value.severity === "string" && prohibitionSeverities.has(value.severity) && (value.ruleAdapterId === undefined || typeof value.ruleAdapterId === "string" && isRuleAdapterId(value.ruleAdapterId));
 }
 
 function validStructuralDimension(value: unknown): value is InterpretationDimensionDraft {
@@ -214,7 +217,7 @@ function alternativeCategory(category: ExperienceCategory): ExperienceCategory {
 
 function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
   if (policy.kind === "event_slots") return { ...policy, requiredSlots: [...policy.requiredSlots] };
-  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds] };
+  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds], requiredRegions: [...policy.requiredRegions], metricThresholds: { ...policy.metricThresholds } };
   return { ...policy };
 }
 
@@ -237,14 +240,17 @@ function complementaryEvidencePolicy(primary: EvidencePolicy, fallbackCategory: 
   if (primary.kind === "distribution") {
     return {
       kind: "distribution",
-      metricIds: Array.from(new Set([...primary.metricIds, "repeated_dimension_continuity"])),
+      metricIds: Array.from(new Set([...primary.metricIds, "paragraph_consistency"])),
       minimumAnchors: shiftedAnchorCount(primary.minimumAnchors),
       requireSemanticJudge: true,
+      requiredRegions: [...primary.requiredRegions],
+      regionSemantics: primary.regionSemantics,
+      metricThresholds: { ...primary.metricThresholds, paragraph_consistency: 0.25 },
     };
   }
   const policy = evidencePolicyFor(fallbackCategory);
   if (policy.kind === "distribution") {
-    return { ...policy, metricIds: [...policy.metricIds, "repeated_dimension_continuity"], minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
+    return { ...policy, metricIds: Array.from(new Set([...policy.metricIds, "paragraph_consistency"])), metricThresholds: { ...policy.metricThresholds, paragraph_consistency: 0.25 }, minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
   }
   if (policy.kind === "event_slots") {
     return { ...policy, requiredSlots: Array.from(new Set([...policy.requiredSlots, "reaction"])), minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
@@ -283,7 +289,7 @@ function splitAndNormalizeDimensions(
       kind: prohibition.kind,
       description: normalizedText(prohibition.description),
       severity: prohibition.severity,
-      ...(prohibition.kind === "shortcut" ? { ruleAdapterId: "contains-pasted-label" } : {}),
+      ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : prohibition.kind === "shortcut" ? { ruleAdapterId: "contains-pasted-label" } : {}),
     }));
     if (secondaryRepeatedDimension) {
       prohibitions.push({ id: `${dimensionId}_prohibition_independence`, dimensionId, kind: "shortcut", description: "不得把第一维已经采用的泛化叙述重复计为持续后果证据。", severity: "rewrite" });
@@ -330,13 +336,8 @@ function solveSynthesis(
   return { ok: true, value: synthesis };
 }
 
-function stableToken(value: string): string {
-  let hash = 2166136261;
-  for (const character of value) {
-    hash ^= character.codePointAt(0) ?? 0;
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
+function stableToken(value: unknown): string {
+  return createHash("sha256").update(canonicalAuthorizationPayload(value)).digest("base64url").slice(0, 22);
 }
 
 function deepFreeze<T>(value: T): T {
@@ -363,8 +364,9 @@ function freezeContractRevision(
     minimumSignals: 1,
     carryRuleIds: dimension.observableSignals.filter((signal) => signal.persistence === "cross_chapter" || signal.persistence === "whole_story").map((signal) => signal.id),
   }));
+  const semanticIdentity = { intent, context: request.context, requestedRevision: request.requestedRevision, parentRevisionId: request.parentRevisionId, dimensions, synthesis, promises, provenance };
   return deepFreeze({
-    id: `experience_revision_${request.requestedRevision}_${stableToken(intent.descriptors.map((descriptor) => descriptor.text).join("\u001f"))}`,
+    id: `experience_revision_${request.requestedRevision}_${stableToken(semanticIdentity)}`,
     schemaVersion: 2,
     revision: request.requestedRevision,
     parentRevisionId: request.parentRevisionId,
@@ -394,5 +396,6 @@ export async function compileExperience(request: CompileExperienceRequest, port:
   const dimensions = splitAndNormalizeDimensions(validation.dimensions, preflight.intent);
   const synthesis = solveSynthesis(dimensions, validation.synthesis);
   if (!synthesis.ok) return { ok: true, value: { status: "needs_resolution", code: "irreconcilable_intent", message: synthesis.message } };
-  return { ok: true, value: { status: "ready", revision: freezeContractRevision(request, preflight.intent, dimensions, synthesis.value, draft.value.provenance, now()) } };
+  const provenance = draft.value.provenance.map((item) => item.kind === "model" ? { ...item, version: `interpretation_${stableToken({ dimensions, synthesis: synthesis.value })}` } : item);
+  return { ok: true, value: { status: "ready", revision: freezeContractRevision(request, preflight.intent, dimensions, synthesis.value, provenance, now()) } };
 }

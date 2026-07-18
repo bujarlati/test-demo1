@@ -1,5 +1,6 @@
 import type {
   CanonFactReferenceV2,
+  CanonFactCandidateV2,
   CompiledExperienceContractRevision,
   EvidencePolicy,
   ExperienceContractActivation,
@@ -50,9 +51,10 @@ export interface InterpretationDimensionDraft {
   interpretation: string;
   categories: InterpretationSignalDraft["kind"][];
   observableSignals: InterpretationSignalDraft[];
-  prohibitions: Array<{ kind: "invariant" | "shortcut" | "style_cliche"; description: string; severity: "block" | "rewrite" | "penalty" }>;
+  prohibitions: Array<{ kind: "invariant" | "shortcut" | "style_cliche"; description: string; severity: "block" | "rewrite" | "penalty"; ruleAdapterId?: GenericRuleAdapterId }>;
   confidence: number;
 }
+export type GenericRuleAdapterId = "event-negated" | "event-intent" | "event-failed-attempt" | "event-simulation" | "event-hearsay" | "helper-substitution" | "contains-pasted-label" | "curated-mechanic-unavailable" | "curated-outcome-weakened";
 
 export interface InterpretationCase {
   intent: ReadingExperienceIntent;
@@ -74,11 +76,13 @@ export interface SemanticEvidenceAnchor { start: number; end: number; quote: str
 /** Versioned, source-grounded judgement input/output.  The assessor never accepts prose summaries. */
 export interface SemanticEvidenceClaim {
   version: 1;
+  eventId: string;
   dimensionId: string;
   signalId: string;
   supported: boolean;
   confidence: number;
   anchors: SemanticEvidenceAnchor[];
+  slotAnchorIndices: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", number>>;
   slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", string>>;
   metrics?: Record<string, number>;
 }
@@ -90,12 +94,14 @@ export interface SemanticEvidenceCase {
   artifactKind: ExperienceArtifactKind;
   source: string;
   sourceHash: string;
-  signals: Array<{ dimensionId: string; signalId: string; kind: string; policy: EvidencePolicy }>;
+  synthesis: { sharedCause: string; dimensionRoles: [string, string] };
+  signals: Array<{ dimensionId: string; signalId: string; kind: string; interpretation: string; description: string; semanticSlots?: Record<string, string>; policy: EvidencePolicy; canonFactReferences: CanonFactReferenceV2[]; prohibitions: Array<{ id: string; kind: string; severity: string; ruleAdapterId?: string }> }>;
 }
-export interface SemanticVerdict { version: 1; claims: SemanticEvidenceClaim[] }
+export interface SemanticSharedCauseClaim { eventId: string; supported: boolean; confidence: number; anchors: SemanticEvidenceAnchor[] }
+export interface SemanticVerdict { version: 1; claims: SemanticEvidenceClaim[]; sharedCause: SemanticSharedCauseClaim }
 
 export interface ExperienceSemanticJudgePort {
-  judge(input: SemanticEvidenceCase): Promise<SemanticVerdict>;
+  judge(input: SemanticEvidenceCase, options?: { signal: AbortSignal }): Promise<SemanticVerdict>;
 }
 
 export interface ExperienceStageTicket {
@@ -127,6 +133,7 @@ export interface ScheduleExperienceRequest {
   revisionId?: string;
   /** Digest of the pre-approved output manifest, when a producer has one. */
   expectedArtifactDigest?: string;
+  roleBindings?: { protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[] };
   chapterNumber?: number;
   failedRuleIds?: string[];
   jobId: string;
@@ -144,10 +151,12 @@ export interface ExperienceStagePlan {
   chapterId?: string;
   revisionId?: string;
   expectedArtifactDigest?: string;
+  roleBindings: { protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[] };
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
-  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[]; roleBindings: { protagonistId: string } }>; prohibitions: string[] };
+  promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
   evidenceSchema: EvidencePolicy[];
+  ruleAdapterIds: GenericRuleAdapterId[];
   duePromiseIds: string[];
   hardPresencePromiseIds: string[];
   softRollingPromiseIds: string[];
@@ -195,6 +204,7 @@ export interface ExperienceLedgerPatch {
   newDebtsByDimension: Record<string, ExperienceDebtV2[]>;
   deliveredPromiseIds: string[];
   evidenceIds: string[];
+  promiseEvidenceLinks: Record<string, string[]>;
 }
 
 export type ExperienceSchedulingErrorCode =
@@ -255,7 +265,6 @@ export interface AssessorDependencies {
   contract: CompiledExperienceContractRevision;
   semanticJudgePort: ExperienceSemanticJudgePort;
   statePort: AssessmentStatePort;
-  createEvidenceId?: (input: { ticketId: string; signalId: string; chapterId: string; revisionId: string }) => string;
   repairTtlMs?: number;
   permitTtlMs?: number;
   judgeTimeoutMs?: number;
@@ -270,6 +279,7 @@ export interface AssessmentState {
   consumedTicketIds: readonly string[];
   consumedPermitIds: readonly string[];
   consumedRepairIds: readonly string[];
+  existingEvidenceIds: readonly string[];
   chapterId?: string;
   revisionId?: string;
   expectedArtifactDigest?: string;
@@ -277,7 +287,7 @@ export interface AssessmentState {
 
 export interface AssessmentStatePort {
   read(input: { ticketId: string; jobId: string }): Promise<AssessmentState> | AssessmentState;
-  consumeTicket(input: { ticketId: string; artifactHash: string; permitId: string }): Promise<boolean> | boolean;
+  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest?: string } }): Promise<boolean> | boolean;
   consumePermit(input: { permitId: string; ticketId: string }): Promise<boolean> | boolean;
   consumeRepair(input: { repairId: string; ticketId: string }): Promise<boolean> | boolean;
 }
@@ -295,7 +305,7 @@ export interface ExperienceRepairToken {
 
 export type ExperienceAssessment =
   | { status: "accepted"; artifactKind: "blueprint"; artifactHash: string }
-  | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; permit: ExperiencePublicationPermit; evidence: ExperienceEvidenceV2[]; ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactReferenceV2[] }
+  | { status: "accepted"; artifactKind: "chapter" | "retcon_revision"; artifactHash: string; permit: ExperiencePublicationPermit; evidence: ExperienceEvidenceV2[]; ledgerPatch: ExperienceLedgerPatch; canonFactCandidates: CanonFactCandidateV2[] }
   | { status: "rewrite"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; repairToken: ExperienceRepairToken; message: string }
   | { status: "rejected"; artifactKind: ExperienceArtifactKind; failedRuleIds: string[]; message: string };
 

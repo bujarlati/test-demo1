@@ -59,7 +59,7 @@ function request(overrides: Record<string, unknown> = {}) {
   return {
     contract: contract(), activation: activation(), ledger: ledger(),
     canon: { branchId: "branch-main", canonVersion: 7, factReferences: [{ id: "canon-fact", revisionId: "chapter-1", kind: "mechanic" }] },
-    artifactKind: "chapter" as const, chapterNumber: 2, jobId: "job-1", attempt: 1,
+    artifactKind: "chapter" as const, chapterId: "chapter-2", revisionId: "revision-2", expectedArtifactDigest: "scheduled-output-digest", roleBindings: { protagonistId: "protagonist-1", aliases: ["Aria"] }, chapterNumber: 2, jobId: "job-1", attempt: 1,
     ...overrides,
   };
 }

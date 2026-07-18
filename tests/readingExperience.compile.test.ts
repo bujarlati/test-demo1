@@ -231,10 +231,19 @@ test("compile records the actual per-dimension interpretation provenance", async
   }, deps.interpretationPort, deps.now);
   assert.equal(result.ok, true);
   if (!result.ok || result.value.status !== "ready") return;
-  assert.deepEqual(result.value.revision.provenance, [
-    { kind: "model", descriptor: "温暖", version: "fixture-v1" },
-    { kind: "model", descriptor: "赛博禅意", version: "fixture-v1" },
+  assert.deepEqual(result.value.revision.provenance.map(({ kind, descriptor }) => ({ kind, descriptor })), [
+    { kind: "model", descriptor: "温暖" }, { kind: "model", descriptor: "赛博禅意" },
   ]);
+  assert.equal(result.value.revision.provenance.every((item) => item.version.startsWith("interpretation_")), true);
+});
+
+test("contract ids use a canonical cryptographic semantic digest", async () => {
+  const { deps } = scriptedExperiencePorts();
+  const build = (first: string) => compileExperience({ intent: { descriptors: [{ text: first }, { text: "fixed" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `ignored-${first}` }, deps.interpretationPort, deps.now);
+  const [left, right, repeat] = await Promise.all([build("3i3g2tzogf"), build("cnbphh3u21"), build("3i3g2tzogf")]);
+  assert.equal(left.ok && left.value.status, "ready"); assert.equal(right.ok && right.value.status, "ready"); assert.equal(repeat.ok && repeat.value.status, "ready");
+  if (!left.ok || left.value.status !== "ready" || !right.ok || right.value.status !== "ready" || !repeat.ok || repeat.value.status !== "ready") return;
+  assert.notEqual(left.value.revision.id, right.value.revision.id); assert.equal(left.value.revision.id, repeat.value.revision.id);
 });
 
 test("compile rejects unsafe input before any external call", async () => {

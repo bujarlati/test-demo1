@@ -8,7 +8,9 @@ import type {
   ScheduleExperienceRequest,
   ScheduledExperienceDebt,
   SchedulerDependencies,
+  GenericRuleAdapterId,
 } from "./types";
+import { isRuleAdapterId } from "./ruleAdapters";
 
 const ticketSeparator = "\u001f";
 
@@ -222,6 +224,9 @@ function deepFreeze<T>(value: T): T {
 
 export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
+  if (request.artifactKind !== "blueprint") {
+    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !request.expectedArtifactDigest?.trim() || !request.roleBindings?.protagonistId.trim() || !Array.isArray(request.roleBindings.aliases) || request.roleBindings.aliases.length === 0 || request.roleBindings.aliases.some((alias) => !alias.trim())) throw new ExperienceSchedulingError("invalid_authorization_payload");
+  }
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
   const hard = activeHardPresence(request, chapter);
@@ -267,13 +272,20 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     ...(request.chapterId ? { chapterId: request.chapterId } : {}),
     ...(request.revisionId ? { revisionId: request.revisionId } : {}),
     ...(request.expectedArtifactDigest ? { expectedArtifactDigest: request.expectedArtifactDigest } : {}),
+    roleBindings: {
+      protagonistId: request.roleBindings?.protagonistId ?? "",
+      aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
+      counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [],
+      opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [],
+    },
     stage,
     artifactKind: request.artifactKind,
     promptProjection: {
-      dimensions: dimensions.map(({ selected, ...projection }) => ({ ...projection, roleBindings: { protagonistId: selected.map((signal) => signal.semanticSlots?.actor).find((actor): actor is string => !!actor) ?? "" } })),
+      dimensions: dimensions.map(({ selected, ...projection }) => projection),
       prohibitions: request.contract.prohibitions.map((prohibition) => prohibition.description),
     },
     evidenceSchema: dimensions.flatMap((dimension) => dimension.selected.map((signal) => signal.verification)),
+    ruleAdapterIds: request.contract.prohibitions.flatMap((prohibition) => prohibition.ruleAdapterId && isRuleAdapterId(prohibition.ruleAdapterId) ? [prohibition.ruleAdapterId as GenericRuleAdapterId] : []),
     duePromiseIds: [...hard, ...soft.due].map((promise) => promise.id),
     hardPresencePromiseIds: hard.map((promise) => promise.id),
     softRollingPromiseIds: request.contract.promises.filter((promise) => promise.hardness === "soft" && promise.scope.kind === "rolling_window").map((promise) => promise.id),

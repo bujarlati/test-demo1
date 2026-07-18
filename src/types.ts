@@ -323,11 +323,12 @@ export interface ReadingExperienceIntent {
 }
 
 export type ExperienceCategory = "mechanic" | "protagonist_action" | "conflict_outcome" | "world_reaction" | "relationship" | "pacing" | "voice";
+export type DistributionMetricId = "anchor_spread" | "scene_coverage" | "paragraph_consistency" | "beat_density" | "turn_position";
 
 export type EvidencePolicy =
   | { kind: "event_slots"; requiredSlots: Array<"actor" | "action" | "object" | "outcome" | "reaction">; minimumAnchors: number }
   | { kind: "relationship_change"; requireReciprocalAction: true; minimumAnchors: number }
-  | { kind: "distribution"; metricIds: string[]; minimumAnchors: number; requireSemanticJudge: true; requiredRegions?: Array<"opening" | "middle" | "ending">; regionSemantics?: "proportional" | "paragraph"; metricThresholds?: Record<string, number> };
+  | { kind: "distribution"; metricIds: DistributionMetricId[]; minimumAnchors: number; requireSemanticJudge: true; requiredRegions: Array<"opening" | "middle" | "ending">; regionSemantics: "proportional" | "paragraph"; metricThresholds: Partial<Record<DistributionMetricId, number>> };
 
 export interface ObservableSignalV2 {
   id: string;
@@ -428,13 +429,33 @@ export interface ExperienceEvidenceV2 {
   branchId: string;
   dimensionId: string;
   signalId: string;
+  eventId: string;
+  ticketId: string;
+  jobId: string;
+  attempt: number;
+  stage: string;
+  artifactKind: string;
+  ruleGraphVersion: string;
+  expectedCanonVersion: number;
+  ledgerRevision: number;
   chapterId: string;
   chapterRevisionId: string;
   sourceHash: string;
   anchors: TextAnchorV2[];
-  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; distributionMetrics?: Record<string, number> };
+  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; slotAnchors?: Record<string, TextAnchorV2>; distributionMetrics?: Record<string, number> };
   confidence: number;
   status: "supported" | "insufficient" | "contradicted";
+}
+
+export interface CanonFactCandidateV2 {
+  id: string;
+  evidenceId: string;
+  revisionId: string;
+  dimensionId: string;
+  signalId: string;
+  kind: "mechanic" | "relationship" | "outcome";
+  observation: ExperienceEvidenceV2["observation"];
+  anchors: TextAnchorV2[];
 }
 
 export interface ExperienceLedgerCheckpoint {

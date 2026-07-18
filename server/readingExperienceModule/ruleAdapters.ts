@@ -1,5 +1,6 @@
 import type { ExperienceCategory, EvidencePolicy } from "../../src/types";
 import type { InterpretationDimensionDraft } from "./types";
+import type { GenericRuleAdapterId } from "./types";
 
 interface CuratedRule {
   interpretation: string;
@@ -9,6 +10,7 @@ interface CuratedRule {
   persistence: InterpretationDimensionDraft["observableSignals"][number]["persistence"];
   role: string;
   tension?: "care" | "cost";
+  adapterId?: GenericRuleAdapterId;
 }
 
 const eventVerification: EvidencePolicy = {
@@ -28,6 +30,9 @@ const distributionVerification: EvidencePolicy = {
   metricIds: ["anchor_spread", "scene_coverage"],
   minimumAnchors: 3,
   requireSemanticJudge: true,
+  requiredRegions: ["opening", "middle", "ending"],
+  regionSemantics: "paragraph",
+  metricThresholds: { anchor_spread: 0.45, scene_coverage: 1 },
 };
 
 const curatedRules: Record<string, CuratedRule> = {
@@ -38,6 +43,7 @@ const curatedRules: Record<string, CuratedRule> = {
     prohibition: "不得把核心机制写成比喻、旁白标签或长期不可用的摆设。",
     persistence: "cross_chapter",
     role: "提供可操作的因果杠杆",
+    adapterId: "curated-mechanic-unavailable",
   },
   无敌: {
     interpretation: "主角在正面对抗中保持压倒性优势，悬念来自胜利造成的变化。",
@@ -46,6 +52,7 @@ const curatedRules: Record<string, CuratedRule> = {
     prohibition: "不得以临时削弱、同级僵持或救场收回既定优势。",
     persistence: "whole_story",
     role: "让胜利改变外部局势",
+    adapterId: "curated-outcome-weakened",
   },
   治愈: {
     interpretation: "困境被准确看见，并通过可持续的关系行动得到承接。",
@@ -85,13 +92,14 @@ const curatedRules: Record<string, CuratedRule> = {
 
 function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
   if (policy.kind === "event_slots") return { ...policy, requiredSlots: [...policy.requiredSlots] };
-  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds] };
+  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds], requiredRegions: [...policy.requiredRegions], metricThresholds: { ...policy.metricThresholds } };
   return { ...policy };
 }
 
 function verificationFor(category: ExperienceCategory): EvidencePolicy {
   if (category === "relationship") return cloneEvidencePolicy(relationshipVerification);
-  if (category === "pacing" || category === "voice") return cloneEvidencePolicy(distributionVerification);
+  if (category === "voice") return { kind: "distribution", metricIds: ["paragraph_consistency", "scene_coverage"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { paragraph_consistency: 0.35, scene_coverage: 1 } };
+  if (category === "pacing") return { kind: "distribution", metricIds: ["beat_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["middle", "ending"], regionSemantics: "paragraph", metricThresholds: { beat_density: 0.25, turn_position: 0.55 } };
   return cloneEvidencePolicy(eventVerification);
 }
 
@@ -109,7 +117,7 @@ export function curatedInterpretation(descriptor: string): InterpretationDimensi
       verification: verificationFor(rule.category),
       persistence: rule.persistence,
     })),
-    prohibitions: [{ kind: "invariant", description: rule.prohibition, severity: "block" }],
+    prohibitions: [{ kind: "invariant", description: rule.prohibition, severity: "block", ...(rule.adapterId ? { ruleAdapterId: rule.adapterId } : {}) }],
     confidence: 1,
   };
 }
@@ -135,13 +143,19 @@ export function evidencePolicyFor(category: ExperienceCategory): EvidencePolicy 
 }
 
 /** Generic, data-selected deterministic shortcuts.  These are never keyed by a descriptor. */
-const genericAdapters: Record<string, RegExp> = {
-  "contains-negated-claim": /\b(?:not|never|cannot|didn't)\b|(?:不|未|没有)/i,
-  "contains-intent-not-event": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?|attempt(?:s|ed)?)\b|(?:计划|打算|试图)/i,
-  "contains-simulation": /\b(?:dream|simulation|prediction|conditional)\b|(?:梦境|模拟|预测)/i,
+const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
+  "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能)/i,
+  "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?)\b|(?:计划|打算)/i,
+  "event-failed-attempt": /\b(?:attempt(?:s|ed)?|fail(?:s|ed)?)\b|(?:试图|失败)/i,
+  "event-simulation": /\b(?:dream|simulation|prediction|conditional)\b|(?:梦境|模拟|预测|如果)/i,
+  "event-hearsay": /\b(?:hearsay|rumou?r)\b|(?:据说|传闻)/i,
+  "helper-substitution": /\bhelper\b|(?:他人代做|旁人替代)/i,
   "contains-pasted-label": /\b(?:label|descriptor)\b|(?:标签|描述词)/i,
+  "curated-mechanic-unavailable": /(?:机制|面板|能力).{0,12}(?:无法使用|只是比喻|没有反馈)/i,
+  "curated-outcome-weakened": /(?:主角|主人公).{0,12}(?:被救场|战平|惨败|失去优势)/i,
 };
 
-export function runRuleAdapter(id: string, source: string): boolean {
-  return genericAdapters[id]?.test(source) ?? false;
+export function isRuleAdapterId(id: string): id is GenericRuleAdapterId { return Object.hasOwn(genericAdapters, id); }
+export function runRuleAdapter(id: GenericRuleAdapterId, source: string): boolean {
+  return genericAdapters[id].test(source);
 }
