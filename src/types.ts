@@ -380,7 +380,7 @@ export interface CompiledExperienceContractRevision {
   promises: DeliveryPromiseV2[];
   prohibitions: ExperienceProhibition[];
   ruleGraphVersion: string;
-  provenance: Array<{ kind: "curated" | "model" | "migration"; descriptor: string; version: string }>;
+  provenance: Array<{ kind: "curated" | "model" | "migration"; descriptor: string; version: string; interpretationDigest?: string }>;
   createdAt: string;
 }
 
@@ -442,7 +442,7 @@ export interface ExperienceEvidenceV2 {
   chapterRevisionId: string;
   sourceHash: string;
   anchors: TextAnchorV2[];
-  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; slotAnchors?: Record<string, TextAnchorV2>; distributionMetrics?: Record<string, number> };
+  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; slotAnchors?: Record<string, TextAnchorV2>; distributionMetrics?: Record<string, number>; distributionFacetAnchors?: Partial<Record<"goal" | "pressure" | "beat" | "turn", TextAnchorV2[]>> };
   confidence: number;
   status: "supported" | "insufficient" | "contradicted";
 }

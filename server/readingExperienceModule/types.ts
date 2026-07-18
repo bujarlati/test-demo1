@@ -85,6 +85,8 @@ export interface SemanticEvidenceClaim {
   slotAnchorIndices: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", number>>;
   slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", string>>;
   metrics?: Record<string, number>;
+  /** Judge-typed pacing facets; every index addresses this claim's grounded anchors. */
+  distributionAnchorIndices?: Partial<Record<"goal" | "pressure" | "beat" | "turn", number[]>>;
 }
 
 export interface SemanticEvidenceCase {
@@ -145,7 +147,7 @@ export interface ScheduleExperienceRequest {
   /** Digest of the pre-approved output manifest, when a producer has one. */
   expectedArtifactDigest?: string;
   artifactBindingId?: string;
-  roleBindings?: { protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[] };
+  roleBindings?: { protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
   chapterNumber?: number;
   repair?: { token: ExperienceRepairToken; expected: RepairTokenContext };
   jobId: string;
@@ -164,7 +166,7 @@ export interface ExperienceStagePlan {
   revisionId?: string;
   expectedArtifactDigest?: string;
   artifactBindingId: string;
-  roleBindings: { protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[] };
+  roleBindings: { protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[]; counterparts: Array<{ id: string; aliases: string[] }>; opponents: Array<{ id: string; aliases: string[] }> };
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
   promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };

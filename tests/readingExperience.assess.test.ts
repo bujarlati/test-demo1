@@ -40,10 +40,59 @@ function verdict(overrides: Partial<SemanticVerdict> = {}): SemanticVerdict { co
   { version: 1 as const, eventId: "shared-event", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice."), anchor("At dusk Aria wins the duel"), anchor("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
   { version: 1 as const, eventId: "pacing-event", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [anchor("Chapter title"), anchor("A spare, precise sentence"), anchor("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
 ]; return { version: 1, claims, sharedCause: { eventId: "shared-event", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice.")], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } as any, ...overrides }; }
-function fixture(judge = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
-function blueprintVerdict(plan: AssessExperienceRequest["plan"]): any { const signalIds = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds); return { version: 1, kind: "blueprint", signals: signalIds.map((signalId, index) => ({ dimensionId: plan.promptProjection.dimensions.find((dimension) => dimension.signalIds.includes(signalId))!.id, signalId, pointer: `/chapters/0/signalIds/${index}`, supported: true })), promises: plan.hardPresencePromiseIds.map((promiseId, index) => ({ promiseId, pointer: `/chapters/0/promiseIds/${index}`, supported: true })), ending: { targetPointer: "/endingContract/target", costPointer: "/endingContract/cost", supported: true, systemState: "available", protagonistOutcome: "fulfilled", hasRealCost: true }, sharedCause: { pointer: "/sharedCause/event", dimensionIds: plan.promptProjection.dimensions.map((dimension) => dimension.id), supported: true }, confidence: .9 }; }
+function fixture(judge = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
+function blueprintVerdict(plan: AssessExperienceRequest["plan"]): any {
+  const deliveries = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds.map((signalId) => ({ dimensionId: dimension.id, signalId })));
+  return {
+    version: 1,
+    kind: "blueprint",
+    signals: deliveries.map(({ dimensionId, signalId }) => ({ dimensionId, signalId, pointer: "/chapters/0/event", supported: true })),
+    promises: plan.hardPresencePromiseIds.map((promiseId) => ({ promiseId, pointer: "/chapters/0/event", supported: true })),
+    ending: { targetPointer: "/endingContract/target", costPointer: "/endingContract/cost", supported: true, systemState: "available", protagonistOutcome: "fulfilled", hasRealCost: true },
+    sharedCause: { pointer: "/chapters/0/event", dimensionIds: plan.promptProjection.dimensions.map((dimension) => dimension.id), supported: true },
+    confidence: .9,
+  };
+}
+
+function blueprintValue(plan: AssessExperienceRequest["plan"], endingTarget = "The mechanism remains available and Aria fulfills the ending goal."): Record<string, unknown> {
+  const deliveries = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds.map((signalId) => ({ dimensionId: dimension.id, signalId, action: `A concrete action realizes ${signalId}.`, outcome: `The action changes the situation for ${dimension.id}.` })));
+  return {
+    schemaVersion: 1,
+    title: "Blueprint",
+    protagonist: { id: "aria-id" },
+    axisSignalIds: deliveries.map((item) => item.signalId),
+    hardPromiseIds: plan.hardPresencePromiseIds,
+    endingContract: { target: endingTarget, cost: "Aria permanently gives up the protected route." },
+    sharedCause: { event: "One costly choice changes both axes.", dimensionIds: plan.promptProjection.dimensions.map((dimension) => dimension.id) },
+    chapters: [{ number: 1, signalIds: deliveries.map((item) => item.signalId), promiseIds: plan.hardPresencePromiseIds, event: "Opening the sealed gate forces concrete changes in the city and in Aria's relationships.", cause: "Opening the sealed gate forces both consequences.", outcome: "The city and Aria's relationships both change.", cost: "The protected route is lost." }],
+    meta: { prohibitionsSatisfied: true },
+  };
+}
 
 test("voice and pacing require distributed anchors and metrics", async () => { const { request, deps } = fixture(); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const distributed = result.value.evidence.filter((item) => item.signalId === "voice" || item.signalId === "pacing"); assert.equal(distributed.every((item) => item.anchors.length >= 3), true); assert.equal(distributed.every((item) => Object.keys(item.observation.distributionMetrics ?? {}).length > 0), true); });
+test("planned, negated, simulated and predicted prose cannot qualify as pacing", async () => {
+  const c = contract();
+  const distribution = (id: string, kind: "voice" | "pacing", metricIds: any[]) => ({ id, dimensionId: kind === "voice" ? "d1" : "d2", kind, description: "compiled distribution target", verification: { kind: "distribution" as const, metricIds, minimumAnchors: 3, requireSemanticJudge: true as const, requiredRegions: ["opening", "middle", "ending"] as any, regionSemantics: "paragraph" as const, metricThresholds: Object.fromEntries(metricIds.map((metric) => [metric, .01])) }, persistence: "chapter" as const });
+  c.dimensions[0] = { ...c.dimensions[0], categories: ["voice"], observableSignals: [distribution("voice-only", "voice", ["anchor_spread", "scene_coverage", "paragraph_consistency"])] };
+  c.dimensions[1] = { ...c.dimensions[1], categories: ["pacing"], observableSignals: [distribution("pacing-only", "pacing", ["anchor_spread", "scene_coverage", "beat_density", "turn_position"])] };
+  const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v-plan", title: "Plan-only chapter", paragraphs: ["Aria plans a decisive action at dawn.", "She has not opened the gate.", "The oracle predicts pressure will rise.", "A simulated attack would change the route.", "They intend to respond tomorrow.", "Rumour says a turn might happen.", "The ending only predicts victory."] };
+  const prose = sourceForArtifact(artifact); const at = (quote: string) => ({ start: prose.indexOf(quote), end: prose.indexOf(quote) + quote.length, quote });
+  const common = at(artifact.paragraphs[0]);
+  const claims: any[] = [
+    { version: 1, eventId: "unrealized", dimensionId: "d1", signalId: "voice-only", supported: true, confidence: .9, anchors: [common, at(artifact.paragraphs[2]), at(artifact.paragraphs[5])], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, paragraph_consistency: 1 } },
+    { version: 1, eventId: "unrealized", dimensionId: "d2", signalId: "pacing-only", supported: true, confidence: .9, anchors: [common, at(artifact.paragraphs[3]), at(artifact.paragraphs[6])], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, beat_density: 1, turn_position: 1 }, distributionAnchorIndices: { goal: [0], pressure: [1], beat: [0, 1], turn: [2] } },
+  ];
+  const semantic: any = { version: 1, claims, sharedCause: { eventId: "unrealized", supported: true, confidence: .9, anchors: [common], links: [{ dimensionId: "d1", signalId: "voice-only", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "pacing-only", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } };
+  const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v-plan", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-plan-pacing", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-plan-pacing" });
+  const base = fixture(); base.state.consumedTicketIds.length = 0; base.state.revisionId = "v-plan"; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, { ...base.deps, contract: c, semanticJudgePort: { judge: async () => semantic } });
+  assert.equal(result.ok, true); if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
+});
+test("voice structure metrics cannot override a target-opposed semantic judgement", async () => {
+  const opposed = fixture(async () => verdict({ claims: verdict().claims.map((claim) => claim.signalId === "voice" ? { ...claim, supported: false, metrics: { ...claim.metrics, anchor_spread: 1, scene_coverage: 1 } } : claim) }));
+  const result = await assessExperience(opposed.request, opposed.deps);
+  assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
+});
 test("a fabricated judge quote never becomes evidence", async () => { const { request, deps } = fixture(async () => verdict({ claims: verdict().claims.map((claim, index) => index ? claim : { ...claim, anchors: [{ start: 0, end: 4, quote: "missing" }] }) })); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rewrite"); });
 test("ticket and authorization failures fail closed before a judge call", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const altered = { ...request, plan: { ...request.plan, chapterNumber: 9 } }; const result = await assessExperience(altered, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rejected"); assert.equal(calls, 0); });
 test("all categories demand their local realized evidence", async () => { for (const slots of [{}, { actor: "Aria", action: "opens", object: "gate", outcome: "records" }]) { const { request, deps } = fixture(async () => verdict({ claims: verdict().claims.map((claim, index) => index ? claim : { ...claim, slots }) })); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, slots.actor ? "accepted" : "rewrite"); } });
@@ -53,7 +102,7 @@ test("anchors, artifact hashes, blueprint and retcon bindings are deterministic"
   assert.equal(sourceForArtifact(chapter), "T\none\ntwo"); assert.equal(hashArtifact(chapter).length, 64);
   const canonicalBlueprint = { kind: "blueprint" as const, value: { meta: { z: 1 }, a: [true] } }; assert.equal(sourceForArtifact(canonicalBlueprint), '{"a":[true],"meta":{"z":1}}');
   const { request, deps, state } = fixture(); const blueprintPlan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-blue", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-blue" });
-  const blueprintSignalIds = blueprintPlan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds); const blueprint = { kind: "blueprint" as const, value: { schemaVersion: 1, title: "Blueprint", protagonist: { id: "aria-id" }, axisSignalIds: blueprintSignalIds, hardPromiseIds: blueprintPlan.hardPresencePromiseIds, endingContract: { target: "The mechanism remains available and Aria fulfills the ending goal.", cost: "Aria permanently gives up the protected route." }, sharedCause: { event: "One costly choice changes both axes.", dimensionIds: blueprintPlan.promptProjection.dimensions.map((dimension) => dimension.id) }, chapters: [{ number: 1, signalIds: blueprintSignalIds, promiseIds: blueprintPlan.hardPresencePromiseIds, event: "Aria makes the costly choice.", cost: "The protected route is lost." }], meta: { prohibitionsSatisfied: true } } }; state.artifactBindingId = blueprintPlan.artifactBindingId; state.expectedArtifactDigest = null; const blueprintDeps = { ...deps, semanticJudgePort: { judge: async () => blueprintVerdict(blueprintPlan) } }; const acceptedBlueprint = await assessExperience({ plan: blueprintPlan, artifact: blueprint }, blueprintDeps); assert.equal(acceptedBlueprint.ok, true); if (!acceptedBlueprint.ok) return assert.fail(); assert.equal(acceptedBlueprint.value.status, "accepted");
+  const blueprint = { kind: "blueprint" as const, value: blueprintValue(blueprintPlan) }; state.artifactBindingId = blueprintPlan.artifactBindingId; state.expectedArtifactDigest = null; const blueprintDeps = { ...deps, semanticJudgePort: { judge: async () => blueprintVerdict(blueprintPlan) } }; const acceptedBlueprint = await assessExperience({ plan: blueprintPlan, artifact: blueprint }, blueprintDeps); assert.equal(acceptedBlueprint.ok, true); if (!acceptedBlueprint.ok) return assert.fail(); assert.equal(acceptedBlueprint.value.status, "accepted");
   const retconArtifact = { ...request.artifact, kind: "retcon_revision" as const, revisionId: "v2" }; const retconDigest = hashArtifact(retconArtifact); const retconPlan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "retcon_revision", chapterId: "c1", revisionId: "v2", expectedArtifactDigest: retconDigest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-retcon", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-retcon" });
   state.revisionId = "v2"; state.artifactBindingId = retconPlan.artifactBindingId; state.expectedArtifactDigest = retconDigest; const retcon = await assessExperience({ plan: retconPlan, artifact: retconArtifact }, deps); assert.equal(retcon.ok, true); if (!retcon.ok || retcon.value.status !== "accepted" || retcon.value.artifactKind !== "retcon_revision") return assert.fail(); assert.equal(retcon.value.evidence.every((item) => item.chapterRevisionId === "v2"), true); assert.equal(retcon.value.permit.revisionId, "v2");
 });
@@ -151,6 +200,16 @@ test("shared-cause pointers permit only the common anchor and require axis-local
   });
   const doubleCounted = await assessExperience(generic.request, generic.deps);
   assert.equal(doubleCounted.ok, true); if (doubleCounted.ok) assert.equal(doubleCounted.value.status, "rewrite");
+
+  const actorOnly = fixture(async () => {
+    const value = verdict(); const actor = anchor("Aria"); const event = anchor("opens the sealed gate and the mechanism records her choice.");
+    value.claims[0] = { ...value.claims[0], anchors: [actor, event], slotAnchorIndices: { actor: 0, action: 1, object: 1, outcome: 1 } };
+    value.claims[1] = { ...value.claims[1], anchors: [actor, value.claims[1].anchors[1], value.claims[1].anchors[2]] };
+    value.sharedCause.anchors = [actor];
+    return value;
+  });
+  const actorRejected = await assessExperience(actorOnly.request, actorOnly.deps);
+  assert.equal(actorRejected.ok, true); if (actorRejected.ok) assert.equal(actorRejected.value.status, "rewrite");
 });
 
 test("every required slot has a grounded pointer and trusted story-role identity", async () => {
@@ -169,6 +228,16 @@ test("every required slot has a grounded pointer and trusted story-role identity
   }, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "relationship"); });
   const untrusted = await assessExperience(relationship.request, relationship.deps);
   assert.equal(untrusted.ok, true); if (untrusted.ok) assert.equal(untrusted.value.status, "rewrite");
+
+  const wrongAlias = fixture(async () => {
+    const value = verdict(); const common = anchor("The city guard lowers his spear");
+    value.claims[0] = { version: 1, eventId: "shared-event", dimensionId: "d1", signalId: "relationship", supported: true, confidence: .9, anchors: [common, anchor("then Aria answers with a bow and they choose to travel together")], slotAnchorIndices: { actor: 1, action: 1, counterpart: 0, reciprocalAction: 0, relationshipChange: 1 } as any, slots: { actor: "Aria", action: "answers", counterpart: "city", counterpartId: "guard-id", reciprocalAction: "lowers", relationshipChange: "travel together" } as any };
+    value.claims[1] = { ...value.claims[1], anchors: [common, anchor("At dusk"), value.claims[1].anchors[2]] };
+    value.sharedCause.anchors = [common]; (value.sharedCause as any).links[0] = { dimensionId: "d1", signalId: "relationship", claimAnchorIndex: 0, sharedAnchorIndex: 0 };
+    return value;
+  }, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "relationship"); });
+  const aliasResult = await assessExperience(wrongAlias.request, wrongAlias.deps);
+  assert.equal(aliasResult.ok, true); if (aliasResult.ok) assert.equal(aliasResult.value.status, "rewrite");
 });
 
 test("curated adapters inspect the claimed event, not unrelated source text", async () => {
@@ -181,16 +250,60 @@ test("curated adapters inspect the claimed event, not unrelated source text", as
   assert.equal(calls, 1);
 });
 
+test("hard curated invariants scan the whole artifact before semantic judging", async () => {
+  let calls = 0;
+  const base = fixture(async () => { calls++; return verdict(); }, (value) => {
+    value.prohibitions.push(
+      { id: "mechanic-global", dimensionId: "both", kind: "invariant", description: "The compiled mechanism remains available.", severity: "block", ruleAdapterId: "curated-mechanic-unavailable" } as any,
+      { id: "outcome-global", dimensionId: "both", kind: "invariant", description: "The compiled protagonist outcome remains fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" } as any,
+    );
+  });
+  const artifact = { ...base.request.artifact, paragraphs: [...base.request.artifact.paragraphs, "Later the system is permanently unavailable and the protagonist surrenders."] };
+  const digest = hashArtifact(artifact);
+  const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-global-invariant", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-global-invariant" });
+  base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, base.deps);
+  assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
+  assert.equal(calls, 0);
+});
+
 test("blueprint acceptance is semantic, pointer-grounded, and rejects a malicious ending", async () => {
   const { deps, state } = fixture();
+  deps.contract.prohibitions.push(
+    { id: "mechanic-ending", dimensionId: "both", kind: "invariant", description: "The compiled mechanic must remain usable.", severity: "block", ruleAdapterId: "curated-mechanic-unavailable" },
+    { id: "outcome-ending", dimensionId: "both", kind: "invariant", description: "The compiled protagonist advantage must remain fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" },
+  );
   const plan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-blue-mal", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-blue-mal" });
-  const signalIds = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds);
-  const artifact = { kind: "blueprint" as const, value: { schemaVersion: 1, title: "Malicious", protagonist: { id: "aria-id" }, axisSignalIds: signalIds, hardPromiseIds: plan.hardPresencePromiseIds, endingContract: { target: "系统永远不可用，主角最终惨败", cost: "Everything is lost." }, sharedCause: { event: "One event", dimensionIds: plan.promptProjection.dimensions.map((dimension) => dimension.id) }, chapters: [{ number: 1, signalIds, promiseIds: plan.hardPresencePromiseIds, event: "One event", cost: "Everything is lost." }], meta: { prohibitionsSatisfied: true } } };
+  const artifact = { kind: "blueprint" as const, value: blueprintValue(plan, "系统在结局前被彻底摧毁，从此再也无法启动；Aria 放弃目标并向对手投降。") };
   let calls = 0; state.consumedTicketIds.length = 0; state.artifactBindingId = plan.artifactBindingId; state.expectedArtifactDigest = null;
   const result = await assessExperience({ plan, artifact }, { ...deps, semanticJudgePort: { judge: async () => { calls++; return blueprintVerdict(plan); } } });
   assert.equal(calls, 1);
   assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
   assert.deepEqual(state.consumedTicketIds, [plan.ticket.id]);
+});
+
+test("blueprint labels cannot masquerade as semantic delivery and confidence is non-vacuous", async () => {
+  const make = (jobId: string) => {
+    const base = fixture();
+    const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId, attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => `t-${jobId}` });
+    base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = null;
+    return { ...base, plan };
+  };
+
+  const labels = make("blue-labels");
+  const labelsValue = blueprintValue(labels.plan) as any;
+  labelsValue.chapters[0].event = [...labelsValue.chapters[0].signalIds, ...labelsValue.chapters[0].promiseIds].join(" ");
+  labelsValue.chapters[0].cause = labels.plan.promptProjection.dimensions.map((item) => item.id).join(" ");
+  const labelsResult = await assessExperience({ plan: labels.plan, artifact: { kind: "blueprint", value: labelsValue } }, { ...labels.deps, semanticJudgePort: { judge: async () => blueprintVerdict(labels.plan) } });
+  assert.equal(labelsResult.ok, true); if (labelsResult.ok) assert.equal(labelsResult.value.status, "rewrite");
+
+  const zero = make("blue-zero"); const zeroVerdict = blueprintVerdict(zero.plan); zeroVerdict.confidence = 0;
+  const zeroResult = await assessExperience({ plan: zero.plan, artifact: { kind: "blueprint", value: blueprintValue(zero.plan) } }, { ...zero.deps, semanticJudgePort: { judge: async () => zeroVerdict } });
+  assert.equal(zeroResult.ok, true); if (zeroResult.ok) assert.equal(zeroResult.value.status, "rewrite");
+
+  const irrelevant = make("blue-irrelevant"); const irrelevantVerdict = blueprintVerdict(irrelevant.plan); irrelevantVerdict.sharedCause.supported = false;
+  const irrelevantResult = await assessExperience({ plan: irrelevant.plan, artifact: { kind: "blueprint", value: blueprintValue(irrelevant.plan) } }, { ...irrelevant.deps, semanticJudgePort: { judge: async () => irrelevantVerdict } });
+  assert.equal(irrelevantResult.ok, true); if (irrelevantResult.ok) assert.equal(irrelevantResult.value.status, "rewrite");
 });
 
 test("assessment atomically performs the first artifact binding and rejects binding drift", async () => {
@@ -205,4 +318,15 @@ test("assessment atomically performs the first artifact binding and rejects bind
   let calls = 0; const drift = fixture(async () => { calls++; return verdict(); }); drift.state.expectedArtifactDigest = "different";
   const rejected = await assessExperience(drift.request, drift.deps);
   assert.equal(rejected.ok, true); if (rejected.ok) assert.equal(rejected.value.status, "rejected"); assert.equal(calls, 0);
+});
+
+test("a tainted compiled contract never reaches the semantic judge while adapterless rules do", async () => {
+  let taintedCalls = 0; const tainted = fixture(async () => { taintedCalls++; return verdict(); }, (value) => { value.dimensions[0].interpretation = "opaque-a pasted into compiled semantics"; });
+  const rejected = await assessExperience(tainted.request, tainted.deps);
+  assert.equal(rejected.ok, true); if (rejected.ok) assert.equal(rejected.value.status, "rejected"); assert.equal(taintedCalls, 0);
+
+  let captured: any; const adapterless = fixture(async (input) => { captured = input; return verdict(); }, (value) => { value.dimensions[0].prohibitions.push({ id: "semantic-only", dimensionId: "d1", kind: "invariant", description: "A concrete irreversible cost must remain after the choice.", severity: "rewrite" }); value.prohibitions.push(value.dimensions[0].prohibitions.at(-1)!); });
+  const accepted = await assessExperience(adapterless.request, adapterless.deps);
+  assert.equal(accepted.ok, true); if (accepted.ok) assert.equal(accepted.value.status, "accepted");
+  assert.equal(captured.signals.find((item: any) => item.dimensionId === "d1").prohibitions.some((item: any) => item.id === "semantic-only"), true);
 });

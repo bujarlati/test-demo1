@@ -222,10 +222,29 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+function roleBindingsFor(request: ScheduleExperienceRequest): ExperienceStagePlan["roleBindings"] {
+  return {
+    protagonistId: request.roleBindings?.protagonistId ?? "",
+    aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
+    counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [],
+    opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [],
+    counterparts: request.roleBindings?.counterparts ? request.roleBindings.counterparts.map((item) => ({ id: item.id, aliases: [...item.aliases] })) : [],
+    opponents: request.roleBindings?.opponents ? request.roleBindings.opponents.map((item) => ({ id: item.id, aliases: [...item.aliases] })) : [],
+  };
+}
+
+function validRoleBindings(roles: ExperienceStagePlan["roleBindings"]): boolean {
+  const validEntities = (entities: Array<{ id: string; aliases: string[] }>, ids: string[]) => entities.every((item) => !!item.id.trim() && item.aliases.length > 0 && item.aliases.every((alias) => !!alias.trim()) && new Set(item.aliases.map((alias) => alias.toLocaleLowerCase())).size === item.aliases.length) && new Set(entities.map((item) => item.id)).size === entities.length && [...ids].sort().join("|") === entities.map((item) => item.id).sort().join("|");
+  return !!roles.protagonistId.trim() && roles.aliases.length > 0 && roles.aliases.every((alias) => !!alias.trim()) && validEntities(roles.counterparts, roles.counterpartIds) && validEntities(roles.opponents, roles.opponentIds);
+}
+
 function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
+  const roles = roleBindingsFor(request);
   if (request.artifactKind !== "blueprint") {
-    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !request.roleBindings?.protagonistId.trim() || !Array.isArray(request.roleBindings.aliases) || request.roleBindings.aliases.length === 0 || request.roleBindings.aliases.some((alias) => !alias.trim())) throw new ExperienceSchedulingError("invalid_authorization_payload");
+    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !validRoleBindings(roles)) throw new ExperienceSchedulingError("invalid_authorization_payload");
+  } else if (request.roleBindings && !validRoleBindings(roles)) {
+    throw new ExperienceSchedulingError("invalid_authorization_payload");
   }
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
@@ -273,12 +292,7 @@ function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDepe
     ...(request.revisionId ? { revisionId: request.revisionId } : {}),
     ...(request.expectedArtifactDigest ? { expectedArtifactDigest: request.expectedArtifactDigest } : {}),
     artifactBindingId: request.artifactBindingId ?? `binding_${stableToken(canonicalAuthorizationPayload([request.contract.id, request.activation.id, request.canon.branchId, request.chapterId ?? "blueprint", request.revisionId ?? "blueprint", request.jobId, request.attempt]))}`,
-    roleBindings: {
-      protagonistId: request.roleBindings?.protagonistId ?? "",
-      aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
-      counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [],
-      opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [],
-    },
+    roleBindings: roles,
     stage,
     artifactKind: request.artifactKind,
     promptProjection: {
@@ -317,7 +331,7 @@ function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDepe
   const repair = request.repair!; const token = repair.token; const { signature, ...unsigned } = token;
   void signature; void unsigned;
   if (!verifyRepairAuthorization(token, repair.expected, deps.ticketSecret, deps.now())) throw new ExperienceSchedulingError("plan_mismatch");
-  const requestRoles = { protagonistId: request.roleBindings?.protagonistId ?? "", aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [], counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [], opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [] };
+  const requestRoles = roleBindingsFor(request);
   if (request.attempt !== token.attempt + 1 || request.jobId !== token.jobId || request.contract.id !== token.contractRevisionId || request.contract.ruleGraphVersion !== token.ruleGraphVersion || request.activation.id !== token.activationId || request.canon.branchId !== token.branchId || request.canon.canonVersion !== token.expectedCanonVersion || request.ledger.revision !== token.ledgerRevision || request.artifactKind !== token.artifactKind || chapterNumber(request) !== token.chapterNumber || canonicalAuthorizationPayload(requestRoles) !== canonicalAuthorizationPayload(token.roleBindings) || request.artifactBindingId === token.artifactBindingId || request.expectedArtifactDigest === token.artifactHash || (token.artifactKind !== "blueprint" && (request.chapterId !== token.chapterId || request.revisionId !== token.revisionId))) throw new ExperienceSchedulingError("plan_mismatch");
   // Scheduling is a pure synchronous operation.  The authorization is carried
   // by the signed plan and consumed in the assessment CAS.

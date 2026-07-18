@@ -98,8 +98,8 @@ function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
 
 function verificationFor(category: ExperienceCategory): EvidencePolicy {
   if (category === "relationship") return cloneEvidencePolicy(relationshipVerification);
-  if (category === "voice") return { kind: "distribution", metricIds: ["paragraph_consistency", "scene_coverage"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { paragraph_consistency: 0.35, scene_coverage: 1 } };
-  if (category === "pacing") return { kind: "distribution", metricIds: ["beat_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["middle", "ending"], regionSemantics: "paragraph", metricThresholds: { beat_density: 0.25, turn_position: 0.55 } };
+  if (category === "voice") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1 } };
+  if (category === "pacing") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "beat_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, scene_coverage: 1, beat_density: 0.25, turn_position: 0.55 } };
   return cloneEvidencePolicy(eventVerification);
 }
 
@@ -151,8 +151,8 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
   "event-hearsay": /\b(?:hearsay|rumou?r)\b|(?:据说|传闻)/i,
   "helper-substitution": /\bhelper\b|(?:他人代做|旁人替代)/i,
   "contains-pasted-label": /\b(?:label|descriptor)\b|(?:标签|描述词)/i,
-  "curated-mechanic-unavailable": /(?:机制|面板|能力).{0,12}(?:无法使用|只是比喻|没有反馈)/i,
-  "curated-outcome-weakened": /(?:主角|主人公).{0,12}(?:被救场|战平|惨败|失去优势)/i,
+  "curated-mechanic-unavailable": /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}?(?:never\s+(?:available|works?)|unavailable|destroyed|cannot\s+(?:activate|use)|无法使用|无法启动|永远不可用|永久失效|被(?:彻底)?摧毁|只是比喻|没有反馈)/i,
+  "curated-outcome-weakened": /(?:protagonist|主角|主人公).{0,24}?(?:rescued|draws?|defeated|los(?:e|es|t)|surrenders?|gives?\s+up|被救场|战平|惨败|失去优势|投降|放弃目标)/i,
 };
 
 export function isRuleAdapterId(id: string): id is GenericRuleAdapterId { return Object.hasOwn(genericAdapters, id); }
@@ -164,20 +164,35 @@ export function adapterAppliesTo(id: GenericRuleAdapterId, category: ExperienceC
   if (id === "curated-mechanic-unavailable") return category === "mechanic";
   if (id === "curated-outcome-weakened") return category === "conflict_outcome";
   if (id === "helper-substitution") return category === "mechanic" || category === "protagonist_action" || category === "conflict_outcome";
+  if (["event-negated", "event-intent", "event-failed-attempt", "event-simulation", "event-hearsay"].includes(id)) return eventCategories.has(category) || category === "pacing";
+  if (id === "contains-pasted-label") return true;
   return eventCategories.has(category);
 }
 
 const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|实际上|现实中|尘埃散去|紧接着)/i;
 const realizedAfterReversal = /(?:\b(?:opened?|defeated?|won|succeeded?|activated?|responded?|confirmed?|acted?)\b|打开|开启|击败|获胜|制胜|成功|生效|反馈|奖励|弹出|记录|改变|确认|亲眼看见|毫发无损)/i;
-function hasRealizedReversal(source: string): boolean {
+function hasRealizedReversal(id: GenericRuleAdapterId, source: string): boolean {
   const marker = reversalMarker.exec(source);
-  return !!marker && realizedAfterReversal.test(source.slice(marker.index + marker[0].length));
+  if (!marker) return false;
+  const tail = source.slice(marker.index + marker[0].length);
+  if (id === "curated-mechanic-unavailable") return /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(tail);
+  if (id === "curated-outcome-weakened") return /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(tail);
+  return realizedAfterReversal.test(tail);
 }
 
 export function runRuleAdapter(id: GenericRuleAdapterId, source: string): boolean {
-  if (!genericAdapters[id].test(source)) return false;
+  const pattern = genericAdapters[id];
+  const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+  const matches = [...source.matchAll(matcher)];
+  if (!matches.length) return false;
+  if (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") {
+    return matches.some((match, index) => {
+      const next = matches[index + 1]?.index ?? source.length;
+      return !hasRealizedReversal(id, source.slice(match.index!, next));
+    });
+  }
   // A rejected possibility followed by a directly narrated realization is not
   // evidence of non-realization.  The assessor still grounds the positive event.
-  if (hasRealizedReversal(source)) return false;
+  if (hasRealizedReversal(id, source)) return false;
   return true;
 }

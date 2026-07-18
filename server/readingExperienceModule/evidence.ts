@@ -30,13 +30,16 @@ function regionFor(source: string, anchor: TextAnchorV2, policy: Extract<Evidenc
   return anchor.start < length / 3 ? "opening" : anchor.start < (length * 2) / 3 ? "middle" : "ending";
 }
 
-function localMetrics(source: string, anchors: TextAnchorV2[], policy: Extract<EvidencePolicy, { kind: "distribution" }>): Record<string, number> {
+function localMetrics(source: string, anchors: TextAnchorV2[], policy: Extract<EvidencePolicy, { kind: "distribution" }>, facets?: SemanticEvidenceClaim["distributionAnchorIndices"]): Record<string, number> {
+  const paragraphs: Array<{ text: string; start: number }> = []; let cursor = 0;
+  for (const line of source.split("\n")) { if (line.trim()) paragraphs.push({ text: line, start: cursor }); cursor += line.length + 1; }
+  const starts = anchors.map((anchor) => anchor.start); const spread = starts.length < 2 ? 0 : (Math.max(...starts) - Math.min(...starts)) / Math.max(source.length, 1);
   const regions = new Set(anchors.map((anchor) => regionFor(source, anchor, policy)));
-  const starts = anchors.map((anchor) => anchor.start); const spread = anchors.length < 2 ? 0 : (Math.max(...starts) - Math.min(...starts)) / Math.max(source.length, 1);
-  const paragraphs = source.split("\n").filter(Boolean); const anchoredParagraphs = new Set(anchors.map((anchor) => source.slice(0, anchor.start).split("\n").length - 1));
-  const lengths = anchors.map((anchor) => anchor.end - anchor.start); const mean = lengths.reduce((sum, length) => sum + length, 0) / Math.max(lengths.length, 1); const deviation = lengths.reduce((sum, length) => sum + Math.abs(length - mean), 0) / Math.max(lengths.length * Math.max(mean, 1), 1);
+  const lengths = paragraphs.flatMap((paragraph) => paragraph.text.split(/(?<=[.!?。！？])/u).map((sentence) => sentence.trim()).filter(Boolean).map((sentence) => Array.from(sentence).length));
+  const mean = lengths.reduce((sum, length) => sum + length, 0) / Math.max(lengths.length, 1); const deviation = lengths.reduce((sum, length) => sum + Math.abs(length - mean), 0) / Math.max(lengths.length * Math.max(mean, 1), 1);
+  const beatIndices = [...new Set(facets?.beat ?? [])]; const turnIndex = facets?.turn?.[0]; const turnStart = turnIndex === undefined ? 0 : anchors[turnIndex]?.start ?? 0;
   const requiredCount = Math.max(policy.requiredRegions.length, 1);
-  const values: Record<DistributionMetricId, number> = { anchor_spread: spread, scene_coverage: regions.size / requiredCount, paragraph_consistency: Math.max(0, 1 - deviation), beat_density: anchors.length / Math.max(paragraphs.length, 1), turn_position: Math.max(...starts, 0) / Math.max(source.length, 1) };
+  const values: Record<DistributionMetricId, number> = { anchor_spread: spread, scene_coverage: Math.min(1, regions.size / requiredCount), paragraph_consistency: Math.max(0, 1 - deviation), beat_density: beatIndices.length / Math.max(anchors.length, 1), turn_position: turnStart / Math.max(source.length, 1) };
   return Object.fromEntries(policy.metricIds.map((id) => [id, values[id] ?? 0]));
 }
 
@@ -57,7 +60,13 @@ export function groundClaim(source: string, claim: SemanticEvidenceClaim, signal
     if (policy.metricIds.some((id) => !metricIds.has(id))) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
     const metricKeys = Object.keys(claim.metrics ?? {}).sort(); const expected = [...policy.metricIds].sort();
     if (metricKeys.join("\u001f") !== expected.join("\u001f")) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
-    const metrics = localMetrics(source, anchors, policy); const required = policy.requiredRegions ?? ["opening", "middle", "ending"]; const present = new Set(anchors.map((anchor) => regionFor(source, anchor, policy)));
+    const pacingMetrics = policy.metricIds.includes("beat_density") || policy.metricIds.includes("turn_position");
+    const facets = claim.distributionAnchorIndices;
+    if (pacingMetrics) {
+      const keys = Object.keys(facets ?? {}).sort(); const expectedFacetKeys = ["beat", "goal", "pressure", "turn"];
+      if (keys.join("|") !== expectedFacetKeys.join("|") || expectedFacetKeys.some((key) => !Array.isArray(facets?.[key as keyof typeof facets]) || !facets![key as keyof typeof facets]!.length || facets![key as keyof typeof facets]!.some((index) => !Number.isInteger(index) || index < 0 || index >= anchors.length)) || facets!.turn!.length !== 1 || facets!.turn![0] !== anchors.length - 1) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+    } else if (facets !== undefined) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+    const metrics = localMetrics(source, anchors, policy, facets); const required = policy.requiredRegions ?? ["opening", "middle", "ending"]; const present = new Set(anchors.map((anchor) => regionFor(source, anchor, policy)));
     if (required.some((region) => !present.has(region)) || Object.entries(policy.metricThresholds ?? {}).some(([id, threshold]) => !Number.isFinite(threshold) || (metrics[id] ?? -Infinity) < threshold)) return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };
     return { claim, anchors, metrics };
   }
@@ -71,7 +80,7 @@ export function evidenceFromClaim(input: { id: string; contractRevisionId: strin
     id: binding.id, contractRevisionId: binding.contractRevisionId, activationId: binding.activationId, branchId: binding.branchId,
     dimensionId: grounded.claim.dimensionId, signalId: grounded.claim.signalId, eventId: grounded.claim.eventId, ticketId: binding.ticketId, jobId: binding.jobId, attempt: binding.attempt, stage: binding.stage, artifactKind: binding.artifactKind, ruleGraphVersion: binding.ruleGraphVersion, expectedCanonVersion: binding.expectedCanonVersion, ledgerRevision: binding.ledgerRevision, chapterId: binding.chapterId, chapterRevisionId: binding.revisionId,
     sourceHash: binding.sourceHash, anchors: grounded.anchors.map((anchor) => ({ ...anchor })),
-    observation: { actor: slots.actor, action: slots.action, object: slots.object, feedback: slots.feedback, outcome: slots.outcome, reaction: slots.reaction, reciprocalAction: slots.reciprocalAction, relationshipOrStateChange: slots.relationshipChange, slots: { ...slots }, slotAnchors: Object.fromEntries(Object.entries(grounded.claim.slotAnchorIndices).map(([slot, index]) => [slot, grounded.anchors[index!]]).filter(([, anchor]) => !!anchor)), distributionMetrics: grounded.metrics ? { ...grounded.metrics } : undefined },
+    observation: { actor: slots.actor, action: slots.action, object: slots.object, feedback: slots.feedback, outcome: slots.outcome, reaction: slots.reaction, reciprocalAction: slots.reciprocalAction, relationshipOrStateChange: slots.relationshipChange, slots: { ...slots }, slotAnchors: Object.fromEntries(Object.entries(grounded.claim.slotAnchorIndices).map(([slot, index]) => [slot, grounded.anchors[index!]]).filter(([, anchor]) => !!anchor)), distributionMetrics: grounded.metrics ? { ...grounded.metrics } : undefined, distributionFacetAnchors: grounded.claim.distributionAnchorIndices ? Object.fromEntries(Object.entries(grounded.claim.distributionAnchorIndices).map(([facet, indices]) => [facet, indices!.map((index) => ({ ...grounded.anchors[index] }))])) : undefined },
     confidence: grounded.claim.confidence, status: "supported",
   };
 }

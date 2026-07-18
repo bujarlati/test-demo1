@@ -32,12 +32,12 @@ const ledger: ExperienceLedgerV2 = { contractRevisionId: "r", activationId: "a",
 
 test("scheduler signs trusted story roles and never guesses protagonist from signal slots", () => {
   const plan = scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 });
-  assert.deepEqual(plan.roleBindings, { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [] });
+  assert.deepEqual(plan.roleBindings, { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] });
   assert.equal(plan.promptProjection.dimensions.every((dimension) => !("roleBindings" in dimension)), true);
 });
 
 function signedRepair(): ExperienceRepairToken {
-  const unsigned = { version: 1 as const, repairId: "repair-1", ticketId: "old-ticket", jobId: "j", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b", stage: "opening" as const, artifactKind: "chapter" as const, ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1, chapterNumber: 1, chapterId: "c", revisionId: "v", artifactBindingId: "old-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [] }, artifactHash: "digest", failedRuleIds: ["evidence.not_realized"], expiresAt: "2026-07-18T00:05:00.000Z" };
+  const unsigned = { version: 1 as const, repairId: "repair-1", ticketId: "old-ticket", jobId: "j", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b", stage: "opening" as const, artifactKind: "chapter" as const, ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1, chapterNumber: 1, chapterId: "c", revisionId: "v", artifactBindingId: "old-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] }, artifactHash: "digest", failedRuleIds: ["evidence.not_realized"], expiresAt: "2026-07-18T00:05:00.000Z" };
   const signature = createHmac("sha256", "s").update("reading-experience:repair:v1").update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
   return { ...unsigned, signature };
 }
@@ -73,6 +73,9 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("event-negated", "他没有退后，反而击败了守卫。"), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "敌人讥笑面板没有反馈，下一刻面板弹出永久奖励。"), false);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "旁观者误以为主角惨败，尘埃散去他毫发无损并一击制胜。"), false);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
 });
 
 test("adapter applicability is closed by narrative category", () => {
@@ -81,4 +84,35 @@ test("adapter applicability is closed by narrative category", () => {
   assert.equal(adapterAppliesTo("curated-outcome-weakened", "conflict_outcome"), true);
   assert.equal(adapterAppliesTo("helper-substitution", "relationship"), false);
   assert.equal(adapterAppliesTo("event-simulation", "relationship"), true);
+  assert.equal(adapterAppliesTo("event-intent", "pacing"), true);
+});
+
+test("distribution metrics bind delivery geometry to signal anchors and pacing to typed facets", () => {
+  const source = "Opening goal is concrete.\nPressure rises at the gate.\nA short reply.\nA measured response changes the route.\nAnother consequence follows.\nThe rhythm turns decisively.\nThe ending records the consequence.";
+  const voicePolicy = { kind: "distribution" as const, metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"] as any, minimumAnchors: 3, requireSemanticJudge: true as const, requiredRegions: ["opening"] as const, regionSemantics: "paragraph" as const, metricThresholds: { anchor_spread: .01, scene_coverage: .01, paragraph_consistency: .01 } };
+  const voice = { id: "distribution", dimensionId: "d", verification: voicePolicy } as any;
+  const makeAnchor = (quote: string) => ({ start: source.indexOf(quote), end: source.indexOf(quote) + quote.length, quote });
+  const claim = (quotes: string[]) => ({ version: 1 as const, eventId: "e", dimensionId: "d", signalId: "distribution", supported: true, confidence: 1, anchors: quotes.map(makeAnchor), slotAnchorIndices: {}, metrics: { anchor_spread: 0, scene_coverage: 0, paragraph_consistency: 0 } });
+  const left = groundClaim(source, claim(["Opening goal", "A measured response", "The ending records the consequence."]), voice);
+  const right = groundClaim(source, claim(["Opening goal", "Pressure rises", "A short reply"]), voice);
+  assert.equal("ruleId" in left, false); assert.equal("ruleId" in right, false);
+  if (!("ruleId" in left) && !("ruleId" in right)) {
+    assert.notEqual(left.metrics?.anchor_spread, right.metrics?.anchor_spread);
+    assert.equal(left.metrics?.paragraph_consistency, right.metrics?.paragraph_consistency);
+  }
+
+  const pacingPolicy = { kind: "distribution" as const, metricIds: ["anchor_spread", "scene_coverage", "beat_density", "turn_position"] as any, minimumAnchors: 3, requireSemanticJudge: true as const, requiredRegions: ["opening", "middle", "ending"] as const, regionSemantics: "paragraph" as const, metricThresholds: { anchor_spread: .01, scene_coverage: .01, beat_density: .01, turn_position: .01 } };
+  const pacing = { id: "pacing", dimensionId: "d", verification: pacingPolicy } as any;
+  const pacingClaim: any = { ...claim(["Opening goal", "A measured response", "The rhythm turns decisively."]), signalId: "pacing", metrics: { anchor_spread: 0, scene_coverage: 0, beat_density: 0, turn_position: 0 }, distributionAnchorIndices: { goal: [0], pressure: [1], beat: [1, 2], turn: [2] } };
+  const paced = groundClaim(source, pacingClaim, pacing); assert.equal("ruleId" in paced, false);
+  const untyped = groundClaim(source, { ...pacingClaim, distributionAnchorIndices: undefined }, pacing);
+  assert.deepEqual(untyped, { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: "d" });
+});
+
+test("long prose does not rescue voice anchors clustered at the opening", () => {
+  const source = Array.from({ length: 12 }, (_, index) => `Paragraph ${index} keeps the same structure.`).join("\n");
+  const quote = (index: number) => `Paragraph ${index}`; const anchor = (index: number) => ({ start: source.indexOf(quote(index)), end: source.indexOf(quote(index)) + quote(index).length, quote: quote(index) });
+  const signal = { id: "voice", dimensionId: "d", verification: { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: .35, scene_coverage: 1, paragraph_consistency: .1 } } } as any;
+  const result = groundClaim(source, { version: 1, eventId: "voice", dimensionId: "d", signalId: "voice", supported: true, confidence: 1, anchors: [anchor(0), anchor(1), anchor(2)], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, paragraph_consistency: 1 } }, signal);
+  assert.deepEqual(result, { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
 });

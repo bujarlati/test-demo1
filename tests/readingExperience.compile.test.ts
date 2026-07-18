@@ -234,7 +234,7 @@ test("compile records the actual per-dimension interpretation provenance", async
   assert.deepEqual(result.value.revision.provenance.map(({ kind, descriptor }) => ({ kind, descriptor })), [
     { kind: "model", descriptor: "温暖" }, { kind: "model", descriptor: "赛博禅意" },
   ]);
-  assert.equal(result.value.revision.provenance.every((item) => item.version.startsWith("interpretation_")), true);
+  assert.equal(result.value.revision.provenance.every((item) => item.version === "fixture-v1" && item.interpretationDigest?.startsWith("interpretation_")), true);
 });
 
 test("contract ids use a canonical cryptographic semantic digest", async () => {
@@ -244,6 +244,45 @@ test("contract ids use a canonical cryptographic semantic digest", async () => {
   assert.equal(left.ok && left.value.status, "ready"); assert.equal(right.ok && right.value.status, "ready"); assert.equal(repeat.ok && repeat.value.status, "ready");
   if (!left.ok || left.value.status !== "ready" || !right.ok || right.value.status !== "ready" || !repeat.ok || repeat.value.status !== "ready") return;
   assert.notEqual(left.value.revision.id, right.value.revision.id); assert.equal(left.value.revision.id, repeat.value.revision.id);
+});
+
+test("compile rejects descriptor taint on every judge-reachable semantic surface", async () => {
+  for (const mutate of [
+    (draft: InterpretationDraft) => { draft.dimensions[0].interpretation = "霓虹禅直接作为解释标签出现并替代可观察语义。"; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].observableSignals[0].description = "人物贴上霓虹禅标签便算作已经兑现。"; },
+    (draft: InterpretationDraft) => { draft.synthesis.sharedCause = "霓虹禅直接充当两个维度的共同原因而没有事件。"; },
+  ]) {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); mutate(draft); return draft; } };
+    const result = await compileExperience({ intent: { descriptors: [{ text: "霓虹禅" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "taint" }, port, scripted.deps.now);
+    assert.equal(result.ok, false); if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+  }
+});
+
+test("dimension identity changes with compiled semantics while provenance retains source version", async () => {
+  const build = async (suffix: string) => {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); draft.dimensions[0].observableSignals[0].description += suffix; return draft; } };
+    return compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `semantic-${suffix}` }, port, scripted.deps.now);
+  };
+  const [left, right] = await Promise.all([build(" 结果落在门上。"), build(" 结果落在桥上。")]);
+  assert.equal(left.ok && left.value.status, "ready"); assert.equal(right.ok && right.value.status, "ready");
+  if (!left.ok || left.value.status !== "ready" || !right.ok || right.value.status !== "ready") return;
+  assert.notEqual(left.value.revision.dimensions[0].id, right.value.revision.dimensions[0].id);
+  assert.equal(left.value.revision.provenance[0].version, "fixture-v1");
+  assert.match(left.value.revision.provenance[0].interpretationDigest ?? "", /^interpretation_/);
+});
+
+test("compile enforces category metric and adapter applicability with non-vacuous thresholds", async () => {
+  for (const mutate of [
+    (draft: InterpretationDraft) => { (draft.dimensions[1].observableSignals[0].verification as any).metricIds = ["beat_density"]; (draft.dimensions[1].observableSignals[0].verification as any).metricThresholds = { beat_density: .2 }; },
+    (draft: InterpretationDraft) => { const policy = draft.dimensions[1].observableSignals[0].verification as any; policy.metricThresholds[policy.metricIds[0]] = 0; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].prohibitions[0].ruleAdapterId = "curated-mechanic-unavailable"; },
+  ]) {
+    const scripted = scriptedExperiencePorts(); const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); mutate(draft); return draft; } };
+    const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "matrix" }, port, scripted.deps.now);
+    assert.equal(result.ok, false); if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+  }
 });
 
 test("compile rejects unsafe input before any external call", async () => {
@@ -306,7 +345,7 @@ test("compile is total and deterministic for 10,000 legal Unicode descriptor pai
     const first = await compileExperience(request, deps.interpretationPort, deps.now);
     const second = await compileExperience(request, deps.interpretationPort, deps.now);
     assert.deepEqual(first, second);
-    assert.equal(first.ok, true);
+    assert.equal(first.ok, true, descriptors.join("|"));
     if (first.ok) assert.ok(["ready", "needs_resolution", "rejected"].includes(first.value.status));
   }
 });

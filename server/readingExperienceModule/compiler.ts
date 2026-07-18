@@ -9,7 +9,7 @@ import type {
 } from "../../src/types";
 import { createHash } from "node:crypto";
 import { canonicalAuthorizationPayload } from "./scheduler";
-import { curatedInterpretation, curatedSynthesis, evidencePolicyFor, isRuleAdapterId } from "./ruleAdapters";
+import { adapterAppliesTo, curatedInterpretation, curatedSynthesis, evidencePolicyFor, isRuleAdapterId } from "./ruleAdapters";
 import type {
   CompileExperienceRequest,
   CompileOutcome,
@@ -165,7 +165,7 @@ function validVerification(value: unknown): value is EvidencePolicy {
     const regions = value.requiredRegions;
     const thresholds = value.metricThresholds;
     const metricIds = Array.isArray(value.metricIds) ? value.metricIds : [];
-    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && distributionMetricIds.has(metric)) && new Set(metricIds).size === metricIds.length && Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length && (value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && isRecord(thresholds) && Object.keys(thresholds).length === metricIds.length && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0 && threshold <= 1);
+    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && distributionMetricIds.has(metric)) && new Set(metricIds).size === metricIds.length && Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length && (value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && isRecord(thresholds) && Object.keys(thresholds).length === metricIds.length && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1);
   }
   return false;
 }
@@ -178,7 +178,15 @@ function validSemanticSlots(value: unknown): boolean {
 
 function validSignal(value: unknown): value is InterpretationDimensionDraft["observableSignals"][number] {
   if (!isRecord(value) || typeof value.description !== "string" || normalizedText(value.description).length < 6 || normalizedText(value.description).length > 300) return false;
-  return hasOnlyKeys(value, ["description", "kind", "semanticSlots", "verification", "persistence"]) && typeof value.kind === "string" && categories.includes(value.kind as ExperienceCategory) && validVerification(value.verification) && typeof value.persistence === "string" && persistenceValues.has(value.persistence) && validSemanticSlots(value.semanticSlots);
+  if (!hasOnlyKeys(value, ["description", "kind", "semanticSlots", "verification", "persistence"]) || typeof value.kind !== "string" || !categories.includes(value.kind as ExperienceCategory) || !validVerification(value.verification) || typeof value.persistence !== "string" || !persistenceValues.has(value.persistence) || !validSemanticSlots(value.semanticSlots)) return false;
+  const kind = value.kind as ExperienceCategory; const verification = value.verification as EvidencePolicy;
+  if (kind === "voice" || kind === "pacing") {
+    if (verification.kind !== "distribution") return false;
+    const required = kind === "voice" ? ["anchor_spread", "scene_coverage", "paragraph_consistency"] : ["anchor_spread", "scene_coverage", "beat_density", "turn_position"];
+    return [...verification.metricIds].sort().join("|") === required.sort().join("|");
+  }
+  if (kind === "relationship") return verification.kind === "relationship_change";
+  return verification.kind === "event_slots";
 }
 
 function validProhibition(value: unknown): boolean {
@@ -187,7 +195,29 @@ function validProhibition(value: unknown): boolean {
 
 function validStructuralDimension(value: unknown): value is InterpretationDimensionDraft {
   if (!isRecord(value) || typeof value.descriptor !== "string" || typeof value.interpretation !== "string" || !Array.isArray(value.categories) || !Array.isArray(value.observableSignals) || !Array.isArray(value.prohibitions) || typeof value.confidence !== "number") return false;
-  return hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) && value.categories.length > 0 && value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) && value.observableSignals.length >= 2 && value.observableSignals.length <= 6 && value.observableSignals.every(validSignal) && value.prohibitions.length > 0 && value.prohibitions.every(validProhibition);
+  if (!hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) || value.categories.length < 1 || !value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) || value.observableSignals.length < 2 || value.observableSignals.length > 6 || !value.observableSignals.every(validSignal) || value.prohibitions.length < 1 || !value.prohibitions.every(validProhibition)) return false;
+  const dimensionCategories = value.categories as ExperienceCategory[];
+  return value.observableSignals.every((signal) => dimensionCategories.includes(signal.kind)) && value.prohibitions.every((prohibition) => !prohibition.ruleAdapterId || dimensionCategories.some((category) => adapterAppliesTo(prohibition.ruleAdapterId!, category)));
+}
+
+function descriptorTainted(draft: InterpretationDraft, intent: ReadingExperienceIntent): boolean {
+  const semanticValues: string[] = [draft.synthesis.sharedCause, ...draft.synthesis.dimensionRoles];
+  for (const dimension of draft.dimensions) {
+    semanticValues.push(dimension.interpretation, ...dimension.observableSignals.map((signal) => signal.description), ...dimension.prohibitions.map((prohibition) => prohibition.description));
+    for (const signal of dimension.observableSignals) if (signal.semanticSlots) semanticValues.push(...Object.values(signal.semanticSlots).filter((value): value is string => typeof value === "string"));
+  }
+  const normalizedValues = semanticValues.map((value) => normalizedText(value).toLocaleLowerCase());
+  return intent.descriptors.some((descriptor) => {
+    const raw = normalizedText(descriptor.text).toLocaleLowerCase();
+    return normalizedValues.some((value) => {
+      if (raw.length > 1) return value.includes(raw);
+      for (let index = value.indexOf(raw); index >= 0; index = value.indexOf(raw, index + raw.length)) {
+        const before = index > 0 ? value[index - 1] : ""; const after = value[index + raw.length] ?? "";
+        if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
+      }
+      return false;
+    });
+  });
 }
 
 function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIntent): Validation {
@@ -200,6 +230,7 @@ function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIn
   if (dimensions.some((dimension, index) => normalizedText(dimension.descriptor) !== expected[index] || !Number.isFinite(dimension.confidence) || dimension.confidence < 0 || dimension.confidence > 1)) {
     return { ok: false, kind: "invalid_model_output" };
   }
+  if (descriptorTainted(draft as unknown as InterpretationDraft, intent)) return { ok: false, kind: "invalid_model_output" };
   if (dimensions.some((dimension) => normalizedText(dimension.interpretation).length < 8 || normalizedText(dimension.interpretation).length > 500 || dimension.confidence < 0.65)) {
     return { ok: false, kind: "domain", outcome: { status: "needs_resolution", code: "unknown_intent", message: "这组词的含义还不够明确，无法编译为可验证的阅读体验，请换一组词或补充说明。" } };
   }
@@ -265,7 +296,8 @@ function splitAndNormalizeDimensions(
   const duplicate = intent.descriptors[0].text === intent.descriptors[1].text;
   const primaryPolicy = cloneEvidencePolicy(drafts[0].observableSignals[0].verification);
   return drafts.map((draft, index) => {
-    const dimensionId = `dimension_${index + 1}_${stableToken(`${index}:${intent.descriptors[index].text}`)}`;
+    const semanticCore = { index, interpretation: normalizedText(draft.interpretation), categories: [...draft.categories], observableSignals: draft.observableSignals.map((signal) => ({ kind: signal.kind, description: normalizedText(signal.description), ...(signal.semanticSlots ? { semanticSlots: { ...signal.semanticSlots } } : {}), verification: signal.verification, persistence: signal.persistence })), prohibitions: draft.prohibitions.map((prohibition) => ({ kind: prohibition.kind, description: normalizedText(prohibition.description), severity: prohibition.severity, ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : {}) })), confidence: draft.confidence };
+    const dimensionId = `dimension_${index + 1}_${stableToken(semanticCore)}`;
     const splitCategory = alternativeCategory(draft.categories[0]);
     const secondaryRepeatedDimension = duplicate && index === 1;
     const secondaryPolicy = complementaryEvidencePolicy(primaryPolicy, splitCategory);
@@ -396,6 +428,6 @@ export async function compileExperience(request: CompileExperienceRequest, port:
   const dimensions = splitAndNormalizeDimensions(validation.dimensions, preflight.intent);
   const synthesis = solveSynthesis(dimensions, validation.synthesis);
   if (!synthesis.ok) return { ok: true, value: { status: "needs_resolution", code: "irreconcilable_intent", message: synthesis.message } };
-  const provenance = draft.value.provenance.map((item) => item.kind === "model" ? { ...item, version: `interpretation_${stableToken({ dimensions, synthesis: synthesis.value })}` } : item);
+  const provenance = draft.value.provenance.map((item) => item.kind === "model" ? { ...item, interpretationDigest: `interpretation_${stableToken({ dimensions, synthesis: synthesis.value })}` } : item);
   return { ok: true, value: { status: "ready", revision: freezeContractRevision(request, preflight.intent, dimensions, synthesis.value, provenance, now()) } };
 }
