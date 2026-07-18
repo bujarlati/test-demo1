@@ -143,10 +143,30 @@ test("zero-confidence claims and shared causes never produce evidence", async ()
     assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
   }
 });
+test("a generic shared action cannot bridge unrelated dimension effects", async () => {
+  const generic = anchor("Aria opens the sealed gate");
+  const consequence = anchor("the mechanism records her choice");
+  const input = fixture(async () => {
+    const value = verdict();
+    value.claims[0] = { ...value.claims[0], anchors: [generic, consequence], slotAnchorIndices: { actor: 0, action: 0, object: 0, outcome: 1 } };
+    value.claims[1] = { ...value.claims[1], anchors: [generic, anchor("At dusk Aria wins the duel"), anchor("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")] };
+    value.sharedCause = { eventId: "shared-event", supported: true, confidence: .9, anchors: [generic], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] };
+    return value;
+  });
+  const result = await assessExperience(input.request, input.deps);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.shared_cause_unsupported"), true); }
+});
 test("a fabricated judge quote never becomes evidence", async () => { const { request, deps } = fixture(async () => verdict({ claims: verdict().claims.map((claim, index) => index ? claim : { ...claim, anchors: [{ start: 0, end: 4, quote: "missing" }] }) })); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rewrite"); });
 test("ticket and authorization failures fail closed before a judge call", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const altered = { ...request, plan: { ...request.plan, chapterNumber: 9 } }; const result = await assessExperience(altered, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rejected"); assert.equal(calls, 0); });
 test("malformed or pre-versioned signed role payloads fail closed without invoking the judge", async () => {
-  for (const mutate of [(roles: any) => { delete roles.counterparts; }, (roles: any) => { delete roles.version; }]) {
+  for (const mutate of [
+    (roles: any) => { delete roles.counterparts; },
+    (roles: any) => { delete roles.version; },
+    (roles: any) => { roles.counterpartIds = [roles.protagonistId]; roles.counterparts = [{ id: roles.protagonistId, aliases: ["Guard"] }]; },
+    (roles: any) => { roles.counterparts[0].aliases = [" ＡRIA "]; },
+    (roles: any) => { roles.opponentIds = [roles.counterpartIds[0]]; roles.opponents = [{ id: roles.counterpartIds[0], aliases: ["Duelist"] }]; },
+  ]) {
     let calls = 0; const base = fixture(async () => { calls += 1; return verdict(); }); const unsigned = structuredClone(base.request.plan) as any; delete unsigned.authorizationMac; mutate(unsigned.roleBindings); const plan = { ...unsigned, authorizationMac: signExperiencePlan(unsigned, secret) };
     const result = await assessExperience({ ...base.request, plan }, base.deps);
     assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rejected"); assert.equal(calls, 0);
@@ -189,8 +209,11 @@ test("all five event categories are actually scheduled and locally verified", as
     const claim = { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: id, supported: true, confidence: .9, anchors, slotAnchorIndices, slots };
     const judged = async () => {
       const base = verdict();
-      base.sharedCause.anchors = [claim.anchors[0]]; (base.sharedCause as any).links[0] = { dimensionId: "d1", signalId: id, claimAnchorIndex: 0, sharedAnchorIndex: 0 };
-      base.claims[1] = { ...base.claims[1], anchors: [claim.anchors[0], claim.anchors[0].start < source.length / 3 ? anchor("At dusk") : anchor("The city guard lowers his spear"), base.claims[1].anchors[2]] };
+      const effectSlot = kind === "relationship" ? "reciprocalAction" : kind === "world_reaction" ? "reaction" : "outcome";
+      const sharedIndex = (claim.slotAnchorIndices as Record<string, number>)[effectSlot] ?? 0;
+      const sharedAnchor = claim.anchors[sharedIndex];
+      base.sharedCause.anchors = [sharedAnchor]; (base.sharedCause as any).links[0] = { dimensionId: "d1", signalId: id, claimAnchorIndex: sharedIndex, sharedAnchorIndex: 0 };
+      base.claims[1] = { ...base.claims[1], anchors: [sharedAnchor, sharedAnchor.start < source.length / 3 ? anchor("At dusk") : anchor("The city guard lowers his spear"), base.claims[1].anchors[2]] };
       if (kind === "relationship") {
         base.claims[2] = { ...base.claims[2], anchors: [base.claims[2].anchors[0], anchor("A spare, precise sentence"), base.claims[2].anchors[2]] };
       }
@@ -447,11 +470,7 @@ test("assessment atomically performs the first artifact binding and rejects bind
   assert.equal(rejected.ok, true); if (rejected.ok) assert.equal(rejected.value.status, "rejected"); assert.equal(calls, 0);
 });
 
-test("a tainted compiled contract never reaches the semantic judge while adapterless rules do", async () => {
-  let taintedCalls = 0; const tainted = fixture(async () => { taintedCalls++; return verdict(); }, (value) => { value.dimensions[0].interpretation = "opaque-a pasted into compiled semantics"; });
-  const rejected = await assessExperience(tainted.request, tainted.deps);
-  assert.equal(rejected.ok, true); if (rejected.ok) assert.equal(rejected.value.status, "rejected"); assert.equal(taintedCalls, 0);
-
+test("adapterless compiled rules remain available through the descriptor-free assessment projection", async () => {
   let captured: any; const adapterless = fixture(async (input) => { captured = input; return verdict(); }, (value) => { value.dimensions[0].prohibitions.push({ id: "semantic-only", dimensionId: "d1", kind: "invariant", description: "A concrete irreversible cost must remain after the choice.", severity: "rewrite" }); value.prohibitions.push(value.dimensions[0].prohibitions.at(-1)!); });
   const accepted = await assessExperience(adapterless.request, adapterless.deps);
   assert.equal(accepted.ok, true); if (accepted.ok) assert.equal(accepted.value.status, "accepted");
@@ -490,6 +509,28 @@ test("module scheduling and assessment perform first binding while permit consum
   statePort.mutate(plan.ticket.id, { artifactBindingId: plan.artifactBindingId });
   assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), true);
   assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
+});
+
+test("one module can schedule and assess contract B without reading factory contract A descriptors", async () => {
+  const base = fixture(); const statePort = new StrictAssessmentStatePort();
+  const decoy = contract();
+  Object.defineProperty(decoy.intent, "descriptors", { enumerable: true, configurable: true, get: () => { throw new Error("raw descriptors must remain compile-only"); } });
+  const module = createReadingExperienceModule({ ...base.deps, contract: decoy, statePort, interpretationPort: { interpret: async () => { throw new Error("unused"); } }, ticketTtlMs: 60_000, createTicketId: () => "contract-b-ticket" });
+  const plan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "contract-b-job", attempt: 1 });
+  assert.equal(JSON.stringify(plan.assessmentContract).includes("opaque-a"), false);
+  assert.equal(JSON.stringify(plan.assessmentContract).includes("opaque-b"), false);
+  statePort.register(plan.ticket.id, plan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  const result = await module.assess({ plan, artifact: base.request.artifact });
+  assert.equal(result.ok, true, JSON.stringify(result)); if (result.ok) assert.equal(result.value.status, "accepted", JSON.stringify(result.value));
+});
+
+test("a re-signed assessment projection with a stale immutable identity fails before judging", async () => {
+  let calls = 0; const base = fixture(async () => { calls += 1; return verdict(); });
+  const unsigned = structuredClone(base.request.plan) as any; delete unsigned.authorizationMac;
+  unsigned.assessmentContract.dimensions[0].observableSignals[0].description = "forged assessment semantics";
+  const plan = { ...unsigned, authorizationMac: signExperiencePlan(unsigned, secret) };
+  const result = await assessExperience({ ...base.request, plan }, base.deps);
+  assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rejected"); assert.equal(calls, 0);
 });
 
 test("a full repair uses a new draft binding and atomically prevents repair-token replay", async () => {

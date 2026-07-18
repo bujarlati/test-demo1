@@ -115,6 +115,19 @@ test("role bindings are versioned and reject identifier-only counterpart or oppo
   assert.throws(() => scheduleExperience(request({ roleBindings: { protagonistId: "protagonist-1", aliases: ["Aria"], opponentIds: ["opponent-1"] } }), deps), { code: "invalid_authorization_payload" });
 });
 
+test("role identities and normalized aliases are globally disjoint for every artifact kind", () => {
+  const attacks = [
+    { protagonistId: "protagonist-1", aliases: ["Aria"], counterpartIds: ["protagonist-1"], counterparts: [{ id: "protagonist-1", aliases: ["Guard"] }] },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], counterpartIds: ["other"], opponentIds: ["other"], counterparts: [{ id: "other", aliases: ["Guard"] }], opponents: [{ id: "other", aliases: ["Duelist"] }] },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], counterpartIds: ["guard"], counterparts: [{ id: "guard", aliases: [" ARIA "] }] },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], opponentIds: ["duelist"], opponents: [{ id: "duelist", aliases: ["Ａria"] }] },
+  ];
+  for (const roleBindings of attacks) {
+    assert.throws(() => scheduleExperience(request({ roleBindings }), deps), { code: "invalid_authorization_payload" });
+  }
+  assert.throws(() => scheduleExperience(request({ artifactKind: "blueprint", roleBindings: undefined }), deps), { code: "invalid_authorization_payload" });
+});
+
 test("hard presence cannot become debt while soft rolling promises can", () => {
   const plan = scheduleExperience(request({ chapterNumber: 5, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }) }), deps);
   assert.deepEqual(plan.hardPresencePromiseIds, ["hard-action", "hard-voice"]);

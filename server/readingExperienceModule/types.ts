@@ -7,6 +7,9 @@ import type {
   ExperienceDebtV2,
   ExperienceEvidenceV2,
   ExperienceLedgerV2,
+  ExperienceProhibition,
+  DeliveryPromiseV2,
+  ObservableSignalV2,
   ReadingExperienceIntent,
 } from "../../src/types";
 
@@ -150,6 +153,8 @@ export interface ScheduleExperienceRequest {
   roleBindings?: { version?: 1; protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
   chapterNumber?: number;
   repair?: { token: ExperienceRepairToken; expected: RepairTokenContext };
+  /** Optional legacy rewrite assertion. It never grants rewrite authority. */
+  failedRuleIds?: string[];
   jobId: string;
   attempt: number;
 }
@@ -169,6 +174,8 @@ export interface ExperienceStagePlan {
   roleBindings: { version: 1; protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[]; counterparts: Array<{ id: string; aliases: string[] }>; opponents: Array<{ id: string; aliases: string[] }> };
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
+  /** Descriptor-free, immutable semantics required by assessment. */
+  assessmentContract: AssessmentContractProjection;
   promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
   evidenceSchema: EvidencePolicy[];
   ruleAdapterIds: GenericRuleAdapterId[];
@@ -184,6 +191,18 @@ export interface ExperienceStagePlan {
   repairAuthorization?: { token: ExperienceRepairToken; expected: RepairTokenContext; tokenDigest: string };
   authorizationMac: string;
   ticket: ExperienceStageTicket;
+}
+
+export interface AssessmentContractProjection {
+  version: 1;
+  schemaVersion: 2;
+  contractRevisionId: string;
+  ruleGraphVersion: string;
+  synthesis: { sharedCause: string; dimensionRoles: [string, string] };
+  dimensions: Array<{ id: string; interpretation: string; observableSignals: ObservableSignalV2[]; prohibitions: ExperienceProhibition[] }>;
+  promises: DeliveryPromiseV2[];
+  prohibitions: ExperienceProhibition[];
+  identityHash: string;
 }
 
 export interface SchedulerDependencies {
@@ -298,8 +317,8 @@ export interface ExperiencePublicationPermit {
 export interface AssessorDependencies {
   ticketSecret: string;
   now: () => Date;
-  /** The immutable revision resolved from the signed ticket before assessment. */
-  contract: CompiledExperienceContractRevision;
+  /** @deprecated Assessment semantics are carried by the signed descriptor-free plan projection. */
+  contract?: CompiledExperienceContractRevision;
   semanticJudgePort: ExperienceSemanticJudgePort;
   statePort: AssessmentStatePort;
   repairTtlMs?: number;

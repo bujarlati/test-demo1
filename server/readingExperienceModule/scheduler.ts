@@ -1,5 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { CanonFactReferenceV2, DeliveryPromiseV2, ExperienceDimension, ObservableSignalV2 } from "../../src/types";
+import type { CanonFactReferenceV2, CompiledExperienceContractRevision, DeliveryPromiseV2, ExperienceDimension, ObservableSignalV2 } from "../../src/types";
 import type {
   ExperienceSchedulingErrorCode,
   ExperienceStage,
@@ -11,8 +11,10 @@ import type {
   GenericRuleAdapterId,
   LedgerEvidenceBinding,
   ExperiencePublicationPermit,
+  AssessmentContractProjection,
 } from "./types";
 import { isRuleAdapterId } from "./ruleAdapters";
+import { normalizeRoleBindings, validTrustedRoleBindings } from "./roles";
 
 const ticketSeparator = "\u001f";
 
@@ -93,6 +95,19 @@ export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizatio
   return createHmac("sha256", secret).update(canonicalAuthorizationPayload(plan)).digest("base64url");
 }
 
+export function assessmentContractIdentity(value: Omit<AssessmentContractProjection, "identityHash">): string {
+  return createHash("sha256").update("reading-experience:assessment-contract:v1").update("\u001f").update(canonicalAuthorizationPayload(value)).digest("base64url");
+}
+
+export function contractRevisionId(body: Omit<CompiledExperienceContractRevision, "id">): string {
+  const digest = createHash("sha256").update("reading-experience:contract-revision:v2").update("\u001f").update(canonicalAuthorizationPayload(body)).digest("base64url").slice(0, 22);
+  return `experience_revision_${body.revision}_${digest}`;
+}
+
+export function contractRevisionIdentityMatches(contract: CompiledExperienceContractRevision): boolean {
+  try { const { id, ...body } = contract; return id === contractRevisionId(body); } catch { return false; }
+}
+
 export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceBindings: LedgerEvidenceBinding[], authorizedPatchHash: string, publicationPermit: ExperiencePublicationPermit, secret: string): string {
   return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit })).digest("base64url");
 }
@@ -126,6 +141,7 @@ function chapterNumber(request: ScheduleExperienceRequest): number {
 export function assertScheduleCompatibility(request: ScheduleExperienceRequest): void {
   const chapter = chapterNumber(request);
   const { activation, contract, ledger, canon } = request;
+  if ((contract.id.startsWith("experience_revision_") || contract.provenance.length > 0) && !contractRevisionIdentityMatches(contract)) throw new ExperienceSchedulingError("contract_mismatch");
   if (activation.contractRevisionId !== contract.id || ledger.contractRevisionId !== contract.id) throw new ExperienceSchedulingError("contract_mismatch");
   if (ledger.activationId !== activation.id) throw new ExperienceSchedulingError("activation_mismatch");
   if (activation.branchId !== ledger.branchId || canon.branchId !== activation.branchId) throw new ExperienceSchedulingError("branch_mismatch");
@@ -224,32 +240,11 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-function roleBindingsFor(request: ScheduleExperienceRequest): ExperienceStagePlan["roleBindings"] {
-  return {
-    version: 1,
-    protagonistId: request.roleBindings?.protagonistId ?? "",
-    aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
-    counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [],
-    opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [],
-    counterparts: request.roleBindings?.counterparts ? request.roleBindings.counterparts.map((item) => ({ id: item.id, aliases: [...item.aliases] })) : [],
-    opponents: request.roleBindings?.opponents ? request.roleBindings.opponents.map((item) => ({ id: item.id, aliases: [...item.aliases] })) : [],
-  };
-}
-
-function validRoleBindings(roles: ExperienceStagePlan["roleBindings"]): boolean {
-  const validEntities = (entities: Array<{ id: string; aliases: string[] }>, ids: string[]) => entities.every((item) => !!item.id.trim() && item.aliases.length > 0 && item.aliases.every((alias) => !!alias.trim()) && new Set(item.aliases.map((alias) => alias.toLocaleLowerCase())).size === item.aliases.length) && new Set(entities.map((item) => item.id)).size === entities.length && [...ids].sort().join("|") === entities.map((item) => item.id).sort().join("|");
-  return roles.version === 1 && !!roles.protagonistId.trim() && roles.aliases.length > 0 && roles.aliases.every((alias) => !!alias.trim()) && validEntities(roles.counterparts, roles.counterpartIds) && validEntities(roles.opponents, roles.opponentIds);
-}
-
 function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
-  const roles = roleBindingsFor(request);
+  const roles = normalizeRoleBindings(request.roleBindings);
   if (request.roleBindings?.version !== undefined && request.roleBindings.version !== 1) throw new ExperienceSchedulingError("invalid_authorization_payload");
-  if (request.artifactKind !== "blueprint") {
-    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !validRoleBindings(roles)) throw new ExperienceSchedulingError("invalid_authorization_payload");
-  } else if (request.roleBindings && !validRoleBindings(roles)) {
-    throw new ExperienceSchedulingError("invalid_authorization_payload");
-  }
+  if (!validTrustedRoleBindings(roles) || (request.artifactKind !== "blueprint" && (!request.chapterId?.trim() || !request.revisionId?.trim()))) throw new ExperienceSchedulingError("invalid_authorization_payload");
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
   const hard = activeHardPresence(request, chapter);
@@ -299,6 +294,24 @@ function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDepe
     roleBindings: roles,
     stage,
     artifactKind: request.artifactKind,
+    assessmentContract: (() => {
+      const body: Omit<AssessmentContractProjection, "identityHash"> = {
+        version: 1,
+        schemaVersion: request.contract.schemaVersion,
+        contractRevisionId: request.contract.id,
+        ruleGraphVersion: request.contract.ruleGraphVersion,
+        synthesis: structuredClone(request.contract.synthesis),
+        dimensions: request.contract.dimensions.map((dimension) => ({
+          id: dimension.id,
+          interpretation: dimension.interpretation,
+          observableSignals: dimension.observableSignals.map((signal) => ({ id: signal.id, dimensionId: signal.dimensionId, kind: signal.kind, description: signal.description, ...(signal.semanticSlots ? { semanticSlots: { ...signal.semanticSlots } } : {}), verification: structuredClone(signal.verification), persistence: signal.persistence })),
+          prohibitions: dimension.prohibitions.map((prohibition) => ({ id: prohibition.id, dimensionId: prohibition.dimensionId, kind: prohibition.kind, description: prohibition.description, severity: prohibition.severity, ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : {}) })),
+        })),
+        promises: request.contract.promises.map((promise) => ({ id: promise.id, dimensionId: promise.dimensionId, scope: structuredClone(promise.scope), hardness: promise.hardness, minimumSignals: promise.minimumSignals, carryRuleIds: [...promise.carryRuleIds], ...(promise.compensationWindow !== undefined ? { compensationWindow: promise.compensationWindow } : {}) })),
+        prohibitions: request.contract.prohibitions.map((prohibition) => ({ id: prohibition.id, dimensionId: prohibition.dimensionId, kind: prohibition.kind, description: prohibition.description, severity: prohibition.severity, ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : {}) })),
+      };
+      return { ...body, identityHash: assessmentContractIdentity(body) };
+    })(),
     promptProjection: {
       dimensions: dimensions.map(({ selected, ...projection }) => projection),
       prohibitions: request.contract.prohibitions.map((prohibition) => prohibition.description),
@@ -335,7 +348,7 @@ function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDepe
   const repair = request.repair!; const token = repair.token; const { signature, ...unsigned } = token;
   void signature; void unsigned;
   if (!verifyRepairAuthorization(token, repair.expected, deps.ticketSecret, deps.now())) throw new ExperienceSchedulingError("plan_mismatch");
-  const requestRoles = roleBindingsFor(request);
+  const requestRoles = normalizeRoleBindings(request.roleBindings);
   if (request.attempt !== token.attempt + 1 || request.jobId !== token.jobId || request.contract.id !== token.contractRevisionId || request.contract.ruleGraphVersion !== token.ruleGraphVersion || request.activation.id !== token.activationId || request.canon.branchId !== token.branchId || request.canon.canonVersion !== token.expectedCanonVersion || request.ledger.revision !== token.ledgerRevision || request.artifactKind !== token.artifactKind || chapterNumber(request) !== token.chapterNumber || canonicalAuthorizationPayload(requestRoles) !== canonicalAuthorizationPayload(token.roleBindings) || request.artifactBindingId === token.artifactBindingId || request.expectedArtifactDigest === token.artifactHash || (token.artifactKind !== "blueprint" && (request.chapterId !== token.chapterId || request.revisionId !== token.revisionId))) throw new ExperienceSchedulingError("plan_mismatch");
   // Scheduling is a pure synchronous operation.  The authorization is carried
   // by the signed plan and consumed in the assessment CAS.
@@ -345,6 +358,13 @@ function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDepe
 }
 
 export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+  if (request.failedRuleIds !== undefined) {
+    if (!Array.isArray(request.failedRuleIds) || request.failedRuleIds.some((id) => typeof id !== "string" || !id.trim())) throw new ExperienceSchedulingError("plan_mismatch");
+    const canonical = [...new Set(request.failedRuleIds)].sort();
+    if (canonicalAuthorizationPayload(request.failedRuleIds) !== canonicalAuthorizationPayload(canonical)) throw new ExperienceSchedulingError("plan_mismatch");
+    if (!request.repair && canonical.length > 0) throw new ExperienceSchedulingError("plan_mismatch");
+    if (request.repair && canonicalAuthorizationPayload(canonical) !== canonicalAuthorizationPayload([...new Set(request.repair.token.failedRuleIds)].sort())) throw new ExperienceSchedulingError("plan_mismatch");
+  }
   if (request.repair) return authorizeRepair(request, deps);
   if (request.stage === "rewrite") throw new ExperienceSchedulingError("invalid_stage");
   return scheduleTrusted(request, deps);

@@ -68,6 +68,18 @@ test("rewrite scheduling carries a valid repair token into a fresh synchronous p
   assert.equal(prematureConsumes, 0);
 });
 
+test("failedRuleIds is a compatibility assertion, never a rewrite authorization", () => {
+  assert.throws(() => scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, failedRuleIds: ["evidence.not_realized"], jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 }), { code: "plan_mismatch" });
+
+  const token = signedRepair();
+  const expected = { ticketId: token.ticketId, jobId: token.jobId, attempt: token.attempt, contractRevisionId: token.contractRevisionId, activationId: token.activationId, branchId: token.branchId, stage: token.stage, artifactKind: token.artifactKind, ruleGraphVersion: token.ruleGraphVersion, expectedCanonVersion: token.expectedCanonVersion, ledgerRevision: token.ledgerRevision, chapterNumber: token.chapterNumber, chapterId: token.chapterId!, revisionId: token.revisionId!, artifactBindingId: token.artifactBindingId, roleBindings: token.roleBindings, artifactHash: token.artifactHash, failedRuleIds: token.failedRuleIds };
+  const base = { contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter" as const, chapterId: "c", revisionId: "v", artifactBindingId: "new-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, repair: { token, expected }, jobId: "j", attempt: 2 };
+  const deps = { now, ticketSecret: "s", ticketTtlMs: 60_000 };
+  assert.deepEqual(scheduleExperience({ ...base, failedRuleIds: ["evidence.not_realized"] }, deps).repairRuleIds, ["evidence.not_realized"]);
+  assert.throws(() => scheduleExperience({ ...base, failedRuleIds: ["different-rule"] }, deps), { code: "plan_mismatch" });
+  assert.throws(() => scheduleExperience({ ...base, failedRuleIds: ["evidence.not_realized", "evidence.not_realized"] }, deps), { code: "plan_mismatch" });
+});
+
 test("deterministic modality adapters reject unrealized events but allow explicit realization reversals", () => {
   const unrealized: Array<[any, string]> = [
     ["event-negated", "Aria did not open the gate."],

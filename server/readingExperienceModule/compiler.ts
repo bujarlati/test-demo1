@@ -8,7 +8,7 @@ import type {
   ReadingExperienceIntent,
 } from "../../src/types";
 import { createHash } from "node:crypto";
-import { canonicalAuthorizationPayload } from "./scheduler";
+import { canonicalAuthorizationPayload, contractRevisionId } from "./scheduler";
 import { adapterAppliesTo, curatedInterpretation, curatedSynthesis, evidencePolicyFor, isRuleAdapterId } from "./ruleAdapters";
 import type {
   CompileExperienceRequest,
@@ -398,9 +398,7 @@ function freezeContractRevision(
     minimumSignals: 1,
     carryRuleIds: dimension.observableSignals.filter((signal) => signal.persistence === "cross_chapter" || signal.persistence === "whole_story").map((signal) => signal.id),
   }));
-  const semanticIdentity = { intent, context: request.context, requestedRevision: request.requestedRevision, parentRevisionId: request.parentRevisionId, dimensions, synthesis, promises, provenance };
-  return deepFreeze({
-    id: `experience_revision_${request.requestedRevision}_${stableToken(semanticIdentity)}`,
+  const body: Omit<CompiledExperienceContractRevision, "id"> = {
     schemaVersion: 2,
     revision: request.requestedRevision,
     parentRevisionId: request.parentRevisionId,
@@ -412,7 +410,8 @@ function freezeContractRevision(
     ruleGraphVersion: "reading-experience-v2-rules-1",
     provenance,
     createdAt: createdAt.toISOString(),
-  });
+  };
+  return deepFreeze({ id: contractRevisionId(body), ...body });
 }
 
 export async function compileExperience(request: CompileExperienceRequest, port: ExperienceInterpretationPort, now: () => Date): Promise<ExperienceOperationResult<CompileOutcome>> {

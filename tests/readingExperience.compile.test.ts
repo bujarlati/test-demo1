@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { compileExperience } from "../server/readingExperienceModule/compiler";
 import { evidencePolicyFor } from "../server/readingExperienceModule/ruleAdapters";
+import { contractRevisionIdentityMatches, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import type { InterpretationDraft } from "../server/readingExperienceModule/types";
 import type { ExperienceCategory } from "../src/types";
 import { scriptedExperiencePorts } from "./fixtures/readingExperienceFixtures";
@@ -246,6 +247,21 @@ test("contract ids use a canonical cryptographic semantic digest", async () => {
   assert.equal(left.ok && left.value.status, "ready"); assert.equal(right.ok && right.value.status, "ready"); assert.equal(repeat.ok && repeat.value.status, "ready");
   if (!left.ok || left.value.status !== "ready" || !right.ok || right.value.status !== "ready" || !repeat.ok || repeat.value.status !== "ready") return;
   assert.notEqual(left.value.revision.id, right.value.revision.id); assert.equal(left.value.revision.id, repeat.value.revision.id);
+});
+
+test("contract revision identity is recomputable from persisted fields and scheduling rejects body forgery", async () => {
+  const { deps } = scriptedExperiencePorts();
+  const result = await compileExperience({ intent: { descriptors: [{ text: "3i3g2tzogf" }, { text: "fixed" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "identity" }, deps.interpretationPort, deps.now);
+  assert.equal(result.ok && result.value.status, "ready"); if (!result.ok || result.value.status !== "ready") return;
+  const revision = result.value.revision;
+  assert.equal(contractRevisionIdentityMatches(revision), true);
+  const activation = { id: "activation", contractRevisionId: revision.id, branchId: "main", effectiveFromChapter: 1, effectiveFromCanonVersion: 1, effectiveThroughCanonVersion: null, activatedAt: deps.now().toISOString() };
+  const ledger = { contractRevisionId: revision.id, activationId: activation.id, revision: 1, branchId: "main", throughCanonVersion: 1, dimensions: revision.dimensions.map((dimension) => ({ dimensionId: dimension.id, lastDeliveredChapter: 0, silentChapters: 0, deliveredSignalIds: [], persistentResults: [], debts: [] })), evidenceIds: [], promiseStates: [], consumedTicketIds: [], history: [] };
+  const request = { contract: revision, activation, ledger, canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter" as const, chapterId: "chapter", revisionId: "draft", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "identity", attempt: 1 };
+  assert.doesNotThrow(() => scheduleExperience(request, { now: deps.now, ticketSecret: "secret", ticketTtlMs: 60_000 }));
+  const forged = structuredClone(revision); forged.dimensions[0].interpretation += " forged";
+  assert.equal(contractRevisionIdentityMatches(forged), false);
+  assert.throws(() => scheduleExperience({ ...request, contract: forged }, { now: deps.now, ticketSecret: "secret", ticketTtlMs: 60_000 }), { code: "contract_mismatch" });
 });
 
 test("compile rejects descriptor taint on every judge-reachable semantic surface", async () => {
