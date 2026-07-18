@@ -9,6 +9,7 @@ import type {
   ExperienceLedgerV2,
   ExperienceProhibition,
   DeliveryPromiseV2,
+  DistributionFacetId,
   ObservableSignalV2,
   ReadingExperienceIntent,
 } from "../../src/types";
@@ -88,8 +89,8 @@ export interface SemanticEvidenceClaim {
   slotAnchorIndices: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", number>>;
   slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", string>>;
   metrics?: Record<string, number>;
-  /** Judge-typed pacing facets; every index addresses this claim's grounded anchors. */
-  distributionAnchorIndices?: Partial<Record<"goal" | "pressure" | "beat" | "turn", number[]>>;
+  /** Judge-typed distribution facets; every index addresses this claim's grounded anchors. */
+  distributionAnchorIndices?: Partial<Record<DistributionFacetId, number[]>>;
 }
 
 export interface SemanticEvidenceCase {
@@ -150,7 +151,7 @@ export interface ScheduleExperienceRequest {
   /** Digest of the pre-approved output manifest, when a producer has one. */
   expectedArtifactDigest?: string;
   artifactBindingId?: string;
-  roleBindings?: { version?: 1; protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
+  roleBindings: { version?: 1; protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
   chapterNumber?: number;
   repair?: { token: ExperienceRepairToken; expected: RepairTokenContext };
   /** Optional legacy rewrite assertion. It never grants rewrite authority. */

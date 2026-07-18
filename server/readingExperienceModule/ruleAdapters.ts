@@ -89,8 +89,8 @@ function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
 
 function verificationFor(category: ExperienceCategory): EvidencePolicy {
   if (category === "relationship") return cloneEvidencePolicy(relationshipVerification);
-  if (category === "voice") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1 } };
-  if (category === "pacing") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "beat_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, scene_coverage: 1, beat_density: 0.25, turn_position: 0.55 } };
+  if (category === "voice") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency", "abstraction_coverage", "sensory_coverage", "rhetoric_coverage"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1, abstraction_coverage: 0.12, sensory_coverage: 0.12, rhetoric_coverage: 0.12 } };
+  if (category === "pacing") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "event_density", "pressure_window", "paragraph_length_density", "sentence_length_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, scene_coverage: 1, event_density: 0.15, pressure_window: 0.2, paragraph_length_density: 0.5, sentence_length_density: 0.5, turn_position: 0.55 } };
   return cloneEvidencePolicy(eventVerificationByCategory[category]);
 }
 

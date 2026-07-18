@@ -41,7 +41,7 @@ function anchor(text: string) { const start = source.indexOf(text); return { sta
 function verdict(overrides: Partial<SemanticVerdict> = {}): SemanticVerdict { const claims = [
   { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: "mechanic", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice.")], slotAnchorIndices: { actor: 0, action: 0, object: 0, outcome: 0 }, slots: { actor: "Aria", action: "opens", object: "gate", outcome: "records" } },
   { version: 1 as const, eventId: "shared-event", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice."), anchor("At dusk Aria wins the duel"), anchor("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
-  { version: 1 as const, eventId: "pacing-event", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [anchor("Chapter title"), anchor("A spare, precise sentence"), anchor("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
+  { version: 1 as const, eventId: "pacing-event", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [anchor("The city guard lowers his spear"), anchor("A spare, precise sentence"), anchor("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
 ]; return { version: 1, claims, sharedCause: { eventId: "shared-event", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice.")], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } as any, ...overrides }; }
 function fixture(judge: AssessorDependencies["semanticJudgePort"]["judge"] = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
 function blueprintVerdict(plan: AssessExperienceRequest["plan"]): any {
@@ -100,7 +100,7 @@ test("event modality checks the containing clause even when judge anchors crop o
   const semantic: SemanticVerdict = { version: 1, claims: [
     { version: 1, eventId: "cropped", dimensionId: "d1", signalId: "mechanic", supported: true, confidence: .9, anchors: [at("Aria"), action], slotAnchorIndices: { actor: 0, action: 1, object: 1, outcome: 1 }, slots: { actor: "Aria", action: "open", object: "gate", outcome: "records" } },
     { version: 1, eventId: "cropped", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [action, at("At dusk Aria wins the duel"), at("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
-    { version: 1, eventId: "pace", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [at("Chapter title"), at("A spare, precise sentence"), at("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
+    { version: 1, eventId: "pace", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [at("The city guard lowers his spear"), at("A spare, precise sentence"), at("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
   ], sharedCause: { eventId: "cropped", supported: true, confidence: .9, anchors: [action], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 1, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } };
   const digest = hashArtifact(artifact);
   const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v-cropped", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-cropped", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-cropped" });
@@ -117,7 +117,7 @@ test("one whole-sentence anchor cannot assign another actor's realization to eve
     const judged = verdict();
     judged.claims[0] = { ...judged.claims[0], anchors: [locate(sentence)], slotAnchorIndices: { actor: 0, action: 0, object: 0, outcome: 0 }, slots: { actor: "Aria", action: "opened", object: "gate", outcome: "opened" } };
     judged.claims[1] = { ...judged.claims[1], anchors: [locate(sentence), locate("At dusk Aria wins the duel"), locate("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")] };
-    judged.claims[2] = { ...judged.claims[2], anchors: [locate("Chapter title"), locate("A spare, precise sentence"), locate("At dawn the rhythm turns with a clear new action.")] };
+    judged.claims[2] = { ...judged.claims[2], anchors: [locate("The city guard lowers his spear"), locate("A spare, precise sentence"), locate("At dawn the rhythm turns with a clear new action.")] };
     judged.sharedCause.anchors = [locate(sentence)];
     return judged;
   }, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "mechanic"); });
@@ -191,11 +191,31 @@ test("invalid schema, unavailable model, distribution failure, and stale tickets
   let calls = 0; const stale = fixture(async () => { calls++; return verdict(); }); const expired = { ...stale.request.plan.ticket, expiresAt: "2026-07-16T00:00:00.000Z" }; const signedExpired = { ...expired, signature: signExperienceStageTicket(expired, secret) }; const unsigned = { ...stale.request.plan, ticket: signedExpired }; const expiredPlan = { ...unsigned, authorizationMac: signExperiencePlan(unsigned, secret) }; const expiredResult = await assessExperience({ ...stale.request, plan: expiredPlan }, stale.deps); assert.equal(expiredResult.ok, true); if (!expiredResult.ok) return assert.fail(); assert.equal(expiredResult.value.status, "rejected"); assert.equal(calls, 0);
 });
 
+test("real chapter and blueprint deadlines abort a pending judge once without consuming authorization", async () => {
+  for (const artifactKind of ["chapter", "blueprint"] as const) {
+    let aborts = 0; let initiallyAborted: boolean | undefined;
+    const pendingJudge: AssessorDependencies["semanticJudgePort"]["judge"] = async (_input, options) => new Promise((_resolve) => {
+      initiallyAborted = options?.signal.aborted;
+      options?.signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
+    });
+    const base = fixture(pendingJudge); let request = base.request;
+    if (artifactKind === "blueprint") {
+      const plan = scheduleExperience({ contract: base.deps.contract!, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "deadline-blueprint", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "deadline-blueprint-ticket" });
+      request = { plan, artifact: { kind: "blueprint", value: blueprintValue(plan) } };
+      base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = null;
+    }
+    const started = Date.now(); const result = await assessExperience(request, { ...base.deps, judgeTimeoutMs: 25 }); const elapsed = Date.now() - started;
+    assert.equal(result.ok, false, artifactKind); if (!result.ok) assert.equal(result.error.code, "model_unavailable");
+    assert.equal(initiallyAborted, false, artifactKind); assert.equal(aborts, 1, artifactKind); assert.equal(elapsed >= 15 && elapsed < 1_000, true, `${artifactKind}:${elapsed}`);
+    assert.deepEqual(base.state.consumedTicketIds, []); assert.deepEqual(base.state.existingEvidenceIds, []);
+  }
+});
+
 test("judge receives compiled semantics, shared cause and canon references without raw descriptors", async () => {
   let captured: any; const { request, deps } = fixture(async (input) => { captured = input; return verdict(); }); const result = await assessExperience(request, deps); assert.equal(result.ok, true); assert.equal(captured.synthesis.sharedCause, "opaque"); assert.equal(captured.signals[0].interpretation, "opaque"); assert.equal(captured.signals[0].description, "opaque"); assert.deepEqual(captured.signals[0].canonFactReferences, []); const wire = JSON.stringify(captured); assert.equal(wire.includes("opaque-a"), false); assert.equal(wire.includes("opaque-b"), false); assert.equal(Object.isFrozen(captured), true);
 });
 
-test("all five event categories are actually scheduled and locally verified", async () => {
+test("all five event categories cover positive, exact-confidence boundary, and negative evidence", async () => {
   const rows: Array<[string, any, any, any[]]> = [
     ["mechanic", { kind: "event_slots", requiredSlots: ["actor", "action", "object", "outcome"], minimumAnchors: 1 }, { actor: "Aria", action: "opens", object: "gate", outcome: "records" }, [anchor("Aria opens the sealed gate and the mechanism records her choice.")]],
     ["protagonist_action", { kind: "event_slots", requiredSlots: ["actor", "action", "object", "outcome"], minimumAnchors: 1 }, { actor: "Aria", action: "opens", object: "gate", outcome: "records" }, [anchor("Aria opens the sealed gate and the mechanism records her choice.")]],
@@ -206,21 +226,29 @@ test("all five event categories are actually scheduled and locally verified", as
   for (const [kind, policy, slots, anchors] of rows) {
     const id = `scheduled-${kind}`;
     const slotAnchorIndices = Object.fromEntries(Object.keys(slots).filter((slot) => !slot.endsWith("Id")).map((slot) => { const found = anchors.findIndex((item) => item.quote.includes(slots[slot].split(" ").at(-1))); return [slot, found < 0 ? 0 : found]; }));
-    const claim = { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: id, supported: true, confidence: .9, anchors, slotAnchorIndices, slots };
-    const judged = async () => {
-      const base = verdict();
-      const effectSlot = kind === "relationship" ? "reciprocalAction" : kind === "world_reaction" ? "reaction" : "outcome";
-      const sharedIndex = (claim.slotAnchorIndices as Record<string, number>)[effectSlot] ?? 0;
-      const sharedAnchor = claim.anchors[sharedIndex];
-      base.sharedCause.anchors = [sharedAnchor]; (base.sharedCause as any).links[0] = { dimensionId: "d1", signalId: id, claimAnchorIndex: sharedIndex, sharedAnchorIndex: 0 };
-      base.claims[1] = { ...base.claims[1], anchors: [sharedAnchor, sharedAnchor.start < source.length / 3 ? anchor("At dusk") : anchor("The city guard lowers his spear"), base.claims[1].anchors[2]] };
-      if (kind === "relationship") {
-        base.claims[2] = { ...base.claims[2], anchors: [base.claims[2].anchors[0], anchor("A spare, precise sentence"), base.claims[2].anchors[2]] };
-      }
-      return { ...base, claims: [claim, ...base.claims.slice(1)] };
-    };
-    const { request, deps } = fixture(judged, (c) => { c.dimensions[0].observableSignals = [{ id, dimensionId: "d1", kind: kind as any, description: "scheduled concrete event", semanticSlots: kind === "world_reaction" || kind === "relationship" ? undefined : { actor: "Aria" }, verification: policy, persistence: kind === "relationship" || kind === "mechanic" ? "cross_chapter" : "chapter" }]; });
-    const result = await assessExperience(request, deps); assert.equal(result.ok, true, kind); if (!result.ok) continue; assert.equal(result.value.status, "accepted", `${kind}:${JSON.stringify(result.value)}`);
+    for (const [caseName, confidence, expectedStatus] of [["positive", .9, "accepted"], ["boundary", .65, "accepted"], ["negative", .649, "rewrite"]] as const) {
+      const claim = { version: 1 as const, eventId: "shared-event", dimensionId: "d1", signalId: id, supported: true, confidence, anchors, slotAnchorIndices, slots };
+      const judged = async () => {
+        const base = verdict();
+        const effectSlot = kind === "relationship" ? "reciprocalAction" : kind === "world_reaction" ? "reaction" : "outcome";
+        const sharedIndex = (claim.slotAnchorIndices as Record<string, number>)[effectSlot] ?? 0;
+        const sharedAnchor = claim.anchors[sharedIndex];
+        base.sharedCause.anchors = [sharedAnchor]; (base.sharedCause as any).links[0] = { dimensionId: "d1", signalId: id, claimAnchorIndex: sharedIndex, sharedAnchorIndex: 0 };
+        base.claims[1] = { ...base.claims[1], anchors: [sharedAnchor, sharedAnchor.start < source.length / 3 ? anchor("At dusk") : anchor("Aria opens the sealed gate"), base.claims[1].anchors[2]] };
+        if (kind === "relationship") base.claims[2] = { ...base.claims[2], anchors: [anchor("Aria opens the sealed gate"), anchor("A spare, precise sentence"), base.claims[2].anchors[2]] };
+        return { ...base, claims: [claim, ...base.claims.slice(1)] };
+      };
+      const { request, deps } = fixture(judged, (c) => { c.dimensions[0].observableSignals = [{ id, dimensionId: "d1", kind: kind as any, description: "scheduled concrete event", semanticSlots: kind === "world_reaction" || kind === "relationship" ? undefined : { actor: "Aria" }, verification: policy, persistence: kind === "relationship" || kind === "mechanic" ? "cross_chapter" : "chapter" }]; });
+      const result = await assessExperience(request, deps); assert.equal(result.ok, true, `${kind}:${caseName}`); if (!result.ok) continue; assert.equal(result.value.status, expectedStatus, `${kind}:${caseName}:${JSON.stringify(result.value)}`);
+    }
+  }
+});
+
+test("voice and pacing cover positive, exact-confidence boundary, and negative evidence", async () => {
+  for (const signalId of ["voice", "pacing"] as const) for (const [caseName, confidence, expectedStatus] of [["positive", .9, "accepted"], ["boundary", .65, "accepted"], ["negative", .649, "rewrite"]] as const) {
+    const input = fixture(async () => { const value = verdict(); value.claims = value.claims.map((claim) => claim.signalId === signalId ? { ...claim, confidence } : claim); return value; });
+    const result = await assessExperience(input.request, input.deps);
+    assert.equal(result.ok, true, `${signalId}:${caseName}`); if (result.ok) assert.equal(result.value.status, expectedStatus, `${signalId}:${caseName}:${JSON.stringify(result.value)}`);
   }
 });
 

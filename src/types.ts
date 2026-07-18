@@ -323,7 +323,8 @@ export interface ReadingExperienceIntent {
 }
 
 export type ExperienceCategory = "mechanic" | "protagonist_action" | "conflict_outcome" | "world_reaction" | "relationship" | "pacing" | "voice";
-export type DistributionMetricId = "anchor_spread" | "scene_coverage" | "paragraph_consistency" | "beat_density" | "turn_position";
+export type DistributionMetricId = "anchor_spread" | "scene_coverage" | "paragraph_consistency" | "beat_density" | "turn_position" | "abstraction_coverage" | "sensory_coverage" | "rhetoric_coverage" | "event_density" | "pressure_window" | "paragraph_length_density" | "sentence_length_density";
+export type DistributionFacetId = "goal" | "pressure" | "beat" | "turn" | "abstraction" | "sensory" | "rhetoric";
 
 export type EvidencePolicy =
   | { kind: "event_slots"; requiredSlots: Array<"actor" | "action" | "object" | "outcome" | "reaction">; minimumAnchors: number }
@@ -442,7 +443,7 @@ export interface ExperienceEvidenceV2 {
   chapterRevisionId: string;
   sourceHash: string;
   anchors: TextAnchorV2[];
-  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; slotAnchors?: Record<string, TextAnchorV2>; distributionMetrics?: Record<string, number>; distributionFacetAnchors?: Partial<Record<"goal" | "pressure" | "beat" | "turn", TextAnchorV2[]>> };
+  observation: { actor?: string; action?: string; object?: string; feedback?: string; outcome?: string; reaction?: string; reciprocalAction?: string; relationshipOrStateChange?: string; slots?: Record<string, string>; slotAnchors?: Record<string, TextAnchorV2>; distributionMetrics?: Record<string, number>; distributionFacetAnchors?: Partial<Record<DistributionFacetId, TextAnchorV2[]>> };
   confidence: number;
   status: "supported" | "insufficient" | "contradicted";
 }

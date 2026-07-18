@@ -5,7 +5,7 @@ import { hashArtifact, groundClaim, sourceForArtifact } from "../server/readingE
 import { canonicalAuthorizationPayload, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import type { ExperienceRepairToken } from "../server/readingExperienceModule/types";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
-import { adapterAppliesTo, runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
+import { adapterAppliesTo, evidencePolicyFor, runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
 
 const now = () => new Date("2026-07-18T00:00:00.000Z");
 
@@ -148,4 +148,51 @@ test("long prose does not rescue voice anchors clustered at the opening", () => 
   const signal = { id: "voice", dimensionId: "d", verification: { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: .35, scene_coverage: 1, paragraph_consistency: .1 } } } as any;
   const result = groundClaim(source, { version: 1, eventId: "voice", dimensionId: "d", signalId: "voice", supported: true, confidence: 1, anchors: [anchor(0), anchor(1), anchor(2)], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, paragraph_consistency: 1 } }, signal);
   assert.deepEqual(result, { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
+});
+
+test("voice evidence requires body-wide abstraction, sensory, and rhetoric facets and never counts the title", () => {
+  const title = "Abstract sensory rhetoric title";
+  const paragraphs = [
+    "A concrete choice establishes the opening idea.",
+    "The corridor keeps a measured narrative cadence.",
+    "Cold iron bites her palm and smoke stings her eyes.",
+    "The consequence becomes a question of duty and cost.",
+    "A repeated image returns with deliberate contrast.",
+    "What was a locked door becomes a verdict on the city.",
+  ];
+  const source = `${title}\n${paragraphs.join("\n")}`; const bodyStart = title.length + 1;
+  const at = (quote: string) => ({ start: source.indexOf(quote), end: source.indexOf(quote) + quote.length, quote });
+  const policy = evidencePolicyFor("voice"); const signal = { id: "voice", dimensionId: "d", verification: policy } as any;
+  const anchors = [at(paragraphs[0]), at(paragraphs[2]), at(paragraphs[5])];
+  const claim: any = { version: 1, eventId: "voice", dimensionId: "d", signalId: "voice", supported: true, confidence: 1, anchors, slotAnchorIndices: {}, metrics: Object.fromEntries(policy.kind === "distribution" ? policy.metricIds.map((id) => [id, 1]) : []), distributionAnchorIndices: { abstraction: [0], sensory: [1], rhetoric: [2] } };
+  assert.equal("ruleId" in groundClaim(source, claim, signal, { bodyStart }), false);
+  const titleAttack = { ...claim, anchors: [at(title), anchors[1], anchors[2]], distributionAnchorIndices: { abstraction: [0], sensory: [1], rhetoric: [2] } };
+  assert.deepEqual(groundClaim(source, titleAttack, signal, { bodyStart }), { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
+  const padded = `${source}\n${Array.from({ length: 18 }, (_, index) => `Neutral padding paragraph ${index} repeats an unrelated statement.`).join("\n")}`;
+  assert.deepEqual(groundClaim(padded, claim, signal, { bodyStart }), { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
+});
+
+test("pacing evidence uses whole-body event density, pressure window, and length density", () => {
+  const title = "Fast title";
+  const paragraphs = [
+    "Aria names the gate as her immediate goal.",
+    "A warning bell answers from the lower hall.",
+    "Pressure closes the eastern route.",
+    "She cuts the first chain and the guard reacts.",
+    "The floor gives way beneath the second step.",
+    "She catches the rail and changes direction.",
+    "The rival blocks the final stair.",
+    "Aria turns the trap back on him and opens the road.",
+  ];
+  const source = `${title}\n${paragraphs.join("\n")}`; const bodyStart = title.length + 1;
+  const at = (index: number) => ({ start: source.indexOf(paragraphs[index]), end: source.indexOf(paragraphs[index]) + paragraphs[index].length, quote: paragraphs[index] });
+  const policy = evidencePolicyFor("pacing"); const signal = { id: "pacing", dimensionId: "d", verification: policy } as any;
+  const claim: any = { version: 1, eventId: "pace", dimensionId: "d", signalId: "pacing", supported: true, confidence: 1, anchors: [at(0), at(2), at(3), at(5), at(7)], slotAnchorIndices: {}, metrics: Object.fromEntries(policy.kind === "distribution" ? policy.metricIds.map((id) => [id, 1]) : []), distributionAnchorIndices: { goal: [0], pressure: [1], beat: [2, 3], turn: [4] } };
+  assert.equal("ruleId" in groundClaim(source, claim, signal, { bodyStart }), false);
+  const sparseParagraphs = Array.from({ length: 32 }, (_, index) => `Neutral explanation ${index} continues without another concrete event.`);
+  for (const [index, paragraph] of [[0, paragraphs[0]], [8, paragraphs[2]], [12, paragraphs[3]], [20, paragraphs[5]], [31, paragraphs[7]]] as const) sparseParagraphs[index] = paragraph;
+  const sparse = `${title}\n${sparseParagraphs.join("\n")}`;
+  const sparseAt = (index: number) => ({ start: sparse.indexOf(sparseParagraphs[index]), end: sparse.indexOf(sparseParagraphs[index]) + sparseParagraphs[index].length, quote: sparseParagraphs[index] });
+  const sparseClaim = { ...claim, anchors: [sparseAt(0), sparseAt(8), sparseAt(12), sparseAt(20), sparseAt(31)] };
+  assert.deepEqual(groundClaim(sparse, sparseClaim, signal, { bodyStart }), { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
 });

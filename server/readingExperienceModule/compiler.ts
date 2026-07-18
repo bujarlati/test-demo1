@@ -29,7 +29,7 @@ const persistenceValues = new Set(["none", "chapter", "cross_chapter", "whole_st
 const prohibitionKinds = new Set(["invariant", "shortcut", "style_cliche"]);
 const prohibitionSeverities = new Set(["block", "rewrite", "penalty"]);
 const eventSlots = new Set(["actor", "action", "object", "outcome", "reaction"]);
-const distributionMetricIds = new Set(["anchor_spread", "scene_coverage", "paragraph_consistency", "beat_density", "turn_position"]);
+const distributionMetricIds = new Set(["anchor_spread", "scene_coverage", "paragraph_consistency", "beat_density", "turn_position", "abstraction_coverage", "sensory_coverage", "rhetoric_coverage", "event_density", "pressure_window", "paragraph_length_density", "sentence_length_density"]);
 const requiredSlotsByCategory: Partial<Record<ExperienceCategory, string[]>> = {
   mechanic: ["actor", "action", "object", "outcome"],
   protagonist_action: ["actor", "action", "outcome"],
