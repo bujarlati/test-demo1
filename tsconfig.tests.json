@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src",
+    "server",
+    "tests/readingExperience*.test.ts",
+    "tests/fixtures/readingExperienceFixtures.ts",
+    "tests/fixtures/strictAssessmentStatePort.ts"
+  ]
+}

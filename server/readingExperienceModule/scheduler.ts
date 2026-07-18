@@ -9,6 +9,7 @@ import type {
   ScheduledExperienceDebt,
   SchedulerDependencies,
   GenericRuleAdapterId,
+  LedgerEvidenceBinding,
 } from "./types";
 import { isRuleAdapterId } from "./ruleAdapters";
 
@@ -91,8 +92,8 @@ export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizatio
   return createHmac("sha256", secret).update(canonicalAuthorizationPayload(plan)).digest("base64url");
 }
 
-export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceIds: string[], secret: string): string {
-  return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceIds })).digest("base64url");
+export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceBindings: LedgerEvidenceBinding[], authorizedPatchHash: string, secret: string): string {
+  return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceBindings, authorizedPatchHash })).digest("base64url");
 }
 
 export function sameMac(left: string, right: string): boolean {
@@ -224,6 +225,7 @@ function deepFreeze<T>(value: T): T {
 
 function roleBindingsFor(request: ScheduleExperienceRequest): ExperienceStagePlan["roleBindings"] {
   return {
+    version: 1,
     protagonistId: request.roleBindings?.protagonistId ?? "",
     aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
     counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [],
@@ -235,12 +237,13 @@ function roleBindingsFor(request: ScheduleExperienceRequest): ExperienceStagePla
 
 function validRoleBindings(roles: ExperienceStagePlan["roleBindings"]): boolean {
   const validEntities = (entities: Array<{ id: string; aliases: string[] }>, ids: string[]) => entities.every((item) => !!item.id.trim() && item.aliases.length > 0 && item.aliases.every((alias) => !!alias.trim()) && new Set(item.aliases.map((alias) => alias.toLocaleLowerCase())).size === item.aliases.length) && new Set(entities.map((item) => item.id)).size === entities.length && [...ids].sort().join("|") === entities.map((item) => item.id).sort().join("|");
-  return !!roles.protagonistId.trim() && roles.aliases.length > 0 && roles.aliases.every((alias) => !!alias.trim()) && validEntities(roles.counterparts, roles.counterpartIds) && validEntities(roles.opponents, roles.opponentIds);
+  return roles.version === 1 && !!roles.protagonistId.trim() && roles.aliases.length > 0 && roles.aliases.every((alias) => !!alias.trim()) && validEntities(roles.counterparts, roles.counterpartIds) && validEntities(roles.opponents, roles.opponentIds);
 }
 
 function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
   const roles = roleBindingsFor(request);
+  if (request.roleBindings?.version !== undefined && request.roleBindings.version !== 1) throw new ExperienceSchedulingError("invalid_authorization_payload");
   if (request.artifactKind !== "blueprint") {
     if (!request.chapterId?.trim() || !request.revisionId?.trim() || !validRoleBindings(roles)) throw new ExperienceSchedulingError("invalid_authorization_payload");
   } else if (request.roleBindings && !validRoleBindings(roles)) {

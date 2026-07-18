@@ -10,6 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "tsx --test \"tests/*.test.ts\"",
     "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --project tsconfig.tests.json",
     "start": "cross-env NODE_ENV=production tsx server/index.ts"
   },
   "dependencies": {

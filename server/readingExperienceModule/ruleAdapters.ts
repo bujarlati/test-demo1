@@ -13,26 +13,17 @@ interface CuratedRule {
   adapterId?: GenericRuleAdapterId;
 }
 
-const eventVerification: EvidencePolicy = {
-  kind: "event_slots",
-  requiredSlots: ["actor", "action", "outcome"],
-  minimumAnchors: 2,
+const eventVerificationByCategory: Record<"mechanic" | "protagonist_action" | "conflict_outcome" | "world_reaction", EvidencePolicy> = {
+  mechanic: { kind: "event_slots", requiredSlots: ["actor", "action", "object", "outcome"], minimumAnchors: 2 },
+  protagonist_action: { kind: "event_slots", requiredSlots: ["actor", "action", "outcome"], minimumAnchors: 2 },
+  conflict_outcome: { kind: "event_slots", requiredSlots: ["actor", "action", "outcome"], minimumAnchors: 2 },
+  world_reaction: { kind: "event_slots", requiredSlots: ["actor", "reaction", "outcome"], minimumAnchors: 2 },
 };
 
 const relationshipVerification: EvidencePolicy = {
   kind: "relationship_change",
   requireReciprocalAction: true,
   minimumAnchors: 2,
-};
-
-const distributionVerification: EvidencePolicy = {
-  kind: "distribution",
-  metricIds: ["anchor_spread", "scene_coverage"],
-  minimumAnchors: 3,
-  requireSemanticJudge: true,
-  requiredRegions: ["opening", "middle", "ending"],
-  regionSemantics: "paragraph",
-  metricThresholds: { anchor_spread: 0.45, scene_coverage: 1 },
 };
 
 const curatedRules: Record<string, CuratedRule> = {
@@ -100,7 +91,7 @@ function verificationFor(category: ExperienceCategory): EvidencePolicy {
   if (category === "relationship") return cloneEvidencePolicy(relationshipVerification);
   if (category === "voice") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1 } };
   if (category === "pacing") return { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "beat_density", "turn_position"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, scene_coverage: 1, beat_density: 0.25, turn_position: 0.55 } };
-  return cloneEvidencePolicy(eventVerification);
+  return cloneEvidencePolicy(eventVerificationByCategory[category]);
 }
 
 /** The only production catalogue that contains concrete curated descriptor mappings. */
@@ -144,11 +135,11 @@ export function evidencePolicyFor(category: ExperienceCategory): EvidencePolicy 
 
 /** Generic, data-selected deterministic shortcuts.  These are never keyed by a descriptor. */
 const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
-  "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能)/i,
-  "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?)\b|(?:计划|打算)/i,
-  "event-failed-attempt": /\b(?:attempt(?:s|ed)?|fail(?:s|ed)?)\b|(?:试图|失败)/i,
-  "event-simulation": /\b(?:dream|simulation|predict(?:s|ed|ion)?|conditional|would|might)\b|(?:梦境|做梦|模拟|预测|预言|如果)/i,
-  "event-hearsay": /\b(?:hearsay|rumou?r)\b|(?:据说|传闻)/i,
+  "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能|并未|未曾|不曾)/i,
+  "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?|prepar(?:e|es|ed|ing))\b|(?:计划|打算|准备|将要)/i,
+  "event-failed-attempt": /\b(?:attempt(?:s|ed)?|tr(?:y|ies|ied)|fail(?:s|ed)?)\b|(?:试图|尝试|失败)/i,
+  "event-simulation": /\b(?:dream|simulation|predict(?:s|ed|ion)?|conditional|would|might|imagin(?:e|es|ed|ation))\b|(?:梦境|做梦|模拟|预测|预言|如果|幻想|想象)/i,
+  "event-hearsay": /\b(?:hearsay|rumou?r|heard)\b|(?:据说|传闻|听说)/i,
   "helper-substitution": /\bhelper\b|(?:他人代做|旁人替代)/i,
   "contains-pasted-label": /\b(?:label|descriptor)\b|(?:标签|描述词)/i,
   "curated-mechanic-unavailable": /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}?(?:never\s+(?:available|works?)|unavailable|destroyed|cannot\s+(?:activate|use)|无法使用|无法启动|永远不可用|永久失效|被(?:彻底)?摧毁|只是比喻|没有反馈)/i,
@@ -171,16 +162,23 @@ export function adapterAppliesTo(id: GenericRuleAdapterId, category: ExperienceC
 
 const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|实际上|现实中|尘埃散去|紧接着)/i;
 const realizedAfterReversal = /(?:\b(?:opened?|defeated?|won|succeeded?|activated?|responded?|confirmed?|acted?)\b|打开|开启|击败|获胜|制胜|成功|生效|反馈|奖励|弹出|记录|改变|确认|亲眼看见|毫发无损)/i;
-function hasRealizedReversal(id: GenericRuleAdapterId, source: string): boolean {
+function termStem(value: string): string {
+  const normalized = value.normalize("NFKC").toLocaleLowerCase().trim();
+  return /^[a-z]+$/u.test(normalized) ? normalized.replace(/(?:ing|ed|es|s)$/u, "") : normalized;
+}
+
+function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realizationTerms: readonly string[] = []): boolean {
   const marker = reversalMarker.exec(source);
   if (!marker) return false;
   const tail = source.slice(marker.index + marker[0].length);
+  const tailTerms = tail.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (realizationTerms.some((term) => { const expected = termStem(term); return expected && !tailTerms.some((candidate) => { const actual = termStem(candidate); return actual === expected || (!/^[a-z]+$/u.test(expected) && actual.includes(expected)); }); })) return false;
   if (id === "curated-mechanic-unavailable") return /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(tail);
   if (id === "curated-outcome-weakened") return /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(tail);
   return realizedAfterReversal.test(tail);
 }
 
-export function runRuleAdapter(id: GenericRuleAdapterId, source: string): boolean {
+export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realizationTerms: readonly string[] = []): boolean {
   const pattern = genericAdapters[id];
   const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
   const matches = [...source.matchAll(matcher)];
@@ -188,11 +186,11 @@ export function runRuleAdapter(id: GenericRuleAdapterId, source: string): boolea
   if (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") {
     return matches.some((match, index) => {
       const next = matches[index + 1]?.index ?? source.length;
-      return !hasRealizedReversal(id, source.slice(match.index!, next));
+      return !hasRealizedReversal(id, source.slice(match.index!, next), realizationTerms);
     });
   }
   // A rejected possibility followed by a directly narrated realization is not
   // evidence of non-realization.  The assessor still grounds the positive event.
-  if (hasRealizedReversal(id, source)) return false;
+  if (hasRealizedReversal(id, source, realizationTerms)) return false;
   return true;
 }

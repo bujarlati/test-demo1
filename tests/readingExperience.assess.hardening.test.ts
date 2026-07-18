@@ -16,6 +16,16 @@ test("artifact digest is structured and cannot collide at title/paragraph bounda
   assert.notEqual(hashArtifact(left), hashArtifact(right));
 });
 
+test("text anchors use UTF-16 offsets and reject code-point indexing across surrogate pairs", () => {
+  const source = "序😀门打开。"; const quote = "😀门"; const start = source.indexOf(quote); const end = start + quote.length;
+  const signal: Pick<ObservableSignalV2, "id" | "dimensionId" | "verification"> = { id: "unicode", dimensionId: "d", verification: { kind: "event_slots", requiredSlots: ["actor"], minimumAnchors: 1 } };
+  const claim = { version: 1 as const, eventId: "unicode", dimensionId: "d", signalId: "unicode", supported: true, confidence: 1, anchors: [{ start, end, quote }], slotAnchorIndices: {} };
+  const grounded = groundClaim(source, claim, signal);
+  assert.equal("ruleId" in grounded, false);
+  const codePointEnd = start + Array.from(quote).length;
+  assert.deepEqual(groundClaim(source, { ...claim, anchors: [{ start, end: codePointEnd, quote }] }, signal), { ruleId: "evidence.anchor_not_grounded", severity: "rewrite", dimensionId: "d" });
+});
+
 test("distribution policies reject unknown local metric ids", () => {
   const source = "opening\nmiddle\nending";
   const signal = { id: "voice", dimensionId: "d", verification: { kind: "distribution", metricIds: ["totally_unknown"], minimumAnchors: 1, requireSemanticJudge: true, requiredRegions: ["opening"], regionSemantics: "paragraph", metricThresholds: { totally_unknown: 0 } } } as unknown as Pick<ObservableSignalV2, "id" | "dimensionId" | "verification">;
@@ -32,12 +42,12 @@ const ledger: ExperienceLedgerV2 = { contractRevisionId: "r", activationId: "a",
 
 test("scheduler signs trusted story roles and never guesses protagonist from signal slots", () => {
   const plan = scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 });
-  assert.deepEqual(plan.roleBindings, { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] });
+  assert.deepEqual(plan.roleBindings, { version: 1, protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] });
   assert.equal(plan.promptProjection.dimensions.every((dimension) => !("roleBindings" in dimension)), true);
 });
 
 function signedRepair(): ExperienceRepairToken {
-  const unsigned = { version: 1 as const, repairId: "repair-1", ticketId: "old-ticket", jobId: "j", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b", stage: "opening" as const, artifactKind: "chapter" as const, ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1, chapterNumber: 1, chapterId: "c", revisionId: "v", artifactBindingId: "old-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] }, artifactHash: "digest", failedRuleIds: ["evidence.not_realized"], expiresAt: "2026-07-18T00:05:00.000Z" };
+  const unsigned = { version: 1 as const, repairId: "repair-1", ticketId: "old-ticket", jobId: "j", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b", stage: "opening" as const, artifactKind: "chapter" as const, ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1, chapterNumber: 1, chapterId: "c", revisionId: "v", artifactBindingId: "old-binding", roleBindings: { version: 1 as const, protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [], counterparts: [], opponents: [] }, artifactHash: "digest", failedRuleIds: ["evidence.not_realized"], expiresAt: "2026-07-18T00:05:00.000Z" };
   const signature = createHmac("sha256", "s").update("reading-experience:repair:v1").update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
   return { ...unsigned, signature };
 }
@@ -76,6 +86,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Bob opened the gate.", ["Aria", "open", "gate"]), true);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the window.", ["Aria", "open", "gate"]), true);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the gate.", ["Aria", "open", "gate"]), false);
+  for (const [id, text] of [["event-negated", "她并未打开门。"], ["event-intent", "她准备明日行动。"], ["event-failed-attempt", "她尝试打开门。"], ["event-simulation", "她幻想自己已经获胜。"], ["event-hearsay", "听说她打开了门。"]] as const) assert.equal(runRuleAdapter(id, text), true, `${id}:${text}`);
 });
 
 test("adapter applicability is closed by narrative category", () => {
@@ -107,6 +121,8 @@ test("distribution metrics bind delivery geometry to signal anchors and pacing t
   const paced = groundClaim(source, pacingClaim, pacing); assert.equal("ruleId" in paced, false);
   const untyped = groundClaim(source, { ...pacingClaim, distributionAnchorIndices: undefined }, pacing);
   assert.deepEqual(untyped, { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: "d" });
+  const collapsed = groundClaim(source, { ...pacingClaim, distributionAnchorIndices: { goal: [2], pressure: [2], beat: [2], turn: [2] } }, pacing);
+  assert.deepEqual(collapsed, { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
 });
 
 test("long prose does not rescue voice anchors clustered at the opening", () => {

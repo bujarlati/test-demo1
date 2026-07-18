@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compileExperience } from "../server/readingExperienceModule/compiler";
+import { evidencePolicyFor } from "../server/readingExperienceModule/ruleAdapters";
 import type { InterpretationDraft } from "../server/readingExperienceModule/types";
+import type { ExperienceCategory } from "../src/types";
 import { scriptedExperiencePorts } from "./fixtures/readingExperienceFixtures";
 
 test("compile accepts curated, conflict, repeated and novel descriptor pairs", async () => {
@@ -250,12 +252,42 @@ test("compile rejects descriptor taint on every judge-reachable semantic surface
   for (const mutate of [
     (draft: InterpretationDraft) => { draft.dimensions[0].interpretation = "霓虹禅直接作为解释标签出现并替代可观察语义。"; },
     (draft: InterpretationDraft) => { draft.dimensions[0].observableSignals[0].description = "人物贴上霓虹禅标签便算作已经兑现。"; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].observableSignals[0].semanticSlots = { actor: "霓虹禅" }; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].prohibitions[0].description = "不得用霓虹禅标签替代实际事件。"; },
     (draft: InterpretationDraft) => { draft.synthesis.sharedCause = "霓虹禅直接充当两个维度的共同原因而没有事件。"; },
+    (draft: InterpretationDraft) => { draft.synthesis.dimensionRoles[0] = "用霓虹禅充当维度职责"; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].observableSignals[0].description = "人物贴上霓\u200b虹\u2060禅标签便算作已经兑现。"; },
   ]) {
     const scripted = scriptedExperiencePorts();
     const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); mutate(draft); return draft; } };
     const result = await compileExperience({ intent: { descriptors: [{ text: "霓虹禅" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "taint" }, port, scripted.deps.now);
     assert.equal(result.ok, false); if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+  }
+});
+
+test("compile rejects a one-Han-character descriptor used as an explicit semantic label", async () => {
+  const scripted = scriptedExperiencePorts();
+  const port = { interpret: async (input: any) => {
+    const draft = await scripted.deps.interpretationPort.interpret(input);
+    draft.dimensions[0].observableSignals[0].description = "人物完成行动后，旁白直接宣告体验标签快已经兑现。";
+    return draft;
+  } };
+  const result = await compileExperience({ intent: { descriptors: [{ text: "快" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "single-han-taint" }, port, scripted.deps.now);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+});
+
+test("compile permits one-Han-character descriptors inside ordinary compound semantics", async () => {
+  for (const [descriptor, sentence] of [["快", "人物很快完成行动，并由具体结果改变后续处境。"], ["燃", "火焰持续燃烧并照亮撤离路线，人物因此作出新的选择。"]] as const) {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => {
+      const draft = await scripted.deps.interpretationPort.interpret(input);
+      draft.dimensions[0].observableSignals[0].description = sentence;
+      return draft;
+    } };
+    const result = await compileExperience({ intent: { descriptors: [{ text: descriptor }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `single-han-compound-${descriptor}` }, port, scripted.deps.now);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (result.ok) assert.equal(result.value.status, "ready");
   }
 });
 
@@ -271,6 +303,9 @@ test("dimension identity changes with compiled semantics while provenance retain
   assert.notEqual(left.value.revision.dimensions[0].id, right.value.revision.dimensions[0].id);
   assert.equal(left.value.revision.provenance[0].version, "fixture-v1");
   assert.match(left.value.revision.provenance[0].interpretationDigest ?? "", /^interpretation_/);
+  assert.notEqual(left.value.revision.provenance[0].interpretationDigest, right.value.revision.provenance[0].interpretationDigest);
+  assert.equal(left.value.revision.provenance[1].interpretationDigest, right.value.revision.provenance[1].interpretationDigest);
+  assert.notEqual(left.value.revision.provenance[0].interpretationDigest, left.value.revision.provenance[1].interpretationDigest);
 });
 
 test("compile enforces category metric and adapter applicability with non-vacuous thresholds", async () => {
@@ -281,6 +316,143 @@ test("compile enforces category metric and adapter applicability with non-vacuou
   ]) {
     const scripted = scriptedExperiencePorts(); const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); mutate(draft); return draft; } };
     const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "matrix" }, port, scripted.deps.now);
+    assert.equal(result.ok, false); if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
+  }
+});
+
+test("compile requires the complete code-owned evidence policy for every signal category", async () => {
+  const categories: ExperienceCategory[] = ["mechanic", "protagonist_action", "conflict_outcome", "world_reaction", "relationship", "pacing", "voice"];
+  const mutations: Array<(policy: any) => void> = [
+    (policy) => { policy.minimumAnchors = policy.minimumAnchors === 1 ? 2 : 1; },
+  ];
+  for (const category of categories) {
+    for (const mutatePolicy of mutations) {
+      const scripted = scriptedExperiencePorts();
+      const port = { interpret: async (input: any) => {
+        const draft = await scripted.deps.interpretationPort.interpret(input);
+        const dimension = draft.dimensions[0];
+        dimension.categories = [category];
+        for (const signal of dimension.observableSignals) {
+          signal.kind = category;
+          signal.verification = evidencePolicyFor(category);
+          mutatePolicy(signal.verification);
+        }
+        return draft;
+      } };
+      const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `policy-min-${category}` }, port, scripted.deps.now);
+      assert.equal(result.ok, false, category);
+      if (!result.ok) assert.equal(result.error.code, "invalid_model_output", category);
+    }
+  }
+
+  for (const category of ["voice", "pacing"] as const) {
+    for (const mutatePolicy of [
+      (policy: any) => { policy.metricThresholds[policy.metricIds[0]] = 0.000001; },
+      (policy: any) => { policy.requiredRegions = ["opening"]; },
+      (policy: any) => { policy.regionSemantics = "proportional"; },
+    ]) {
+      const scripted = scriptedExperiencePorts();
+      const port = { interpret: async (input: any) => {
+        const draft = await scripted.deps.interpretationPort.interpret(input);
+        const dimension = draft.dimensions[0];
+        dimension.categories = [category];
+        for (const signal of dimension.observableSignals) {
+          signal.kind = category;
+          signal.verification = evidencePolicyFor(category);
+          mutatePolicy(signal.verification);
+        }
+        return draft;
+      } };
+      const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `policy-distribution-${category}` }, port, scripted.deps.now);
+      assert.equal(result.ok, false, category);
+      if (!result.ok) assert.equal(result.error.code, "invalid_model_output", category);
+    }
+  }
+});
+
+test("compile enforces distinct event-slot matrices for each event category", async () => {
+  const cases: Array<[ExperienceCategory, string[]]> = [
+    ["mechanic", ["actor", "action", "outcome"]],
+    ["protagonist_action", ["actor", "action", "object", "outcome"]],
+    ["conflict_outcome", ["actor", "action", "object", "outcome"]],
+    ["world_reaction", ["actor", "action", "outcome"]],
+  ];
+  for (const [category, forgedSlots] of cases) {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => {
+      const draft = await scripted.deps.interpretationPort.interpret(input);
+      const dimension = draft.dimensions[0];
+      dimension.categories = [category];
+      for (const signal of dimension.observableSignals) {
+        signal.kind = category;
+        signal.verification = { kind: "event_slots", requiredSlots: forgedSlots, minimumAnchors: 2 } as any;
+      }
+      return draft;
+    } };
+    const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `slot-matrix-${category}` }, port, scripted.deps.now);
+    assert.equal(result.ok, false, category);
+    if (!result.ok) assert.equal(result.error.code, "invalid_model_output", category);
+  }
+});
+
+test("dimension IDs hash final normalized semantics with set ordering and without confidence", async () => {
+  const build = async (variant: "base" | "reordered" | "confidence") => {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => {
+      const draft = await scripted.deps.interpretationPort.interpret(input);
+      const dimension = draft.dimensions[0];
+      dimension.categories = ["protagonist_action", "world_reaction"];
+      dimension.observableSignals.push({
+        description: "环境和旁观者对行动结果作出具体反应，并形成新的外部处境。",
+        kind: "world_reaction",
+        verification: evidencePolicyFor("world_reaction"),
+        persistence: "cross_chapter",
+      });
+      dimension.prohibitions.push({ kind: "invariant", description: "不得让已经发生的外部反应在下一场景无故消失。", severity: "block" });
+      if (variant === "reordered") {
+        dimension.categories.reverse();
+        dimension.observableSignals.reverse();
+        dimension.prohibitions.reverse();
+        for (const signal of dimension.observableSignals) {
+          if (signal.verification.kind === "event_slots") signal.verification.requiredSlots.reverse();
+        }
+      }
+      if (variant === "confidence") dimension.confidence = 0.99;
+      return draft;
+    } };
+    return compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `final-id-${variant}` }, port, scripted.deps.now);
+  };
+  const [base, reordered, confidence] = await Promise.all([build("base"), build("reordered"), build("confidence")]);
+  for (const result of [base, reordered, confidence]) assert.equal(result.ok && result.value.status, "ready");
+  if (!base.ok || base.value.status !== "ready" || !reordered.ok || reordered.value.status !== "ready" || !confidence.ok || confidence.value.status !== "ready") return;
+  assert.equal(base.value.revision.dimensions[0].id, reordered.value.revision.dimensions[0].id);
+  assert.equal(base.value.revision.dimensions[0].id, confidence.value.revision.dimensions[0].id);
+});
+
+test("repeated secondary dimension IDs ignore draft semantics replaced by the final split transform", async () => {
+  const build = async (suffix: string) => {
+    const scripted = scriptedExperiencePorts();
+    const port = { interpret: async (input: any) => {
+      const draft = await scripted.deps.interpretationPort.interpret(input);
+      draft.dimensions[1].observableSignals[0].description += suffix;
+      return draft;
+    } };
+    return compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "量子静谧" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: `discarded-${suffix}` }, port, scripted.deps.now);
+  };
+  const [left, right] = await Promise.all([build(" 这段输入会被替换。"), build(" 另一段输入同样会被替换。")]);
+  assert.equal(left.ok && left.value.status, "ready"); assert.equal(right.ok && right.value.status, "ready");
+  if (!left.ok || left.value.status !== "ready" || !right.ok || right.value.status !== "ready") return;
+  assert.equal(left.value.revision.dimensions[1].id, right.value.revision.dimensions[1].id);
+});
+
+test("model output cannot self-assign deterministic prohibition adapters or declare hollow categories", async () => {
+  for (const mutate of [
+    (draft: InterpretationDraft) => { draft.dimensions[0].prohibitions[0].ruleAdapterId = "event-intent"; draft.dimensions[0].prohibitions[0].kind = "invariant"; draft.dimensions[0].prohibitions[0].description = "A relationship must not permanently collapse after care."; },
+    (draft: InterpretationDraft) => { draft.dimensions[0].categories.push(draft.dimensions[0].categories[0]); },
+    (draft: InterpretationDraft) => { draft.dimensions[0].categories.push("world_reaction"); },
+  ]) {
+    const scripted = scriptedExperiencePorts(); const port = { interpret: async (input: any) => { const draft = await scripted.deps.interpretationPort.interpret(input); mutate(draft); return draft; } };
+    const result = await compileExperience({ intent: { descriptors: [{ text: "量子静谧" }, { text: "烟火感" }], locale: "zh-CN" }, context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId: "adapter-ownership" }, port, scripted.deps.now);
     assert.equal(result.ok, false); if (!result.ok) assert.equal(result.error.code, "invalid_model_output");
   }
 });

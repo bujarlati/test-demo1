@@ -30,6 +30,12 @@ const prohibitionKinds = new Set(["invariant", "shortcut", "style_cliche"]);
 const prohibitionSeverities = new Set(["block", "rewrite", "penalty"]);
 const eventSlots = new Set(["actor", "action", "object", "outcome", "reaction"]);
 const distributionMetricIds = new Set(["anchor_spread", "scene_coverage", "paragraph_consistency", "beat_density", "turn_position"]);
+const requiredSlotsByCategory: Partial<Record<ExperienceCategory, string[]>> = {
+  mechanic: ["actor", "action", "object", "outcome"],
+  protagonist_action: ["actor", "action", "outcome"],
+  conflict_outcome: ["actor", "action", "outcome"],
+  world_reaction: ["actor", "reaction", "outcome"],
+};
 
 type RejectedOutcome = Extract<CompileOutcome, { status: "rejected" }>;
 type NeedsResolutionOutcome = Extract<CompileOutcome, { status: "needs_resolution" }>;
@@ -180,13 +186,11 @@ function validSignal(value: unknown): value is InterpretationDimensionDraft["obs
   if (!isRecord(value) || typeof value.description !== "string" || normalizedText(value.description).length < 6 || normalizedText(value.description).length > 300) return false;
   if (!hasOnlyKeys(value, ["description", "kind", "semanticSlots", "verification", "persistence"]) || typeof value.kind !== "string" || !categories.includes(value.kind as ExperienceCategory) || !validVerification(value.verification) || typeof value.persistence !== "string" || !persistenceValues.has(value.persistence) || !validSemanticSlots(value.semanticSlots)) return false;
   const kind = value.kind as ExperienceCategory; const verification = value.verification as EvidencePolicy;
-  if (kind === "voice" || kind === "pacing") {
-    if (verification.kind !== "distribution") return false;
-    const required = kind === "voice" ? ["anchor_spread", "scene_coverage", "paragraph_consistency"] : ["anchor_spread", "scene_coverage", "beat_density", "turn_position"];
-    return [...verification.metricIds].sort().join("|") === required.sort().join("|");
-  }
-  if (kind === "relationship") return verification.kind === "relationship_change";
-  return verification.kind === "event_slots";
+  const canonicalPolicy = normalizedPolicy(evidencePolicyFor(kind));
+  if (canonicalAuthorizationPayload(normalizedPolicy(verification)) !== canonicalAuthorizationPayload(canonicalPolicy)) return false;
+  if (verification.kind !== "event_slots") return true;
+  const required = requiredSlotsByCategory[kind];
+  return !!required && [...verification.requiredSlots].sort().join("|") === [...required].sort().join("|");
 }
 
 function validProhibition(value: unknown): boolean {
@@ -195,9 +199,10 @@ function validProhibition(value: unknown): boolean {
 
 function validStructuralDimension(value: unknown): value is InterpretationDimensionDraft {
   if (!isRecord(value) || typeof value.descriptor !== "string" || typeof value.interpretation !== "string" || !Array.isArray(value.categories) || !Array.isArray(value.observableSignals) || !Array.isArray(value.prohibitions) || typeof value.confidence !== "number") return false;
-  if (!hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) || value.categories.length < 1 || !value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) || value.observableSignals.length < 2 || value.observableSignals.length > 6 || !value.observableSignals.every(validSignal) || value.prohibitions.length < 1 || !value.prohibitions.every(validProhibition)) return false;
+  if (!hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) || value.categories.length < 1 || !value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) || new Set(value.categories).size !== value.categories.length || value.observableSignals.length < 2 || value.observableSignals.length > 6 || !value.observableSignals.every(validSignal) || value.prohibitions.length < 1 || !value.prohibitions.every(validProhibition)) return false;
   const dimensionCategories = value.categories as ExperienceCategory[];
-  return value.observableSignals.every((signal) => dimensionCategories.includes(signal.kind)) && value.prohibitions.every((prohibition) => !prohibition.ruleAdapterId || dimensionCategories.some((category) => adapterAppliesTo(prohibition.ruleAdapterId!, category)));
+  const observableSignals = value.observableSignals as InterpretationDimensionDraft["observableSignals"]; const prohibitions = value.prohibitions as InterpretationDimensionDraft["prohibitions"];
+  return observableSignals.every((signal) => dimensionCategories.includes(signal.kind)) && dimensionCategories.every((category) => observableSignals.some((signal) => signal.kind === category)) && prohibitions.every((prohibition) => !prohibition.ruleAdapterId || dimensionCategories.some((category) => adapterAppliesTo(prohibition.ruleAdapterId!, category)));
 }
 
 function descriptorTainted(draft: InterpretationDraft, intent: ReadingExperienceIntent): boolean {
@@ -209,10 +214,20 @@ function descriptorTainted(draft: InterpretationDraft, intent: ReadingExperience
   const normalizedValues = semanticValues.map((value) => normalizedText(value).toLocaleLowerCase());
   return intent.descriptors.some((descriptor) => {
     const raw = normalizedText(descriptor.text).toLocaleLowerCase();
+    const skeleton = raw.replace(/[\p{Cf}\p{Z}\p{P}\p{S}_]+/gu, "");
     return normalizedValues.some((value) => {
-      if (raw.length > 1) return value.includes(raw);
-      for (let index = value.indexOf(raw); index >= 0; index = value.indexOf(raw, index + raw.length)) {
-        const before = index > 0 ? value[index - 1] : ""; const after = value[index + raw.length] ?? "";
+      const compact = value.replace(/[\p{Cf}\p{Z}\p{P}\p{S}_]+/gu, "");
+      if (skeleton.length > 1) return compact.includes(skeleton);
+      if (!skeleton) return false;
+      if (compact === skeleton) return true;
+      const labels = ["词语", "标签", "感觉", "维度", "描述词", "体验词", "word", "label", "feeling", "dimension"];
+      for (let index = compact.indexOf(skeleton); index >= 0; index = compact.indexOf(skeleton, index + skeleton.length)) {
+        const before = compact.slice(0, index); const after = compact.slice(index + skeleton.length);
+        if (labels.some((label) => before.endsWith(label) || after.startsWith(label))) return true;
+      }
+      const visible = value.replace(/\p{Cf}+/gu, "");
+      for (let index = visible.indexOf(raw); index >= 0; index = visible.indexOf(raw, index + raw.length)) {
+        const before = index > 0 ? visible[index - 1] : ""; const after = visible[index + raw.length] ?? "";
         if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
       }
       return false;
@@ -220,12 +235,13 @@ function descriptorTainted(draft: InterpretationDraft, intent: ReadingExperience
   });
 }
 
-function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIntent): Validation {
+function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIntent, adaptersAreCodeOwned: boolean): Validation {
   if (!isRecord(draft) || !hasOnlyKeys(draft, ["dimensions", "synthesis", "provenanceVersion"]) || !Array.isArray(draft.dimensions) || draft.dimensions.length !== 2 || !isRecord(draft.synthesis) || !hasOnlyKeys(draft.synthesis, ["sharedCause", "dimensionRoles"]) || typeof draft.provenanceVersion !== "string" || !normalizedText(draft.provenanceVersion) || normalizedText(draft.provenanceVersion).length > 80) {
     return { ok: false, kind: "invalid_model_output" };
   }
   if (!validStructuralDimension(draft.dimensions[0]) || !validStructuralDimension(draft.dimensions[1])) return { ok: false, kind: "invalid_model_output" };
   const dimensions = draft.dimensions as [InterpretationDimensionDraft, InterpretationDimensionDraft];
+  if (!adaptersAreCodeOwned && dimensions.some((dimension) => dimension.prohibitions.some((prohibition) => prohibition.ruleAdapterId !== undefined))) return { ok: false, kind: "invalid_model_output" };
   const expected = intent.descriptors.map((descriptor) => descriptor.text);
   if (dimensions.some((dimension, index) => normalizedText(dimension.descriptor) !== expected[index] || !Number.isFinite(dimension.confidence) || dimension.confidence < 0 || dimension.confidence > 1)) {
     return { ok: false, kind: "invalid_model_output" };
@@ -243,7 +259,8 @@ function validateInterpretationDraft(draft: unknown, intent: ReadingExperienceIn
 }
 
 function alternativeCategory(category: ExperienceCategory): ExperienceCategory {
-  return categories[(categories.indexOf(category) + 1) % categories.length];
+  const alternatives: Record<ExperienceCategory, ExperienceCategory> = { mechanic: "world_reaction", protagonist_action: "conflict_outcome", conflict_outcome: "world_reaction", world_reaction: "protagonist_action", relationship: "protagonist_action", pacing: "voice", voice: "pacing" };
+  return alternatives[category];
 }
 
 function cloneEvidencePolicy(policy: EvidencePolicy): EvidencePolicy {
@@ -260,33 +277,19 @@ function shiftedAnchorCount(value: number): number {
   return value >= 12 ? value - 1 : value + 1;
 }
 
-function complementaryEvidencePolicy(primary: EvidencePolicy, fallbackCategory: ExperienceCategory): EvidencePolicy {
-  if (primary.kind === "event_slots") {
-    return {
-      kind: "event_slots",
-      requiredSlots: Array.from(new Set([...primary.requiredSlots, "reaction", "object"])),
-      minimumAnchors: shiftedAnchorCount(primary.minimumAnchors),
-    };
-  }
-  if (primary.kind === "distribution") {
-    return {
-      kind: "distribution",
-      metricIds: Array.from(new Set([...primary.metricIds, "paragraph_consistency"])),
-      minimumAnchors: shiftedAnchorCount(primary.minimumAnchors),
-      requireSemanticJudge: true,
-      requiredRegions: [...primary.requiredRegions],
-      regionSemantics: primary.regionSemantics,
-      metricThresholds: { ...primary.metricThresholds, paragraph_consistency: 0.25 },
-    };
-  }
-  const policy = evidencePolicyFor(fallbackCategory);
-  if (policy.kind === "distribution") {
-    return { ...policy, metricIds: Array.from(new Set([...policy.metricIds, "paragraph_consistency"])), metricThresholds: { ...policy.metricThresholds, paragraph_consistency: 0.25 }, minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
-  }
-  if (policy.kind === "event_slots") {
-    return { ...policy, requiredSlots: Array.from(new Set([...policy.requiredSlots, "reaction"])), minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
-  }
-  return { kind: "event_slots", requiredSlots: ["actor", "action", "outcome", "reaction"], minimumAnchors: 3 };
+function complementaryEvidencePolicy(_primary: EvidencePolicy, fallbackCategory: ExperienceCategory): EvidencePolicy {
+  const policy = cloneEvidencePolicy(evidencePolicyFor(fallbackCategory));
+  return { ...policy, minimumAnchors: shiftedAnchorCount(policy.minimumAnchors) };
+}
+
+function normalizedPolicy(policy: EvidencePolicy): EvidencePolicy {
+  if (policy.kind === "event_slots") return { ...policy, requiredSlots: [...policy.requiredSlots].sort() as typeof policy.requiredSlots };
+  if (policy.kind === "distribution") return { ...policy, metricIds: [...policy.metricIds].sort(), requiredRegions: [...policy.requiredRegions].sort() as typeof policy.requiredRegions, metricThresholds: Object.fromEntries(Object.entries(policy.metricThresholds).sort(([left], [right]) => left.localeCompare(right))) };
+  return { ...policy };
+}
+
+function semanticSort<T>(values: T[]): T[] {
+  return [...values].sort((left, right) => canonicalAuthorizationPayload(left).localeCompare(canonicalAuthorizationPayload(right)));
 }
 
 function splitAndNormalizeDimensions(
@@ -296,45 +299,44 @@ function splitAndNormalizeDimensions(
   const duplicate = intent.descriptors[0].text === intent.descriptors[1].text;
   const primaryPolicy = cloneEvidencePolicy(drafts[0].observableSignals[0].verification);
   return drafts.map((draft, index) => {
-    const semanticCore = { index, interpretation: normalizedText(draft.interpretation), categories: [...draft.categories], observableSignals: draft.observableSignals.map((signal) => ({ kind: signal.kind, description: normalizedText(signal.description), ...(signal.semanticSlots ? { semanticSlots: { ...signal.semanticSlots } } : {}), verification: signal.verification, persistence: signal.persistence })), prohibitions: draft.prohibitions.map((prohibition) => ({ kind: prohibition.kind, description: normalizedText(prohibition.description), severity: prohibition.severity, ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : {}) })), confidence: draft.confidence };
-    const dimensionId = `dimension_${index + 1}_${stableToken(semanticCore)}`;
     const splitCategory = alternativeCategory(draft.categories[0]);
     const secondaryRepeatedDimension = duplicate && index === 1;
     const secondaryPolicy = complementaryEvidencePolicy(primaryPolicy, splitCategory);
-    const signals: ObservableSignalV2[] = secondaryRepeatedDimension
+    const signalBodies = semanticSort(secondaryRepeatedDimension
       ? [
-        { id: `${dimensionId}_signal_1`, dimensionId, kind: splitCategory, description: "当前行动造成的持续状态变化必须绑定具体人物、对象和结果。", verification: cloneEvidencePolicy(secondaryPolicy), persistence: "cross_chapter" },
-        { id: `${dimensionId}_signal_2`, dimensionId, kind: splitCategory, description: "后续事件必须显示该状态如何改变人物选择、环境反应或冲突走向。", verification: cloneEvidencePolicy(secondaryPolicy), persistence: "cross_chapter" },
+        { kind: splitCategory, description: "当前行动造成的持续状态变化必须绑定具体人物、对象和结果。", verification: normalizedPolicy(secondaryPolicy), persistence: "cross_chapter" as const },
+        { kind: splitCategory, description: "后续事件必须显示该状态如何改变人物选择、环境反应或冲突走向。", verification: normalizedPolicy(secondaryPolicy), persistence: "cross_chapter" as const },
       ]
-      : draft.observableSignals.map((signal, signalIndex) => ({
-        id: `${dimensionId}_signal_${signalIndex + 1}`,
-        dimensionId,
+      : draft.observableSignals.map((signal) => ({
         kind: signal.kind,
         description: normalizedText(signal.description),
         ...(signal.semanticSlots ? { semanticSlots: cloneSemanticSlots(signal.semanticSlots) } : {}),
-        verification: cloneEvidencePolicy(signal.verification),
+        verification: normalizedPolicy(signal.verification),
         persistence: signal.persistence,
-      }));
-    const prohibitions: ExperienceProhibition[] = draft.prohibitions.map((prohibition, prohibitionIndex) => ({
-      id: `${dimensionId}_prohibition_${prohibitionIndex + 1}`,
-      dimensionId,
+      })));
+    const prohibitionBodies = draft.prohibitions.map((prohibition) => ({
       kind: prohibition.kind,
       description: normalizedText(prohibition.description),
       severity: prohibition.severity,
       ...(prohibition.ruleAdapterId ? { ruleAdapterId: prohibition.ruleAdapterId } : prohibition.kind === "shortcut" ? { ruleAdapterId: "contains-pasted-label" } : {}),
     }));
     if (secondaryRepeatedDimension) {
-      prohibitions.push({ id: `${dimensionId}_prohibition_independence`, dimensionId, kind: "shortcut", description: "不得把第一维已经采用的泛化叙述重复计为持续后果证据。", severity: "rewrite" });
+      prohibitionBodies.push({ kind: "shortcut", description: "不得把第一维已经采用的泛化叙述重复计为持续后果证据。", severity: "rewrite", ruleAdapterId: "contains-pasted-label" });
     }
+    const interpretation = secondaryRepeatedDimension
+      ? `${normalizedText(draft.interpretation)} 本维度专门验证行动留下的持续后果和次级变化，不重复计数当下的关系行动。`
+      : duplicate
+        ? `${normalizedText(draft.interpretation)} 本维度聚焦当前事件中人物之间立即发生的具体行动与回应。`
+        : normalizedText(draft.interpretation);
+    const dimensionBody = { index, interpretation, categories: (secondaryRepeatedDimension ? [splitCategory] : [...draft.categories]).sort(), observableSignals: signalBodies, prohibitions: semanticSort(prohibitionBodies) };
+    const dimensionId = `dimension_${index + 1}_${stableToken(dimensionBody)}`;
+    const signals: ObservableSignalV2[] = signalBodies.map((signal, signalIndex) => ({ id: `${dimensionId}_signal_${signalIndex + 1}`, dimensionId, ...signal }));
+    const prohibitions: ExperienceProhibition[] = semanticSort(prohibitionBodies).map((prohibition, prohibitionIndex) => ({ id: `${dimensionId}_prohibition_${prohibitionIndex + 1}`, dimensionId, ...prohibition }));
     return {
       id: dimensionId,
       descriptor: intent.descriptors[index].text,
-      interpretation: secondaryRepeatedDimension
-        ? `${normalizedText(draft.interpretation)} 本维度专门验证行动留下的持续后果和次级变化，不重复计数当下的关系行动。`
-        : duplicate
-          ? `${normalizedText(draft.interpretation)} 本维度聚焦当前事件中人物之间立即发生的具体行动与回应。`
-          : normalizedText(draft.interpretation),
-      categories: secondaryRepeatedDimension ? [splitCategory] : [...draft.categories],
+      interpretation,
+      categories: (secondaryRepeatedDimension ? [splitCategory] : [...draft.categories]).sort() as ExperienceCategory[],
       observableSignals: signals,
       prohibitions,
       confidence: draft.confidence,
@@ -418,7 +420,7 @@ export async function compileExperience(request: CompileExperienceRequest, port:
   if (!preflight.ok) return { ok: true, value: preflight.outcome };
   const draft = await interpretationDraft(preflight.intent, preflight.context, port, request.jobId);
   if (!draft.ok) return draft;
-  const validation = validateInterpretationDraft(draft.value.draft, preflight.intent);
+  const validation = validateInterpretationDraft(draft.value.draft, preflight.intent, draft.value.provenance.every((item) => item.kind === "curated"));
   if (!validation.ok) {
     if (validation.kind === "invalid_model_output") {
       return { ok: false, error: { code: "invalid_model_output", message: "体验词解释结果格式不正确，请稍后重试。", stage: "interpretation", retryable: false, jobId: request.jobId } };
@@ -428,6 +430,9 @@ export async function compileExperience(request: CompileExperienceRequest, port:
   const dimensions = splitAndNormalizeDimensions(validation.dimensions, preflight.intent);
   const synthesis = solveSynthesis(dimensions, validation.synthesis);
   if (!synthesis.ok) return { ok: true, value: { status: "needs_resolution", code: "irreconcilable_intent", message: synthesis.message } };
-  const provenance = draft.value.provenance.map((item) => item.kind === "model" ? { ...item, interpretationDigest: `interpretation_${stableToken({ dimensions, synthesis: synthesis.value })}` } : item);
+  const provenance = draft.value.provenance.map((item, index) => item.kind === "model" ? {
+    ...item,
+    interpretationDigest: `interpretation_${stableToken({ dimension: dimensions[index], dimensionRole: synthesis.value.dimensionRoles[index], sharedCause: synthesis.value.sharedCause })}`,
+  } : item);
   return { ok: true, value: { status: "ready", revision: freezeContractRevision(request, preflight.intent, dimensions, synthesis.value, provenance, now()) } };
 }

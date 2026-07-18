@@ -97,7 +97,7 @@ export interface SemanticEvidenceCase {
   source: string;
   sourceHash: string;
   synthesis: { sharedCause: string; dimensionRoles: [string, string] };
-  signals: Array<{ dimensionId: string; signalId: string; kind: string; interpretation: string; description: string; semanticSlots?: Record<string, string>; policy: EvidencePolicy; canonFactReferences: CanonFactReferenceV2[]; prohibitions: Array<{ id: string; kind: string; severity: string; ruleAdapterId?: string }> }>;
+  signals: Array<{ dimensionId: string; signalId: string; kind: string; interpretation: string; description: string; semanticSlots?: Record<string, string>; policy: EvidencePolicy; canonFactReferences: CanonFactReferenceV2[]; prohibitions: Array<{ id: string; kind: string; description: string; severity: string; ruleAdapterId?: string }> }>;
 }
 export interface SemanticSharedCauseLink { dimensionId: string; signalId: string; claimAnchorIndex: number; sharedAnchorIndex: number }
 export interface SemanticSharedCauseClaim { eventId: string; supported: boolean; confidence: number; anchors: SemanticEvidenceAnchor[]; links: SemanticSharedCauseLink[] }
@@ -147,7 +147,7 @@ export interface ScheduleExperienceRequest {
   /** Digest of the pre-approved output manifest, when a producer has one. */
   expectedArtifactDigest?: string;
   artifactBindingId?: string;
-  roleBindings?: { protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
+  roleBindings?: { version?: 1; protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[]; counterparts?: Array<{ id: string; aliases: string[] }>; opponents?: Array<{ id: string; aliases: string[] }> };
   chapterNumber?: number;
   repair?: { token: ExperienceRepairToken; expected: RepairTokenContext };
   jobId: string;
@@ -166,7 +166,7 @@ export interface ExperienceStagePlan {
   revisionId?: string;
   expectedArtifactDigest?: string;
   artifactBindingId: string;
-  roleBindings: { protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[]; counterparts: Array<{ id: string; aliases: string[] }>; opponents: Array<{ id: string; aliases: string[] }> };
+  roleBindings: { version: 1; protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[]; counterparts: Array<{ id: string; aliases: string[] }>; opponents: Array<{ id: string; aliases: string[] }> };
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
   promptProjection: { dimensions: Array<{ id: string; interpretation: string; signalIds: string[]; factReferences: CanonFactReferenceV2[] }>; prohibitions: string[] };
@@ -196,8 +196,18 @@ export interface SchedulerDependencies {
 export interface LedgerAuthorization {
   readonly plan: ExperienceStagePlan;
   readonly canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
-  readonly evidenceIds: string[];
+  readonly evidenceBindings: LedgerEvidenceBinding[];
+  readonly authorizedPatchHash: string;
   readonly authorizationRootMac: string;
+}
+
+export interface LedgerEvidenceBinding {
+  readonly evidenceId: string;
+  readonly dimensionId: string;
+  readonly signalId: string;
+  readonly chapterRevisionId: string;
+  readonly sourceHash: string;
+  readonly evidenceDigest: string;
 }
 
 export interface LedgerDependencies extends SchedulerDependencies {
@@ -223,6 +233,8 @@ export interface ExperienceLedgerPatch {
   newDebtsByDimension: Record<string, ExperienceDebtV2[]>;
   deliveredPromiseIds: string[];
   evidenceIds: string[];
+  /** Signed prospective canon write-set; persistent references must map one-to-one. */
+  canonFactCandidates: CanonFactCandidateV2[];
   /** Promise -> dimension -> evidence IDs; `both` promises never collapse axes. */
   promiseEvidenceLinks: Record<string, Record<string, string[]>>;
 }
@@ -265,6 +277,7 @@ export interface ExperiencePublicationPermit {
   branchId: string;
   chapterId: string;
   revisionId: string;
+  artifactBindingId: string;
   artifactHash: string;
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
@@ -308,9 +321,9 @@ export interface AssessmentState {
 
 export interface AssessmentStatePort {
   read(input: { ticketId: string; jobId: string }): Promise<AssessmentState> | AssessmentState;
-  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; newEvidenceIds: readonly string[]; repairAuthorization?: { repairId: string; tokenDigest: string; expected: RepairTokenContext }; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest?: string; existingEvidenceIds: readonly string[] } }): Promise<boolean> | boolean;
-  consumePermit(input: { permitId: string; ticketId: string; permitDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId: string; revisionId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
-  consumeRepair(input: { repairId: string; ticketId: string; tokenDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
+  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; newEvidenceIds: readonly string[]; repairAuthorization?: { repairId: string; tokenDigest: string; expected: RepairTokenContext }; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; artifactBindingId: string; expectedArtifactDigest?: string; existingEvidenceIds: readonly string[] } }): Promise<boolean> | boolean;
+  consumePermit(input: { permitId: string; ticketId: string; permitDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId: string; revisionId: string; artifactBindingId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
+  consumeRepair(input: { repairId: string; ticketId: string; tokenDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; artifactBindingId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
   bindArtifactDigest?(input: { ticketId: string; artifactBindingId: string; artifactHash: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest: null } }): Promise<boolean> | boolean;
 }
 
@@ -321,7 +334,7 @@ export type RepairTokenContext =
 export interface PublicationPermitContext {
   ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
   stage: ExperienceStage; artifactKind: ExperienceArtifactKind; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number;
-  chapterId: string; revisionId: string; artifactHash: string; evidenceIds: readonly string[]; ledgerPatchHash: string;
+  chapterId: string; revisionId: string; artifactBindingId: string; artifactHash: string; evidenceIds: readonly string[]; ledgerPatchHash: string;
 }
 
 export interface ExperienceRepairToken {

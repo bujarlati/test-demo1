@@ -1,19 +1,22 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { scheduleExperience } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, repairContext, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import { assessExperience, consumePublicationPermit, verifyPublicationPermit } from "../server/readingExperienceModule/assessor";
+import { createReadingExperienceModule } from "../server/readingExperienceModule";
 import { hashArtifact, sourceForArtifact } from "../server/readingExperienceModule/evidence";
 import { signExperiencePlan, signExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
-import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2 } from "../src/types";
-import type { AssessExperienceRequest, SemanticVerdict } from "../server/readingExperienceModule/types";
+import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
+import type { AssessExperienceRequest, AssessorDependencies, SemanticVerdict } from "../server/readingExperienceModule/types";
+import { StrictAssessmentStatePort } from "./fixtures/strictAssessmentStatePort";
 
 const secret = "assessor-test-secret";
 const now = () => new Date("2026-07-17T00:00:00.000Z");
 const source = "Chapter title\nAria opens the sealed gate and the mechanism records her choice.\nThe city guard lowers his spear, then Aria answers with a bow and they choose to travel together.\nAt dusk Aria wins the duel, and the crowd opens the road.\nA spare, precise sentence keeps the scene moving.\nAt dawn the rhythm turns with a clear new action.\n旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。";
 
 function contract(): CompiledExperienceContractRevision {
-  const event = (id: string, kind: any, policy: any) => ({ id, dimensionId: "d1", kind, description: "opaque", semanticSlots: { actor: "Aria" }, verification: policy, persistence: kind === "mechanic" || kind === "relationship" ? "cross_chapter" : "chapter" });
+  const event = (id: string, kind: any, policy: any): ObservableSignalV2 => ({ id, dimensionId: "d1", kind, description: "opaque", semanticSlots: { actor: "Aria" }, verification: policy, persistence: kind === "mechanic" || kind === "relationship" ? "cross_chapter" : "chapter" });
   return {
     id: "r1", schemaVersion: 2, revision: 1, parentRevisionId: null,
     intent: { descriptors: [{ text: "opaque-a" }, { text: "opaque-b" }], locale: "zh-CN" },
@@ -40,7 +43,7 @@ function verdict(overrides: Partial<SemanticVerdict> = {}): SemanticVerdict { co
   { version: 1 as const, eventId: "shared-event", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice."), anchor("At dusk Aria wins the duel"), anchor("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
   { version: 1 as const, eventId: "pacing-event", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [anchor("Chapter title"), anchor("A spare, precise sentence"), anchor("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
 ]; return { version: 1, claims, sharedCause: { eventId: "shared-event", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice.")], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } as any, ...overrides }; }
-function fixture(judge = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
+function fixture(judge: AssessorDependencies["semanticJudgePort"]["judge"] = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
 function blueprintVerdict(plan: AssessExperienceRequest["plan"]): any {
   const deliveries = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds.map((signalId) => ({ dimensionId: dimension.id, signalId })));
   return {
@@ -80,21 +83,55 @@ test("planned, negated, simulated and predicted prose cannot qualify as pacing",
   const common = at(artifact.paragraphs[0]);
   const claims: any[] = [
     { version: 1, eventId: "unrealized", dimensionId: "d1", signalId: "voice-only", supported: true, confidence: .9, anchors: [common, at(artifact.paragraphs[2]), at(artifact.paragraphs[5])], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, paragraph_consistency: 1 } },
-    { version: 1, eventId: "unrealized", dimensionId: "d2", signalId: "pacing-only", supported: true, confidence: .9, anchors: [common, at(artifact.paragraphs[3]), at(artifact.paragraphs[6])], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, beat_density: 1, turn_position: 1 }, distributionAnchorIndices: { goal: [0], pressure: [1], beat: [0, 1], turn: [2] } },
+    { version: 1, eventId: "unrealized", dimensionId: "d2", signalId: "pacing-only", supported: true, confidence: .9, anchors: [common, at(artifact.paragraphs[3]), at(artifact.paragraphs[6])], slotAnchorIndices: {}, metrics: { anchor_spread: 1, scene_coverage: 1, beat_density: 1, turn_position: 1 }, distributionAnchorIndices: { goal: [0], pressure: [1], beat: [1], turn: [2] } },
   ];
   const semantic: any = { version: 1, claims, sharedCause: { eventId: "unrealized", supported: true, confidence: .9, anchors: [common], links: [{ dimensionId: "d1", signalId: "voice-only", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "pacing-only", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } };
   const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v-plan", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-plan-pacing", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-plan-pacing" });
   const base = fixture(); base.state.consumedTicketIds.length = 0; base.state.revisionId = "v-plan"; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
   const result = await assessExperience({ plan, artifact }, { ...base.deps, contract: c, semanticJudgePort: { judge: async () => semantic } });
-  assert.equal(result.ok, true); if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
+  assert.equal(result.ok, true, JSON.stringify(result)); if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true, JSON.stringify(result.value.failedRuleIds)); }
+});
+test("event modality checks the containing clause even when judge anchors crop out the negation", async () => {
+  const base = fixture();
+  const artifact = { ...base.request.artifact, revisionId: "v-cropped", paragraphs: [...(base.request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>).paragraphs] } as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>;
+  artifact.paragraphs[0] = "Aria did not open the sealed gate and the mechanism records her choice.";
+  const prose = sourceForArtifact(artifact); const at = (quote: string) => ({ start: prose.indexOf(quote), end: prose.indexOf(quote) + quote.length, quote });
+  const action = at("open the sealed gate and the mechanism records her choice.");
+  const semantic: SemanticVerdict = { version: 1, claims: [
+    { version: 1, eventId: "cropped", dimensionId: "d1", signalId: "mechanic", supported: true, confidence: .9, anchors: [at("Aria"), action], slotAnchorIndices: { actor: 0, action: 1, object: 1, outcome: 1 }, slots: { actor: "Aria", action: "open", object: "gate", outcome: "records" } },
+    { version: 1, eventId: "cropped", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [action, at("At dusk Aria wins the duel"), at("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
+    { version: 1, eventId: "pace", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [at("Chapter title"), at("A spare, precise sentence"), at("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
+  ], sharedCause: { eventId: "cropped", supported: true, confidence: .9, anchors: [action], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 1, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } };
+  const digest = hashArtifact(artifact);
+  const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v-cropped", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-cropped", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-cropped" });
+  base.state.consumedTicketIds.length = 0; base.state.revisionId = "v-cropped"; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, { ...base.deps, semanticJudgePort: { judge: async () => semantic } });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
 });
 test("voice structure metrics cannot override a target-opposed semantic judgement", async () => {
   const opposed = fixture(async () => verdict({ claims: verdict().claims.map((claim) => claim.signalId === "voice" ? { ...claim, supported: false, metrics: { ...claim.metrics, anchor_spread: 1, scene_coverage: 1 } } : claim) }));
   const result = await assessExperience(opposed.request, opposed.deps);
   assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
 });
+test("zero-confidence claims and shared causes never produce evidence", async () => {
+  for (const semantic of [
+    () => verdict({ claims: verdict().claims.map((claim, index) => index === 0 ? { ...claim, confidence: 0 } : claim) }),
+    () => { const value = verdict(); value.sharedCause.confidence = 0; return value; },
+  ]) {
+    const input = fixture(async () => semantic()); const result = await assessExperience(input.request, input.deps);
+    assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
+  }
+});
 test("a fabricated judge quote never becomes evidence", async () => { const { request, deps } = fixture(async () => verdict({ claims: verdict().claims.map((claim, index) => index ? claim : { ...claim, anchors: [{ start: 0, end: 4, quote: "missing" }] }) })); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rewrite"); });
 test("ticket and authorization failures fail closed before a judge call", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const altered = { ...request, plan: { ...request.plan, chapterNumber: 9 } }; const result = await assessExperience(altered, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, "rejected"); assert.equal(calls, 0); });
+test("malformed or pre-versioned signed role payloads fail closed without invoking the judge", async () => {
+  for (const mutate of [(roles: any) => { delete roles.counterparts; }, (roles: any) => { delete roles.version; }]) {
+    let calls = 0; const base = fixture(async () => { calls += 1; return verdict(); }); const unsigned = structuredClone(base.request.plan) as any; delete unsigned.authorizationMac; mutate(unsigned.roleBindings); const plan = { ...unsigned, authorizationMac: signExperiencePlan(unsigned, secret) };
+    const result = await assessExperience({ ...base.request, plan }, base.deps);
+    assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rejected"); assert.equal(calls, 0);
+  }
+});
 test("all categories demand their local realized evidence", async () => { for (const slots of [{}, { actor: "Aria", action: "opens", object: "gate", outcome: "records" }]) { const { request, deps } = fixture(async () => verdict({ claims: verdict().claims.map((claim, index) => index ? claim : { ...claim, slots }) })); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok) return assert.fail(); assert.equal(result.value.status, slots.actor ? "accepted" : "rewrite"); } });
 
 test("anchors, artifact hashes, blueprint and retcon bindings are deterministic", async () => {
@@ -103,7 +140,7 @@ test("anchors, artifact hashes, blueprint and retcon bindings are deterministic"
   const canonicalBlueprint = { kind: "blueprint" as const, value: { meta: { z: 1 }, a: [true] } }; assert.equal(sourceForArtifact(canonicalBlueprint), '{"a":[true],"meta":{"z":1}}');
   const { request, deps, state } = fixture(); const blueprintPlan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-blue", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-blue" });
   const blueprint = { kind: "blueprint" as const, value: blueprintValue(blueprintPlan) }; state.artifactBindingId = blueprintPlan.artifactBindingId; state.expectedArtifactDigest = null; const blueprintDeps = { ...deps, semanticJudgePort: { judge: async () => blueprintVerdict(blueprintPlan) } }; const acceptedBlueprint = await assessExperience({ plan: blueprintPlan, artifact: blueprint }, blueprintDeps); assert.equal(acceptedBlueprint.ok, true); if (!acceptedBlueprint.ok) return assert.fail(); assert.equal(acceptedBlueprint.value.status, "accepted");
-  const retconArtifact = { ...request.artifact, kind: "retcon_revision" as const, revisionId: "v2" }; const retconDigest = hashArtifact(retconArtifact); const retconPlan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "retcon_revision", chapterId: "c1", revisionId: "v2", expectedArtifactDigest: retconDigest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-retcon", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-retcon" });
+  const chapterArtifact = request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>; const retconArtifact = { ...chapterArtifact, kind: "retcon_revision" as const, revisionId: "v2" }; const retconDigest = hashArtifact(retconArtifact); const retconPlan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "retcon_revision", chapterId: "c1", revisionId: "v2", expectedArtifactDigest: retconDigest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-retcon", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-retcon" });
   state.revisionId = "v2"; state.artifactBindingId = retconPlan.artifactBindingId; state.expectedArtifactDigest = retconDigest; const retcon = await assessExperience({ plan: retconPlan, artifact: retconArtifact }, deps); assert.equal(retcon.ok, true); if (!retcon.ok || retcon.value.status !== "accepted" || retcon.value.artifactKind !== "retcon_revision") return assert.fail(); assert.equal(retcon.value.evidence.every((item) => item.chapterRevisionId === "v2"), true); assert.equal(retcon.value.permit.revisionId, "v2");
 });
 
@@ -145,17 +182,36 @@ test("all five event categories are actually scheduled and locally verified", as
 });
 
 test("ticket CAS permits only one concurrent assessment and permit context is exact and one-time", async () => {
-  const { request, deps } = fixture(); const [left, right] = await Promise.all([assessExperience(request, deps), assessExperience(request, deps)]); const accepted = [left, right].filter((result) => result.ok && result.value.status === "accepted"); assert.equal(accepted.length, 1); const result = accepted[0]; if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const value = result.value; const context = { ticketId: value.permit.ticketId, jobId: value.permit.jobId, attempt: value.permit.attempt, contractRevisionId: value.permit.contractRevisionId, activationId: value.permit.activationId, branchId: value.permit.branchId, stage: value.permit.stage, artifactKind: value.permit.artifactKind, ruleGraphVersion: value.permit.ruleGraphVersion, expectedCanonVersion: value.permit.expectedCanonVersion, ledgerRevision: value.permit.ledgerRevision, chapterId: value.permit.chapterId, revisionId: value.permit.revisionId, artifactHash: value.permit.artifactHash, evidenceIds: value.permit.evidenceIds, ledgerPatchHash: value.permit.ledgerPatchHash }; assert.equal(verifyPublicationPermit(value.permit, {} as any, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, context, secret, now()), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), false);
+  const { request, deps } = fixture(); const [left, right] = await Promise.all([assessExperience(request, deps), assessExperience(request, deps)]); const accepted = [left, right].filter((result) => result.ok && result.value.status === "accepted"); assert.equal(accepted.length, 1); const result = accepted[0]; if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const value = result.value; const context = { ticketId: value.permit.ticketId, jobId: value.permit.jobId, attempt: value.permit.attempt, contractRevisionId: value.permit.contractRevisionId, activationId: value.permit.activationId, branchId: value.permit.branchId, stage: value.permit.stage, artifactKind: value.permit.artifactKind, ruleGraphVersion: value.permit.ruleGraphVersion, expectedCanonVersion: value.permit.expectedCanonVersion, ledgerRevision: value.permit.ledgerRevision, chapterId: value.permit.chapterId, revisionId: value.permit.revisionId, artifactBindingId: value.permit.artifactBindingId, artifactHash: value.permit.artifactHash, evidenceIds: value.permit.evidenceIds, ledgerPatchHash: value.permit.ledgerPatchHash }; assert.equal(verifyPublicationPermit(value.permit, {} as any, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, { ...context, artifactBindingId: "other-binding" }, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, context, secret, now()), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), false);
 });
 
-test("wrong digest and revision fail before judge", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const digest = await assessExperience({ ...request, plan: { ...request.plan, expectedArtifactDigest: "wrong" } }, deps); assert.equal(digest.ok, true); if (digest.ok) assert.equal(digest.value.status, "rejected"); const revision = await assessExperience({ ...request, artifact: { ...request.artifact, revisionId: "other" } }, deps); assert.equal(revision.ok, true); if (revision.ok) assert.equal(revision.value.status, "rejected"); assert.equal(calls, 0); });
+test("wrong digest and revision fail before judge", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const digest = await assessExperience({ ...request, plan: { ...request.plan, expectedArtifactDigest: "wrong" } }, deps); assert.equal(digest.ok, true); if (digest.ok) assert.equal(digest.value.status, "rejected"); const chapterArtifact = request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>; const revision = await assessExperience({ ...request, artifact: { ...chapterArtifact, revisionId: "other" } }, deps); assert.equal(revision.ok, true); if (revision.ok) assert.equal(revision.value.status, "rejected"); assert.equal(calls, 0); });
 
-test("an accepted assessment patch applies through the real ledger authorization gate", async () => { const { request, deps } = fixture(); const result = await assessExperience(request, deps); assert.equal(result.ok, true); if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const canon = { branchId: "main", canonVersion: 1, factReferences: [] }; const authorization = createLedgerAuthorization(request.plan, canon, result.value.evidence.map((item) => item.id), secret); const updated = applyExperienceLedgerPatch(ledger(), result.value.ledgerPatch, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon }); assert.equal(updated.revision, 2); assert.equal(result.value.canonFactCandidates.every((item) => item.evidenceId && item.anchors.length), true); });
+test("an accepted assessment patch applies prospective canon facts through the real ledger authorization gate", async () => {
+  const { request, deps } = fixture(); const result = await assessExperience(request, deps); assert.equal(result.ok, true);
+  if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail();
+  const accepted = result.value;
+  const oldFact = { id: "older-canon-fact", revisionId: "v0", kind: "mechanic" };
+  const canon = { branchId: "main", canonVersion: 1, factReferences: [oldFact] };
+  const authorization = createLedgerAuthorization(request.plan, canon, accepted.evidence, accepted.ledgerPatch, secret);
+  const initial = ledger(); initial.dimensions[0].persistentResults = [oldFact];
+  const updated = applyExperienceLedgerPatch(initial, accepted.ledgerPatch, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon });
+  assert.equal(updated.revision, 2); assert.equal(accepted.canonFactCandidates.every((item) => item.evidenceId && item.anchors.length), true);
+  const stored = updated.dimensions.flatMap((dimension) => dimension.persistentResults);
+  assert.deepEqual(stored.map((item) => item.id).sort(), [oldFact.id, ...accepted.canonFactCandidates.map((item) => item.id)].sort());
+  assert.deepEqual(accepted.ledgerPatch.canonFactCandidates, accepted.canonFactCandidates);
+
+  const tampered = structuredClone(accepted.ledgerPatch); tampered.canonFactCandidates[0].observation.outcome = "forged outcome";
+  assert.throws(() => createLedgerAuthorization(request.plan, canon, accepted.evidence, tampered, secret), { code: "unauthorized_fact" });
+  assert.throws(() => applyExperienceLedgerPatch(initial, tampered, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon }), { code: "plan_mismatch" });
+  const malformed = { ...structuredClone(accepted.ledgerPatch), canonFactCandidates: [null] } as any;
+  assert.throws(() => applyExperienceLedgerPatch(initial, malformed, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon }), { code: "invalid_authorization_payload" });
+});
 
 test("the final ticket CAS binds the live evidence collision set and catches port failures", async () => {
   const collision = fixture(); let sawEvidenceSet = false;
   collision.deps.statePort.consumeTicket = ((input: any) => {
-    sawEvidenceSet = Array.isArray(input.expected.existingEvidenceIds) && input.expected.existingEvidenceIds.length === 0 && Array.isArray(input.newEvidenceIds) && input.newEvidenceIds.length > 0;
+    sawEvidenceSet = input.expected.artifactBindingId === collision.request.plan.artifactBindingId && input.expected.expectedArtifactDigest === hashArtifact(collision.request.artifact) && Array.isArray(input.expected.existingEvidenceIds) && input.expected.existingEvidenceIds.length === 0 && Array.isArray(input.newEvidenceIds) && input.newEvidenceIds.length > 0;
     collision.state.existingEvidenceIds.push(input.newEvidenceIds[0]);
     return false;
   }) as any;
@@ -238,6 +294,16 @@ test("every required slot has a grounded pointer and trusted story-role identity
   }, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "relationship"); });
   const aliasResult = await assessExperience(wrongAlias.request, wrongAlias.deps);
   assert.equal(aliasResult.ok, true); if (aliasResult.ok) assert.equal(aliasResult.value.status, "rewrite");
+
+  const wrongActor = fixture(async () => {
+    const value = verdict(); const common = anchor("The city guard lowers his spear");
+    value.claims[0] = { version: 1, eventId: "shared-event", dimensionId: "d1", signalId: "relationship", supported: true, confidence: .9, anchors: [common, anchor("then Aria answers with a bow and they choose to travel together")], slotAnchorIndices: { actor: 0, action: 0, counterpart: 0, reciprocalAction: 1, relationshipChange: 1 } as any, slots: { actor: "guard", action: "lowers", counterpart: "guard", counterpartId: "guard-id", reciprocalAction: "answers", relationshipChange: "travel together" } as any };
+    value.claims[1] = { ...value.claims[1], anchors: [common, anchor("At dusk"), value.claims[1].anchors[2]] };
+    value.sharedCause.anchors = [common]; (value.sharedCause as any).links[0] = { dimensionId: "d1", signalId: "relationship", claimAnchorIndex: 0, sharedAnchorIndex: 0 };
+    return value;
+  }, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "relationship"); delete value.dimensions[0].observableSignals[0].semanticSlots; });
+  const actorResult = await assessExperience(wrongActor.request, wrongActor.deps);
+  assert.equal(actorResult.ok, true); if (actorResult.ok) assert.equal(actorResult.value.status, "rewrite");
 });
 
 test("curated adapters inspect the claimed event, not unrelated source text", async () => {
@@ -258,7 +324,7 @@ test("hard curated invariants scan the whole artifact before semantic judging", 
       { id: "outcome-global", dimensionId: "both", kind: "invariant", description: "The compiled protagonist outcome remains fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" } as any,
     );
   });
-  const artifact = { ...base.request.artifact, paragraphs: [...base.request.artifact.paragraphs, "Later the system is permanently unavailable and the protagonist surrenders."] };
+  const chapterArtifact = base.request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>; const artifact = { ...chapterArtifact, paragraphs: [...chapterArtifact.paragraphs, "Later the system is permanently unavailable and the protagonist surrenders."] };
   const digest = hashArtifact(artifact);
   const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-global-invariant", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-global-invariant" });
   base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
@@ -297,6 +363,10 @@ test("blueprint labels cannot masquerade as semantic delivery and confidence is 
   const labelsResult = await assessExperience({ plan: labels.plan, artifact: { kind: "blueprint", value: labelsValue } }, { ...labels.deps, semanticJudgePort: { judge: async () => blueprintVerdict(labels.plan) } });
   assert.equal(labelsResult.ok, true); if (labelsResult.ok) assert.equal(labelsResult.value.status, "rewrite");
 
+  const meta = make("blue-meta"); const metaValue = blueprintValue(meta.plan) as any; metaValue.chapters[0].event = "本章成功兑现全部信号和承诺，两个维度均已满足。";
+  const metaResult = await assessExperience({ plan: meta.plan, artifact: { kind: "blueprint", value: metaValue } }, { ...meta.deps, semanticJudgePort: { judge: async () => blueprintVerdict(meta.plan) } });
+  assert.equal(metaResult.ok, true); if (metaResult.ok) assert.equal(metaResult.value.status, "rewrite");
+
   const zero = make("blue-zero"); const zeroVerdict = blueprintVerdict(zero.plan); zeroVerdict.confidence = 0;
   const zeroResult = await assessExperience({ plan: zero.plan, artifact: { kind: "blueprint", value: blueprintValue(zero.plan) } }, { ...zero.deps, semanticJudgePort: { judge: async () => zeroVerdict } });
   assert.equal(zeroResult.ok, true); if (zeroResult.ok) assert.equal(zeroResult.value.status, "rewrite");
@@ -329,4 +399,71 @@ test("a tainted compiled contract never reaches the semantic judge while adapter
   const accepted = await assessExperience(adapterless.request, adapterless.deps);
   assert.equal(accepted.ok, true); if (accepted.ok) assert.equal(accepted.value.status, "accepted");
   assert.equal(captured.signals.find((item: any) => item.dimensionId === "d1").prohibitions.some((item: any) => item.id === "semantic-only"), true);
+  assert.equal(captured.signals.find((item: any) => item.dimensionId === "d1").prohibitions.find((item: any) => item.id === "semantic-only").description, "A concrete irreversible cost must remain after the choice.");
+});
+
+test("strict state storage rejects double binding and evidence collisions", () => {
+  const base = fixture();
+  const digest = hashArtifact(base.request.artifact);
+  const bindingPort = new StrictAssessmentStatePort();
+  bindingPort.register("strict-bind", "strict-job", { ...base.state, artifactBindingId: "binding-strict", expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  const bindInput = { ticketId: "strict-bind", artifactBindingId: "binding-strict", artifactHash: digest, expected: { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", expectedArtifactDigest: null as null } };
+  assert.equal(bindingPort.bindArtifactDigest!(bindInput), true);
+  assert.equal(bindingPort.bindArtifactDigest!(bindInput), false);
+
+  const collisionPort = new StrictAssessmentStatePort();
+  collisionPort.register("strict-collision", "strict-job", { ...base.state, artifactBindingId: "binding-collision", expectedArtifactDigest: digest, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: ["evidence-existing"] });
+  assert.equal(collisionPort.consumeTicket({ ticketId: "strict-collision", artifactHash: digest, outcomeId: "accepted-outcome", outcome: "accepted", newEvidenceIds: ["evidence-existing"], expected: { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: "binding-collision", expectedArtifactDigest: digest, existingEvidenceIds: ["evidence-existing"] } }), false);
+});
+
+test("module scheduling and assessment perform first binding while permit consumption binds digest and identity", async () => {
+  const base = fixture(); const statePort = new StrictAssessmentStatePort();
+  const moduleDeps = { ...base.deps, statePort, interpretationPort: { interpret: async () => { throw new Error("unused"); } }, ticketTtlMs: 60_000, createTicketId: () => "strict-module-ticket" };
+  const module = createReadingExperienceModule(moduleDeps);
+  const artifact = base.request.artifact;
+  const plan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "strict-module-job", attempt: 1 });
+  statePort.register(plan.ticket.id, plan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  const assessed = await module.assess({ plan, artifact });
+  assert.equal(assessed.ok, true, JSON.stringify(assessed));
+  if (!assessed.ok || assessed.value.status !== "accepted" || assessed.value.artifactKind === "blueprint") return assert.fail();
+  const publication = assessed.value;
+  const { version: _version, permitId: _permitId, expiresAt: _expiresAt, signature: _signature, ...context } = publication.permit;
+  const permitDigest = createHash("sha256").update(canonicalAuthorizationPayload(publication.permit)).digest("hex");
+  statePort.authorizePermit(publication.permit.permitId, "wrong-digest");
+  assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
+  statePort.authorizePermit(publication.permit.permitId, permitDigest);
+  statePort.mutate(plan.ticket.id, { artifactBindingId: "binding-drift" });
+  assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
+  statePort.mutate(plan.ticket.id, { artifactBindingId: plan.artifactBindingId });
+  assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), true);
+  assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
+});
+
+test("a full repair uses a new draft binding and atomically prevents repair-token replay", async () => {
+  let judgeCalls = 0;
+  const base = fixture(async () => verdict()); const statePort = new StrictAssessmentStatePort();
+  const moduleDeps = { ...base.deps, statePort, semanticJudgePort: { judge: async () => { judgeCalls += 1; const value = verdict(); if (judgeCalls === 1) value.claims[0].supported = false; return value; } }, interpretationPort: { interpret: async () => { throw new Error("unused"); } }, ticketTtlMs: 60_000, createTicketId: (request: any) => `repair-ticket-${request.artifactBindingId ?? request.attempt}` };
+  const module = createReadingExperienceModule(moduleDeps);
+  const roles = { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] };
+  const firstPlan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", roleBindings: roles, chapterNumber: 1, jobId: "repair-job", attempt: 1 });
+  statePort.register(firstPlan.ticket.id, firstPlan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: firstPlan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  const failed = await module.assess({ plan: firstPlan, artifact: base.request.artifact });
+  assert.equal(failed.ok, true, JSON.stringify(failed)); if (!failed.ok || failed.value.status !== "rewrite") return assert.fail();
+  const token = failed.value.repairToken; const expected = repairContext(token); const tokenDigest = createHash("sha256").update(canonicalAuthorizationPayload(token)).digest("hex");
+  const newArtifact = { ...base.request.artifact, paragraphs: [...(base.request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>).paragraphs, "x"] } as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>;
+  assert.notEqual(hashArtifact(newArtifact), token.artifactHash);
+  const secondPlan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", artifactBindingId: "repair-binding-new", roleBindings: roles, chapterNumber: 1, repair: { token, expected }, jobId: "repair-job", attempt: 2 });
+  assert.notEqual(secondPlan.artifactBindingId, token.artifactBindingId);
+  statePort.register(secondPlan.ticket.id, secondPlan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 2, chapterId: "c1", revisionId: "v1", artifactBindingId: secondPlan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  statePort.authorizeRepair(token.repairId, "wrong-digest", expected);
+  const wrongDigest = await module.assess({ plan: secondPlan, artifact: newArtifact });
+  assert.equal(wrongDigest.ok, true); if (wrongDigest.ok) assert.equal(wrongDigest.value.status, "rejected");
+  statePort.authorizeRepair(token.repairId, tokenDigest, expected);
+  const repaired = await module.assess({ plan: secondPlan, artifact: newArtifact });
+  assert.equal(repaired.ok, true, JSON.stringify(repaired)); if (repaired.ok) assert.equal(repaired.value.status, "accepted", JSON.stringify(repaired.value));
+
+  const replayPlan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", artifactBindingId: "repair-binding-replay", roleBindings: roles, chapterNumber: 1, repair: { token, expected }, jobId: "repair-job", attempt: 2 });
+  statePort.register(replayPlan.ticket.id, replayPlan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 2, chapterId: "c1", revisionId: "v1", artifactBindingId: replayPlan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
+  const callsBeforeReplay = judgeCalls; const replayed = await module.assess({ plan: replayPlan, artifact: newArtifact });
+  assert.equal(replayed.ok, true); if (replayed.ok) assert.equal(replayed.value.status, "rejected"); assert.equal(judgeCalls, callsBeforeReplay);
 });

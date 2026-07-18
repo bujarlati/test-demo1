@@ -49,7 +49,7 @@ function dimension(descriptor: string, kind: "protagonist_action" | "voice"): In
         description: "人物在具体压力下作出改变局势的选择，并留下可验证的结果。",
         kind,
         verification: distribution
-          ? { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.3, paragraph_consistency: 0.3, scene_coverage: 1 } }
+          ? { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1 } }
           : { kind: "event_slots", requiredSlots: ["actor", "action", "outcome"], minimumAnchors: 2 },
         persistence: "chapter",
       },
@@ -57,8 +57,8 @@ function dimension(descriptor: string, kind: "protagonist_action" | "voice"): In
         description: "选择引发他人或环境的可见反应，使新的处境延续到后续事件。",
         kind,
         verification: distribution
-          ? { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.3, paragraph_consistency: 0.3, scene_coverage: 1 } }
-          : { kind: "event_slots", requiredSlots: ["actor", "action", "reaction"], minimumAnchors: 2 },
+          ? { kind: "distribution", metricIds: ["anchor_spread", "scene_coverage", "paragraph_consistency"], minimumAnchors: 3, requireSemanticJudge: true, requiredRegions: ["opening", "middle", "ending"], regionSemantics: "paragraph", metricThresholds: { anchor_spread: 0.35, paragraph_consistency: 0.35, scene_coverage: 1 } }
+          : { kind: "event_slots", requiredSlots: ["actor", "action", "outcome"], minimumAnchors: 2 },
         persistence: "cross_chapter",
       },
     ],
