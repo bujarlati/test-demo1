@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
+import { evidenceRootHash, issuePublicationPermit, ledgerPatchHash, sortedEvidenceBindings } from "../server/readingExperienceModule/publication";
 import { canonicalAuthorizationPayload, scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceDebtV2, ExperienceEvidenceV2, ExperienceLedgerV2 } from "../src/types";
 import type { ExperienceLedgerPatch } from "../server/readingExperienceModule/types";
@@ -76,8 +77,18 @@ function fakeEvidence(plan: ReturnType<typeof scheduleExperience>, patch: Experi
   });
 }
 
+function permitFor(plan: ReturnType<typeof scheduleExperience>, patch: ExperienceLedgerPatch, evidence: ExperienceEvidenceV2[], key = secret) {
+  const bindings = sortedEvidenceBindings(evidence); const artifactHash = evidence[0]?.sourceHash ?? plan.expectedArtifactDigest ?? "empty-evidence-digest";
+  const context = { ticketId: plan.ticket.id, jobId: plan.ticket.jobId, attempt: plan.ticket.attempt, contractRevisionId: plan.ticket.contractRevisionId, activationId: plan.ticket.activationId, branchId: plan.ticket.branchId, stage: plan.stage, artifactKind: plan.artifactKind, ruleGraphVersion: plan.ticket.ruleGraphVersion, expectedCanonVersion: plan.ticket.expectedCanonVersion, ledgerRevision: plan.ticket.ledgerRevision, chapterId: plan.chapterId!, revisionId: plan.revisionId!, artifactBindingId: plan.artifactBindingId, artifactHash, evidenceIds: bindings.map((binding) => binding.evidenceId).sort(), evidenceBindings: bindings.map((binding) => ({ ...binding })), evidenceRootHash: evidenceRootHash(bindings), ledgerPatchHash: ledgerPatchHash(patch) };
+  return issuePublicationPermit(context, `permit-${plan.ticket.id}`, new Date(now().getTime() + 60_000).toISOString(), key);
+}
+
+function ledgerAuthorization(plan: ReturnType<typeof scheduleExperience>, canon: ReturnType<typeof request>["canon"], evidence: ExperienceEvidenceV2[], patch: ExperienceLedgerPatch, key = secret) {
+  return createLedgerAuthorization(plan, canon, evidence, patch, key, permitFor(plan, patch, evidence, key));
+}
+
 function authorizationFor(plan: ReturnType<typeof scheduleExperience>, patch: ExperienceLedgerPatch, key = secret, canon = request().canon) {
-  return createLedgerAuthorization(plan, canon, fakeEvidence(plan, patch), patch, key);
+  return ledgerAuthorization(plan, canon, fakeEvidence(plan, patch), patch, key);
 }
 
 function ledgerDepsFor(plan: ReturnType<typeof scheduleExperience>, patch: ExperienceLedgerPatch) {
@@ -149,9 +160,10 @@ test("tickets use canonical fixed-field signing and reject tamper, expiry, reuse
   assert.throws(() => applyExperienceLedgerPatch(ledger(), { ...patch, ticket: { ...ticket, expiresAt: "2026-07-16T00:00:00.000Z" } }, trustedDeps), { code: "ticket_tampered" });
   assert.throws(() => applyExperienceLedgerPatch(ledger(), { ...patch, ticket: { ...ticket, expiresAt: "2026-07-16T00:00:00.000Z", signature: createHmac("sha256", secret).update([ticket.id, ticket.contractRevisionId, ticket.activationId, ticket.ledgerRevision, ticket.branchId, ticket.expectedCanonVersion, ticket.ruleGraphVersion, ticket.stage, ticket.artifactKind, ticket.jobId, ticket.attempt, "2026-07-16T00:00:00.000Z"].join("\u001f")).digest("base64url") } }, trustedDeps), { code: "ticket_expired" });
   const canon = request().canon; const evidence = fakeEvidence(plan, patch);
-  assert.throws(() => createLedgerAuthorization(plan, canon, [null] as any, patch, secret), { code: "unauthorized_delivery" });
+  const validPermit = permitFor(plan, patch, evidence, secret);
+  assert.throws(() => createLedgerAuthorization(plan, canon, [null] as any, patch, secret, validPermit), { code: "unauthorized_delivery" });
   const malformed = structuredClone(patch) as any; delete malformed.deliveredSignalIdsByDimension;
-  const malformedAuthorization = createLedgerAuthorization(plan, canon, evidence, malformed, secret);
+  const malformedAuthorization = ledgerAuthorization(plan, canon, evidence, malformed, secret);
   assert.throws(() => applyExperienceLedgerPatch(ledger(), malformed, { ...deps, authorization: malformedAuthorization, liveCanon: canon }), { code: "invalid_authorization_payload" });
 });
 
@@ -179,7 +191,7 @@ test("due soft promises raise the selected per-dimension minimum and overdue deb
     ticket: softPlan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2,
     deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["soft-rolling"], evidenceIds: [], canonFactCandidates: [], promiseEvidenceLinks: { "soft-rolling": { dimension_action: [] } },
   };
-  assert.throws(() => applyExperienceLedgerPatch(ledger(), insufficientPatch, { ...deps, contract: revised, authorization: createLedgerAuthorization(softPlan, request().canon, [], insufficientPatch, secret), liveCanon: request().canon }), { code: "unauthorized_delivery" });
+  assert.throws(() => applyExperienceLedgerPatch(ledger(), insufficientPatch, { ...deps, contract: revised, authorization: ledgerAuthorization(softPlan, request().canon, [], insufficientPatch, secret), liveCanon: request().canon }), { code: "unauthorized_delivery" });
 
   const carried = scheduleExperience(request({
     chapterNumber: 4,
@@ -239,14 +251,14 @@ test("signed promise links are dimension-bound and count distinct signals", () =
   const base: ExperienceLedgerPatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-action", "evidence-voice"], canonFactCandidates: [], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action"] }, "hard-voice": { dimension_voice: ["evidence-voice"] }, "soft-rolling": { dimension_action: ["evidence-action"] } } };
   const evidence = fakeEvidence(plan, base);
   const swapped = structuredClone(base); swapped.promiseEvidenceLinks["hard-action"].dimension_action = ["evidence-voice"]; swapped.promiseEvidenceLinks["hard-voice"].dimension_voice = ["evidence-action"];
-  const swappedAuthorization = createLedgerAuthorization(plan, request().canon, evidence, swapped, secret);
+  const swappedAuthorization = ledgerAuthorization(plan, request().canon, evidence, swapped, secret);
   assert.throws(() => applyExperienceLedgerPatch(ledger(), swapped, { ...deps, authorization: swappedAuthorization, liveCanon: request().canon }), { code: "unauthorized_delivery" });
 
   const revised = contract(); revised.promises.find((promise) => promise.id === "hard-action")!.minimumSignals = 2;
   const twoPlan = scheduleExperience(request({ contract: revised }), deps);
   const sameSignal: ExperienceLedgerPatch = { ...structuredClone(base), ticket: twoPlan.ticket, deliveredSignalIdsByDimension: { ...base.deliveredSignalIdsByDimension, dimension_action: ["dimension_action_mechanic", "dimension_action_relationship"] }, evidenceIds: ["evidence-action-a", "evidence-action-b", "evidence-voice"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action-a", "evidence-action-b"] }, "hard-voice": { dimension_voice: ["evidence-voice"] }, "soft-rolling": { dimension_action: ["evidence-action-a"] } } };
   const duplicateSignalEvidence = fakeEvidence(twoPlan, sameSignal);
-  const duplicateAuthorization = createLedgerAuthorization(twoPlan, request().canon, duplicateSignalEvidence, sameSignal, secret);
+  const duplicateAuthorization = ledgerAuthorization(twoPlan, request().canon, duplicateSignalEvidence, sameSignal, secret);
   assert.throws(() => applyExperienceLedgerPatch(ledger(), sameSignal, { ...deps, contract: revised, authorization: duplicateAuthorization, liveCanon: request().canon }), { code: "unauthorized_delivery" });
 });
 
@@ -257,7 +269,7 @@ test("authorization snapshots and scheduled plans are immutable and reject unaut
   const canon = request().canon;
   const patch: ExperienceLedgerPatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-action", "evidence-voice"], canonFactCandidates: [], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action"] }, "hard-voice": { dimension_voice: ["evidence-voice"] } } };
   const evidence = fakeEvidence(plan, patch);
-  const authorization = createLedgerAuthorization(plan, canon, evidence, patch, secret);
+  const authorization = ledgerAuthorization(plan, canon, evidence, patch, secret);
   canon.factReferences.length = 0;
   evidence.push({ ...evidence[0], id: "changed" });
   assert.deepEqual(authorization.canon.factReferences, [{ id: "canon-fact", revisionId: "chapter-1", kind: "mechanic" }]);
@@ -290,8 +302,8 @@ test("authorization rejects fabricated plans and scheduling never freezes caller
   assert.equal(Object.isFrozen(mutableRequest.contract.dimensions[0].observableSignals[0].verification), false);
   const patch: ExperienceLedgerPatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-action", "evidence-voice"], canonFactCandidates: [], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action"] }, "hard-voice": { dimension_voice: ["evidence-voice"] } } };
   const evidence = fakeEvidence(plan, patch);
-  assert.throws(() => createLedgerAuthorization({ ...plan, chapterNumber: 99 }, request().canon, evidence, patch, secret), { code: "plan_mismatch" });
-  assert.doesNotThrow(() => createLedgerAuthorization(plan, request().canon, evidence, patch, secret));
+  assert.throws(() => createLedgerAuthorization({ ...plan, chapterNumber: 99 }, request().canon, evidence, patch, secret, permitFor(plan, patch, evidence, secret)), { code: "plan_mismatch" });
+  assert.doesNotThrow(() => ledgerAuthorization(plan, request().canon, evidence, patch, secret));
 });
 
 test("satisfied soft promises do not block hard-only patches and debt comparison is dimension-safe", () => {
@@ -304,7 +316,8 @@ test("CAS rejects an authorization MACed with an attacker-chosen key", () => {
   const { authorizationMac: _ignored, ...unsignedPlan } = { ...plan, chapterNumber: 99 };
   const forgedPlan = { ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, "attacker-key") };
   const patch: ExperienceLedgerPatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-action", "evidence-voice"], canonFactCandidates: [], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action"] }, "hard-voice": { dimension_voice: ["evidence-voice"] }, "soft-rolling": { dimension_action: ["evidence-action"] } } };
-  const forged = createLedgerAuthorization(forgedPlan, request().canon, fakeEvidence(forgedPlan, patch), patch, "attacker-key");
+  const forgedEvidence = fakeEvidence(forgedPlan, patch);
+  const forged = ledgerAuthorization(forgedPlan, request().canon, forgedEvidence, patch, "attacker-key");
   assert.throws(() => applyExperienceLedgerPatch(ledger(), patch, { ...deps, authorization: forged, liveCanon: request().canon }), { code: "plan_mismatch" });
 });
 

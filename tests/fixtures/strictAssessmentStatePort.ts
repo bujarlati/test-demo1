@@ -19,7 +19,7 @@ export class StrictAssessmentStatePort implements AssessmentStatePort {
   private readonly consumedRepairs = new Set<string>();
   private readonly evidenceIds = new Set<string>();
   private readonly repairRecords = new Map<string, { tokenDigest: string; expected: RepairTokenContext }>();
-  private readonly permitRecords = new Map<string, string>();
+  private readonly permitRecords = new Map<string, { permitDigest: string; context: PermitInput["context"] }>();
 
   register(ticketId: string, jobId: string, state: AssessmentState): void {
     if (this.states.has(ticketId)) throw new Error("duplicate ticket state");
@@ -35,12 +35,6 @@ export class StrictAssessmentStatePort implements AssessmentStatePort {
     const registered = this.states.get(ticketId); if (!registered) throw new Error("unknown ticket state");
     Object.assign(registered.state, structuredClone(values));
   }
-
-  authorizeRepair(repairId: string, tokenDigest: string, expected: RepairTokenContext): void {
-    this.repairRecords.set(repairId, { tokenDigest, expected: structuredClone(expected) });
-  }
-
-  authorizePermit(permitId: string, permitDigest: string): void { this.permitRecords.set(permitId, permitDigest); }
 
   private registered(ticketId: string): RegisteredState | undefined { return this.states.get(ticketId); }
 
@@ -79,6 +73,12 @@ export class StrictAssessmentStatePort implements AssessmentStatePort {
     const registered = this.registered(input.ticketId); if (!registered) return false;
     const state = registered.state; const newEvidence = [...input.newEvidenceIds];
     if (!same(input.expected, this.ticketExpected(state)) || !state.expectedArtifactDigest || input.artifactHash !== state.expectedArtifactDigest || this.consumedTickets.has(input.ticketId) || !input.outcomeId || new Set(newEvidence).size !== newEvidence.length || newEvidence.some((id) => this.evidenceIds.has(id))) return false;
+    const issued = input.issuedAuthorization;
+    if (input.outcome === "accepted") {
+      if (!issued || issued.kind !== "permit" || issued.permitId !== input.outcomeId || this.permitRecords.has(issued.permitId) || issued.context.ticketId !== input.ticketId || issued.context.artifactHash !== input.artifactHash || !same([...issued.context.evidenceIds].sort(), [...newEvidence].sort())) return false;
+    } else if (input.outcome === "rewrite") {
+      if (!issued || issued.kind !== "repair" || issued.repairId !== input.outcomeId || this.repairRecords.has(issued.repairId) || issued.context.ticketId !== input.ticketId || issued.context.artifactHash !== input.artifactHash || newEvidence.length) return false;
+    } else if (issued) return false;
     if (input.repairAuthorization) {
       const known = this.repairRecords.get(input.repairAuthorization.repairId);
       if (!known || this.consumedRepairs.has(input.repairAuthorization.repairId) || input.repairAuthorization.tokenDigest !== known.tokenDigest || !same(input.repairAuthorization.expected, known.expected)) return false;
@@ -86,6 +86,8 @@ export class StrictAssessmentStatePort implements AssessmentStatePort {
     this.consumedTickets.add(input.ticketId);
     newEvidence.forEach((id) => this.evidenceIds.add(id));
     if (input.repairAuthorization) this.consumedRepairs.add(input.repairAuthorization.repairId);
+    if (issued?.kind === "permit") this.permitRecords.set(issued.permitId, { permitDigest: issued.permitDigest, context: structuredClone(issued.context) });
+    if (issued?.kind === "repair") this.repairRecords.set(issued.repairId, { tokenDigest: issued.tokenDigest, expected: structuredClone(issued.context) });
     return true;
   }
 
@@ -93,7 +95,8 @@ export class StrictAssessmentStatePort implements AssessmentStatePort {
     const registered = this.registered(input.ticketId); if (!registered) return false;
     const state = registered.state;
     const expected = { activationId: state.activationId, branchId: state.branchId, canonVersion: state.canonVersion, ledgerRevision: state.ledgerRevision, attempt: state.attempt, chapterId: state.chapterId, revisionId: state.revisionId, artifactBindingId: state.artifactBindingId, expectedArtifactDigest: state.expectedArtifactDigest };
-    if (!state.chapterId || !state.revisionId || !state.expectedArtifactDigest || !same(input.expected, expected) || !this.consumedTickets.has(input.ticketId) || this.consumedPermits.has(input.permitId) || this.permitRecords.get(input.permitId) !== input.permitDigest) return false;
+    const known = this.permitRecords.get(input.permitId);
+    if (!state.chapterId || !state.revisionId || !state.expectedArtifactDigest || !same(input.expected, expected) || !this.consumedTickets.has(input.ticketId) || this.consumedPermits.has(input.permitId) || !known || known.permitDigest !== input.permitDigest || !same(known.context, input.context)) return false;
     this.consumedPermits.add(input.permitId);
     return true;
   }

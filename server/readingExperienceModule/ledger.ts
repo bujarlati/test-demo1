@@ -1,7 +1,7 @@
 import type { ExperienceEvidenceV2, ExperienceLedgerV2 } from "../../src/types";
-import type { ExperienceLedgerPatch, LedgerAuthorization, LedgerDependencies, LedgerEvidenceBinding } from "./types";
+import type { ExperienceLedgerPatch, ExperiencePublicationPermit, ExperienceStagePlan, LedgerAuthorization, LedgerDependencies, LedgerEvidenceBinding, PublicationPermitContext } from "./types";
 import { canonicalAuthorizationPayload, ExperienceSchedulingError, sameMac, signExperiencePlan, signLedgerAuthorizationRoot, verifyExperienceStageTicket } from "./scheduler";
-import { canonFactCandidateId, cleanAuthorizationValue, evidenceBinding, ledgerPatchHash } from "./publication";
+import { canonFactCandidateId, cleanAuthorizationValue, evidenceRootHash, ledgerPatchHash, publicationPermitContext, sortedEvidenceBindings, verifyPublicationPermit, verifyPublicationPermitSignature } from "./publication";
 
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -13,12 +13,23 @@ function deepFreeze<T>(value: T): T {
 
 const authenticAuthorizations = new WeakSet<object>();
 
+function expectedPermitContext(plan: ExperienceStagePlan, patch: ExperienceLedgerPatch, bindings: ReadonlyArray<LedgerEvidenceBinding>, permit: ExperiencePublicationPermit): PublicationPermitContext {
+  return {
+    ticketId: plan.ticket.id, jobId: plan.ticket.jobId, attempt: plan.ticket.attempt, contractRevisionId: plan.ticket.contractRevisionId,
+    activationId: plan.ticket.activationId, branchId: plan.ticket.branchId, stage: plan.stage, artifactKind: plan.artifactKind,
+    ruleGraphVersion: plan.ticket.ruleGraphVersion, expectedCanonVersion: plan.ticket.expectedCanonVersion, ledgerRevision: plan.ticket.ledgerRevision,
+    chapterId: plan.chapterId ?? "", revisionId: plan.revisionId ?? "", artifactBindingId: plan.artifactBindingId, artifactHash: permit.artifactHash,
+    evidenceIds: bindings.map((binding) => binding.evidenceId).sort(), evidenceBindings: bindings.map((binding) => ({ ...binding })), evidenceRootHash: evidenceRootHash(bindings), ledgerPatchHash: ledgerPatchHash(patch),
+  };
+}
+
 export function createLedgerAuthorization(
   plan: LedgerAuthorization["plan"],
   canon: LedgerAuthorization["canon"],
   evidence: ReadonlyArray<ExperienceEvidenceV2>,
   patch: ExperienceLedgerPatch,
   ticketSecret: string,
+  publicationPermit: ExperiencePublicationPermit,
 ): LedgerAuthorization {
   try {
     const { authorizationMac, ...unsignedPlan } = plan;
@@ -27,10 +38,13 @@ export function createLedgerAuthorization(
     const evidenceById = new Map(evidence.map((item) => [item?.id, item]));
     if (evidenceById.size !== evidence.length || evidence.some((item) => !item || typeof item !== "object" || !item.id || !item.dimensionId || !item.signalId || !item.chapterRevisionId || !item.sourceHash)) throw new ExperienceSchedulingError("unauthorized_delivery");
     if (patch.canonFactCandidates.some((candidate) => { const source = evidenceById.get(candidate.evidenceId); return !source || candidate.revisionId !== source.chapterRevisionId || candidate.dimensionId !== source.dimensionId || candidate.signalId !== source.signalId || canonicalAuthorizationPayload(cleanAuthorizationValue(candidate.observation)) !== canonicalAuthorizationPayload(cleanAuthorizationValue(source.observation)) || canonicalAuthorizationPayload(candidate.anchors) !== canonicalAuthorizationPayload(source.anchors); })) throw new ExperienceSchedulingError("unauthorized_fact");
-    const evidenceBindings = evidence.map(evidenceBinding).sort((left, right) => left.evidenceId.localeCompare(right.evidenceId));
+    const evidenceBindings = sortedEvidenceBindings(evidence);
     if (new Set(evidenceBindings.map((item) => item.evidenceId)).size !== evidenceBindings.length) throw new ExperienceSchedulingError("unauthorized_delivery");
     const authorizedPatchHash = ledgerPatchHash(patch);
-    const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceBindings, authorizedPatchHash, authorizationRootMac: signLedgerAuthorizationRoot(plan, canon, evidenceBindings, authorizedPatchHash, ticketSecret) })) as LedgerAuthorization;
+    if (evidence.some((item) => item.contractRevisionId !== plan.ticket.contractRevisionId || item.activationId !== plan.ticket.activationId || item.branchId !== plan.ticket.branchId || item.ticketId !== plan.ticket.id || item.jobId !== plan.ticket.jobId || item.attempt !== plan.ticket.attempt || item.stage !== plan.stage || item.artifactKind !== plan.artifactKind || item.ruleGraphVersion !== plan.ticket.ruleGraphVersion || item.expectedCanonVersion !== plan.ticket.expectedCanonVersion || item.ledgerRevision !== plan.ticket.ledgerRevision || item.chapterId !== plan.chapterId || item.chapterRevisionId !== plan.revisionId || item.status !== "supported")) throw new ExperienceSchedulingError("unauthorized_delivery");
+    const permitContext = expectedPermitContext(plan, patch, evidenceBindings, publicationPermit);
+    if (!verifyPublicationPermitSignature(publicationPermit, permitContext, ticketSecret)) throw new ExperienceSchedulingError("unauthorized_delivery");
+    const snapshot = deepFreeze(structuredClone({ plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit, authorizationRootMac: signLedgerAuthorizationRoot(plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit, ticketSecret) })) as LedgerAuthorization;
     authenticAuthorizations.add(snapshot);
     return snapshot;
   } catch (error) {
@@ -72,10 +86,10 @@ function sameFact(left: { id: string; revisionId: string; kind: string }, right:
 function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: ExperienceLedgerPatch, deps: LedgerDependencies): void {
   if (!patch.promiseEvidenceLinks || typeof patch.promiseEvidenceLinks !== "object" || Array.isArray(patch.promiseEvidenceLinks) || Object.values(patch.promiseEvidenceLinks).some((links) => !links || typeof links !== "object" || Array.isArray(links) || Object.values(links).some((ids) => !Array.isArray(ids) || ids.some((id) => typeof id !== "string")))) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (!validCandidates(patch.canonFactCandidates)) throw new ExperienceSchedulingError("invalid_authorization_payload");
-  const { plan, canon, evidenceBindings, authorizedPatchHash } = deps.authorization;
+  const { plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit } = deps.authorization;
   if (!authenticAuthorizations.has(deps.authorization)) throw new ExperienceSchedulingError("plan_mismatch");
   const { authorizationMac, ...unsignedPlan } = plan;
-  if (!sameMac(authorizationMac, signExperiencePlan(unsignedPlan, deps.ticketSecret)) || !sameMac(deps.authorization.authorizationRootMac, signLedgerAuthorizationRoot(plan, canon, evidenceBindings, authorizedPatchHash, deps.ticketSecret)) || authorizedPatchHash !== ledgerPatchHash(patch)) throw new ExperienceSchedulingError("plan_mismatch");
+  if (!sameMac(authorizationMac, signExperiencePlan(unsignedPlan, deps.ticketSecret)) || !sameMac(deps.authorization.authorizationRootMac, signLedgerAuthorizationRoot(plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit, deps.ticketSecret)) || authorizedPatchHash !== ledgerPatchHash(patch)) throw new ExperienceSchedulingError("plan_mismatch");
   if (!sameTicket(plan.ticket, patch.ticket)
     || plan.chapterNumber !== patch.chapterNumber
     || plan.stage !== patch.ticket.stage
@@ -90,6 +104,8 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
   const plannedDimensions = new Map(plan.promptProjection.dimensions.map((dimension) => [dimension.id, dimension]));
   const bindings = new Map(evidenceBindings.map((binding) => [binding.evidenceId, binding]));
   if (bindings.size !== evidenceBindings.length || evidenceBindings.some((binding) => !binding.evidenceId || !binding.dimensionId || !binding.signalId || !binding.chapterRevisionId || !binding.sourceHash || !/^[a-f\d]{64}$/i.test(binding.evidenceDigest) || binding.chapterRevisionId !== plan.revisionId || plan.expectedArtifactDigest !== undefined && binding.sourceHash !== plan.expectedArtifactDigest)) throw new ExperienceSchedulingError("unauthorized_delivery");
+  const permitContext = expectedPermitContext(plan, patch, evidenceBindings, publicationPermit);
+  if (!verifyPublicationPermit(publicationPermit, permitContext, deps.ticketSecret, deps.now()) || canonicalAuthorizationPayload(publicationPermitContext(publicationPermit)) !== canonicalAuthorizationPayload(permitContext) || evidenceBindings.some((binding) => binding.sourceHash !== publicationPermit.artifactHash)) throw new ExperienceSchedulingError("unauthorized_delivery");
   const suppliedDimensionIds = new Set([
     ...Object.keys(patch.deliveredSignalIdsByDimension),
     ...Object.keys(patch.persistentResultsByDimension),

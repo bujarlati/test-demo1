@@ -198,6 +198,7 @@ export interface LedgerAuthorization {
   readonly canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] };
   readonly evidenceBindings: LedgerEvidenceBinding[];
   readonly authorizedPatchHash: string;
+  readonly publicationPermit: ExperiencePublicationPermit;
   readonly authorizationRootMac: string;
 }
 
@@ -285,6 +286,9 @@ export interface ExperiencePublicationPermit {
   expectedCanonVersion: number;
   ledgerRevision: number;
   evidenceIds: string[];
+  evidenceBindings: LedgerEvidenceBinding[];
+  /** Content commitment over the complete, sorted evidence bindings and bodies. */
+  evidenceRootHash: string;
   ledgerPatchHash: string;
   permitId: string;
   expiresAt: string;
@@ -321,8 +325,8 @@ export interface AssessmentState {
 
 export interface AssessmentStatePort {
   read(input: { ticketId: string; jobId: string }): Promise<AssessmentState> | AssessmentState;
-  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; newEvidenceIds: readonly string[]; repairAuthorization?: { repairId: string; tokenDigest: string; expected: RepairTokenContext }; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; artifactBindingId: string; expectedArtifactDigest?: string; existingEvidenceIds: readonly string[] } }): Promise<boolean> | boolean;
-  consumePermit(input: { permitId: string; ticketId: string; permitDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId: string; revisionId: string; artifactBindingId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
+  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; newEvidenceIds: readonly string[]; issuedAuthorization?: { kind: "permit"; permitId: string; permitDigest: string; context: PublicationPermitContext } | { kind: "repair"; repairId: string; tokenDigest: string; context: RepairTokenContext }; repairAuthorization?: { repairId: string; tokenDigest: string; expected: RepairTokenContext }; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; artifactBindingId: string; expectedArtifactDigest?: string; existingEvidenceIds: readonly string[] } }): Promise<boolean> | boolean;
+  consumePermit(input: { permitId: string; ticketId: string; permitDigest: string; context: PublicationPermitContext; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId: string; revisionId: string; artifactBindingId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
   consumeRepair(input: { repairId: string; ticketId: string; tokenDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; artifactBindingId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
   bindArtifactDigest?(input: { ticketId: string; artifactBindingId: string; artifactHash: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest: null } }): Promise<boolean> | boolean;
 }
@@ -334,7 +338,7 @@ export type RepairTokenContext =
 export interface PublicationPermitContext {
   ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
   stage: ExperienceStage; artifactKind: ExperienceArtifactKind; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number;
-  chapterId: string; revisionId: string; artifactBindingId: string; artifactHash: string; evidenceIds: readonly string[]; ledgerPatchHash: string;
+  chapterId: string; revisionId: string; artifactBindingId: string; artifactHash: string; evidenceIds: readonly string[]; evidenceBindings: readonly LedgerEvidenceBinding[]; evidenceRootHash: string; ledgerPatchHash: string;
 }
 
 export interface ExperienceRepairToken {

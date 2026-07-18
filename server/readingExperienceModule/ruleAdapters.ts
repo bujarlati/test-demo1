@@ -167,18 +167,46 @@ function termStem(value: string): string {
   return /^[a-z]+$/u.test(normalized) ? normalized.replace(/(?:ing|ed|es|s)$/u, "") : normalized;
 }
 
-function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realizationTerms: readonly string[] = []): boolean {
+export interface RealizationBinding {
+  actor?: string;
+  action?: string;
+  object?: string;
+  reaction?: string;
+  counterpart?: string;
+  opponent?: string;
+}
+
+function termIndex(source: string, term: string): number {
+  const expected = termStem(term); if (!expected) return -1;
+  const normalized = source.normalize("NFKC").toLocaleLowerCase();
+  if (!/^[a-z]+$/u.test(expected)) return normalized.indexOf(expected);
+  const token = /[a-z]+/gu; for (const match of normalized.matchAll(token)) if (termStem(match[0]) === expected) return match.index!;
+  return -1;
+}
+
+function boundRealizationInOneClause(tail: string, value: RealizationBinding): boolean {
+  const predicate = value.action ?? value.reaction;
+  if (!value.actor || !predicate) return false;
+  const requiredObjects = [value.object, value.counterpart, value.opponent].filter((term): term is string => typeof term === "string" && !!term.trim());
+  const clauses = tail.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
+  return clauses.some((clause) => {
+    const predicateAt = termIndex(clause, predicate); const actorAt = termIndex(clause, value.actor!);
+    return predicateAt >= 0 && actorAt >= 0 && actorAt < predicateAt && requiredObjects.every((term) => termIndex(clause, term) >= 0);
+  });
+}
+
+function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realization: readonly string[] | RealizationBinding = []): boolean {
   const marker = reversalMarker.exec(source);
   if (!marker) return false;
   const tail = source.slice(marker.index + marker[0].length);
-  const tailTerms = tail.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (realizationTerms.some((term) => { const expected = termStem(term); return expected && !tailTerms.some((candidate) => { const actual = termStem(candidate); return actual === expected || (!/^[a-z]+$/u.test(expected) && actual.includes(expected)); }); })) return false;
   if (id === "curated-mechanic-unavailable") return /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(tail);
   if (id === "curated-outcome-weakened") return /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(tail);
+  const binding: RealizationBinding = Array.isArray(realization) ? { actor: realization[0], action: realization[1], object: realization[2] } : realization as RealizationBinding;
+  if (Object.values(binding).some((term) => typeof term === "string" && !!term.trim())) return boundRealizationInOneClause(tail, binding);
   return realizedAfterReversal.test(tail);
 }
 
-export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realizationTerms: readonly string[] = []): boolean {
+export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realization: readonly string[] | RealizationBinding = []): boolean {
   const pattern = genericAdapters[id];
   const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
   const matches = [...source.matchAll(matcher)];
@@ -186,11 +214,11 @@ export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realiza
   if (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") {
     return matches.some((match, index) => {
       const next = matches[index + 1]?.index ?? source.length;
-      return !hasRealizedReversal(id, source.slice(match.index!, next), realizationTerms);
+      return !hasRealizedReversal(id, source.slice(match.index!, next), realization);
     });
   }
   // A rejected possibility followed by a directly narrated realization is not
   // evidence of non-realization.  The assessor still grounds the positive event.
-  if (hasRealizedReversal(id, source, realizationTerms)) return false;
+  if (hasRealizedReversal(id, source, realization)) return false;
   return true;
 }

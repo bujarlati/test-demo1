@@ -10,6 +10,7 @@ import type {
   SchedulerDependencies,
   GenericRuleAdapterId,
   LedgerEvidenceBinding,
+  ExperiencePublicationPermit,
 } from "./types";
 import { isRuleAdapterId } from "./ruleAdapters";
 
@@ -92,8 +93,8 @@ export function signExperiencePlan(plan: Omit<ExperienceStagePlan, "authorizatio
   return createHmac("sha256", secret).update(canonicalAuthorizationPayload(plan)).digest("base64url");
 }
 
-export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceBindings: LedgerEvidenceBinding[], authorizedPatchHash: string, secret: string): string {
-  return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceBindings, authorizedPatchHash })).digest("base64url");
+export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceBindings: LedgerEvidenceBinding[], authorizedPatchHash: string, publicationPermit: ExperiencePublicationPermit, secret: string): string {
+  return createHmac("sha256", secret).update(canonicalAuthorizationPayload({ plan, canon, evidenceBindings, authorizedPatchHash, publicationPermit })).digest("base64url");
 }
 
 export function sameMac(left: string, right: string): boolean {

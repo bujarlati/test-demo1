@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import test from "node:test";
 import { canonicalAuthorizationPayload, repairContext, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import { assessExperience, consumePublicationPermit, verifyPublicationPermit } from "../server/readingExperienceModule/assessor";
@@ -7,6 +6,7 @@ import { createReadingExperienceModule } from "../server/readingExperienceModule
 import { hashArtifact, sourceForArtifact } from "../server/readingExperienceModule/evidence";
 import { signExperiencePlan, signExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
+import { sortedEvidenceBindings } from "../server/readingExperienceModule/publication";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
 import type { AssessExperienceRequest, AssessorDependencies, SemanticVerdict } from "../server/readingExperienceModule/types";
 import { StrictAssessmentStatePort } from "./fixtures/strictAssessmentStatePort";
@@ -182,7 +182,7 @@ test("all five event categories are actually scheduled and locally verified", as
 });
 
 test("ticket CAS permits only one concurrent assessment and permit context is exact and one-time", async () => {
-  const { request, deps } = fixture(); const [left, right] = await Promise.all([assessExperience(request, deps), assessExperience(request, deps)]); const accepted = [left, right].filter((result) => result.ok && result.value.status === "accepted"); assert.equal(accepted.length, 1); const result = accepted[0]; if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const value = result.value; const context = { ticketId: value.permit.ticketId, jobId: value.permit.jobId, attempt: value.permit.attempt, contractRevisionId: value.permit.contractRevisionId, activationId: value.permit.activationId, branchId: value.permit.branchId, stage: value.permit.stage, artifactKind: value.permit.artifactKind, ruleGraphVersion: value.permit.ruleGraphVersion, expectedCanonVersion: value.permit.expectedCanonVersion, ledgerRevision: value.permit.ledgerRevision, chapterId: value.permit.chapterId, revisionId: value.permit.revisionId, artifactBindingId: value.permit.artifactBindingId, artifactHash: value.permit.artifactHash, evidenceIds: value.permit.evidenceIds, ledgerPatchHash: value.permit.ledgerPatchHash }; assert.equal(verifyPublicationPermit(value.permit, {} as any, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, { ...context, artifactBindingId: "other-binding" }, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, context, secret, now()), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), false);
+  const { request, deps } = fixture(); const [left, right] = await Promise.all([assessExperience(request, deps), assessExperience(request, deps)]); const accepted = [left, right].filter((result) => result.ok && result.value.status === "accepted"); assert.equal(accepted.length, 1); const result = accepted[0]; if (!result.ok || result.value.status !== "accepted" || result.value.artifactKind !== "chapter") return assert.fail(); const value = result.value; const context = { ticketId: value.permit.ticketId, jobId: value.permit.jobId, attempt: value.permit.attempt, contractRevisionId: value.permit.contractRevisionId, activationId: value.permit.activationId, branchId: value.permit.branchId, stage: value.permit.stage, artifactKind: value.permit.artifactKind, ruleGraphVersion: value.permit.ruleGraphVersion, expectedCanonVersion: value.permit.expectedCanonVersion, ledgerRevision: value.permit.ledgerRevision, chapterId: value.permit.chapterId, revisionId: value.permit.revisionId, artifactBindingId: value.permit.artifactBindingId, artifactHash: value.permit.artifactHash, evidenceIds: value.permit.evidenceIds, evidenceBindings: value.permit.evidenceBindings, evidenceRootHash: value.permit.evidenceRootHash, ledgerPatchHash: value.permit.ledgerPatchHash }; assert.equal(verifyPublicationPermit(value.permit, {} as any, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, { ...context, artifactBindingId: "other-binding" }, secret, now()), false); assert.equal(verifyPublicationPermit(value.permit, context, secret, now()), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), true); assert.equal(await consumePublicationPermit(value.permit, context, deps), false);
 });
 
 test("wrong digest and revision fail before judge", async () => { let calls = 0; const { request, deps } = fixture(async () => { calls++; return verdict(); }); const digest = await assessExperience({ ...request, plan: { ...request.plan, expectedArtifactDigest: "wrong" } }, deps); assert.equal(digest.ok, true); if (digest.ok) assert.equal(digest.value.status, "rejected"); const chapterArtifact = request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>; const revision = await assessExperience({ ...request, artifact: { ...chapterArtifact, revisionId: "other" } }, deps); assert.equal(revision.ok, true); if (revision.ok) assert.equal(revision.value.status, "rejected"); assert.equal(calls, 0); });
@@ -193,16 +193,23 @@ test("an accepted assessment patch applies prospective canon facts through the r
   const accepted = result.value;
   const oldFact = { id: "older-canon-fact", revisionId: "v0", kind: "mechanic" };
   const canon = { branchId: "main", canonVersion: 1, factReferences: [oldFact] };
-  const authorization = createLedgerAuthorization(request.plan, canon, accepted.evidence, accepted.ledgerPatch, secret);
+  const authorization = createLedgerAuthorization(request.plan, canon, accepted.evidence, accepted.ledgerPatch, secret, accepted.permit);
   const initial = ledger(); initial.dimensions[0].persistentResults = [oldFact];
   const updated = applyExperienceLedgerPatch(initial, accepted.ledgerPatch, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon });
   assert.equal(updated.revision, 2); assert.equal(accepted.canonFactCandidates.every((item) => item.evidenceId && item.anchors.length), true);
   const stored = updated.dimensions.flatMap((dimension) => dimension.persistentResults);
   assert.deepEqual(stored.map((item) => item.id).sort(), [oldFact.id, ...accepted.canonFactCandidates.map((item) => item.id)].sort());
   assert.deepEqual(accepted.ledgerPatch.canonFactCandidates, accepted.canonFactCandidates);
+  assert.deepEqual(accepted.permit.evidenceBindings, sortedEvidenceBindings(accepted.evidence));
+
+  const replacedEvidence = structuredClone(accepted.evidence);
+  const replaceable = replacedEvidence.find((item) => item.signalId === "voice");
+  assert.ok(replaceable);
+  replaceable.observation.distributionMetrics = { ...(replaceable.observation.distributionMetrics ?? {}), anchor_spread: 0.999 };
+  assert.throws(() => createLedgerAuthorization(request.plan, canon, replacedEvidence, accepted.ledgerPatch, secret, accepted.permit), { code: "unauthorized_delivery" });
 
   const tampered = structuredClone(accepted.ledgerPatch); tampered.canonFactCandidates[0].observation.outcome = "forged outcome";
-  assert.throws(() => createLedgerAuthorization(request.plan, canon, accepted.evidence, tampered, secret), { code: "unauthorized_fact" });
+  assert.throws(() => createLedgerAuthorization(request.plan, canon, accepted.evidence, tampered, secret, accepted.permit), { code: "unauthorized_fact" });
   assert.throws(() => applyExperienceLedgerPatch(initial, tampered, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon }), { code: "plan_mismatch" });
   const malformed = { ...structuredClone(accepted.ledgerPatch), canonFactCandidates: [null] } as any;
   assert.throws(() => applyExperienceLedgerPatch(initial, malformed, { ticketSecret: secret, ticketTtlMs: 60_000, now, contract: deps.contract, authorization, liveCanon: canon }), { code: "invalid_authorization_payload" });
@@ -428,10 +435,6 @@ test("module scheduling and assessment perform first binding while permit consum
   if (!assessed.ok || assessed.value.status !== "accepted" || assessed.value.artifactKind === "blueprint") return assert.fail();
   const publication = assessed.value;
   const { version: _version, permitId: _permitId, expiresAt: _expiresAt, signature: _signature, ...context } = publication.permit;
-  const permitDigest = createHash("sha256").update(canonicalAuthorizationPayload(publication.permit)).digest("hex");
-  statePort.authorizePermit(publication.permit.permitId, "wrong-digest");
-  assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
-  statePort.authorizePermit(publication.permit.permitId, permitDigest);
   statePort.mutate(plan.ticket.id, { artifactBindingId: "binding-drift" });
   assert.equal(await consumePublicationPermit(publication.permit, context, moduleDeps), false);
   statePort.mutate(plan.ticket.id, { artifactBindingId: plan.artifactBindingId });
@@ -449,16 +452,12 @@ test("a full repair uses a new draft binding and atomically prevents repair-toke
   statePort.register(firstPlan.ticket.id, firstPlan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: firstPlan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
   const failed = await module.assess({ plan: firstPlan, artifact: base.request.artifact });
   assert.equal(failed.ok, true, JSON.stringify(failed)); if (!failed.ok || failed.value.status !== "rewrite") return assert.fail();
-  const token = failed.value.repairToken; const expected = repairContext(token); const tokenDigest = createHash("sha256").update(canonicalAuthorizationPayload(token)).digest("hex");
+  const token = failed.value.repairToken; const expected = repairContext(token);
   const newArtifact = { ...base.request.artifact, paragraphs: [...(base.request.artifact as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>).paragraphs, "x"] } as Extract<AssessExperienceRequest["artifact"], { kind: "chapter" }>;
   assert.notEqual(hashArtifact(newArtifact), token.artifactHash);
   const secondPlan = module.schedule({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", artifactBindingId: "repair-binding-new", roleBindings: roles, chapterNumber: 1, repair: { token, expected }, jobId: "repair-job", attempt: 2 });
   assert.notEqual(secondPlan.artifactBindingId, token.artifactBindingId);
   statePort.register(secondPlan.ticket.id, secondPlan.ticket.jobId, { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 2, chapterId: "c1", revisionId: "v1", artifactBindingId: secondPlan.artifactBindingId, expectedArtifactDigest: null, consumedTicketIds: [], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [] });
-  statePort.authorizeRepair(token.repairId, "wrong-digest", expected);
-  const wrongDigest = await module.assess({ plan: secondPlan, artifact: newArtifact });
-  assert.equal(wrongDigest.ok, true); if (wrongDigest.ok) assert.equal(wrongDigest.value.status, "rejected");
-  statePort.authorizeRepair(token.repairId, tokenDigest, expected);
   const repaired = await module.assess({ plan: secondPlan, artifact: newArtifact });
   assert.equal(repaired.ok, true, JSON.stringify(repaired)); if (repaired.ok) assert.equal(repaired.value.status, "accepted", JSON.stringify(repaired.value));
 
