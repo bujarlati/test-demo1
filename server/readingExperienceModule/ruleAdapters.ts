@@ -147,7 +147,7 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
   "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能)/i,
   "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?)\b|(?:计划|打算)/i,
   "event-failed-attempt": /\b(?:attempt(?:s|ed)?|fail(?:s|ed)?)\b|(?:试图|失败)/i,
-  "event-simulation": /\b(?:dream|simulation|prediction|conditional)\b|(?:梦境|模拟|预测|如果)/i,
+  "event-simulation": /\b(?:dream|simulation|predict(?:s|ed|ion)?|conditional|would|might)\b|(?:梦境|做梦|模拟|预测|预言|如果)/i,
   "event-hearsay": /\b(?:hearsay|rumou?r)\b|(?:据说|传闻)/i,
   "helper-substitution": /\bhelper\b|(?:他人代做|旁人替代)/i,
   "contains-pasted-label": /\b(?:label|descriptor)\b|(?:标签|描述词)/i,
@@ -156,6 +156,28 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
 };
 
 export function isRuleAdapterId(id: string): id is GenericRuleAdapterId { return Object.hasOwn(genericAdapters, id); }
+
+const eventCategories = new Set<ExperienceCategory>(["mechanic", "protagonist_action", "conflict_outcome", "world_reaction", "relationship"]);
+
+/** Adapter/category compatibility is code-owned; model output cannot choose a harmless adapter. */
+export function adapterAppliesTo(id: GenericRuleAdapterId, category: ExperienceCategory): boolean {
+  if (id === "curated-mechanic-unavailable") return category === "mechanic";
+  if (id === "curated-outcome-weakened") return category === "conflict_outcome";
+  if (id === "helper-substitution") return category === "mechanic" || category === "protagonist_action" || category === "conflict_outcome";
+  return eventCategories.has(category);
+}
+
+const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|实际上|现实中|尘埃散去|紧接着)/i;
+const realizedAfterReversal = /(?:\b(?:opened?|defeated?|won|succeeded?|activated?|responded?|confirmed?|acted?)\b|打开|开启|击败|获胜|制胜|成功|生效|反馈|奖励|弹出|记录|改变|确认|亲眼看见|毫发无损)/i;
+function hasRealizedReversal(source: string): boolean {
+  const marker = reversalMarker.exec(source);
+  return !!marker && realizedAfterReversal.test(source.slice(marker.index + marker[0].length));
+}
+
 export function runRuleAdapter(id: GenericRuleAdapterId, source: string): boolean {
-  return genericAdapters[id].test(source);
+  if (!genericAdapters[id].test(source)) return false;
+  // A rejected possibility followed by a directly narrated realization is not
+  // evidence of non-realization.  The assessor still grounds the positive event.
+  if (hasRealizedReversal(source)) return false;
+  return true;
 }

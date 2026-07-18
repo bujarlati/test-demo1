@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHmac } from "node:crypto";
 import { hashArtifact, groundClaim, sourceForArtifact } from "../server/readingExperienceModule/evidence";
-import { scheduleExperience } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, scheduleExperience } from "../server/readingExperienceModule/scheduler";
+import type { ExperienceRepairToken } from "../server/readingExperienceModule/types";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
+import { adapterAppliesTo, runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
 
 const now = () => new Date("2026-07-18T00:00:00.000Z");
 
@@ -31,4 +34,51 @@ test("scheduler signs trusted story roles and never guesses protagonist from sig
   const plan = scheduleExperience({ contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c", revisionId: "v", expectedArtifactDigest: "digest", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j", attempt: 1 }, { now, ticketSecret: "s", ticketTtlMs: 60_000 });
   assert.deepEqual(plan.roleBindings, { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [] });
   assert.equal(plan.promptProjection.dimensions.every((dimension) => !("roleBindings" in dimension)), true);
+});
+
+function signedRepair(): ExperienceRepairToken {
+  const unsigned = { version: 1 as const, repairId: "repair-1", ticketId: "old-ticket", jobId: "j", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b", stage: "opening" as const, artifactKind: "chapter" as const, ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1, chapterNumber: 1, chapterId: "c", revisionId: "v", artifactBindingId: "old-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: [], opponentIds: [] }, artifactHash: "digest", failedRuleIds: ["evidence.not_realized"], expiresAt: "2026-07-18T00:05:00.000Z" };
+  const signature = createHmac("sha256", "s").update("reading-experience:repair:v1").update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
+  return { ...unsigned, signature };
+}
+
+test("rewrite scheduling carries a valid repair token into a fresh synchronous plan", async () => {
+  const consumed = new Set<string>(); let consumes = 0;
+  const token = signedRepair(); const expected = { ticketId: token.ticketId, jobId: token.jobId, attempt: token.attempt, contractRevisionId: token.contractRevisionId, activationId: token.activationId, branchId: token.branchId, stage: token.stage, artifactKind: token.artifactKind, ruleGraphVersion: (token as any).ruleGraphVersion, expectedCanonVersion: token.expectedCanonVersion, ledgerRevision: token.ledgerRevision, chapterNumber: (token as any).chapterNumber, chapterId: token.chapterId!, revisionId: token.revisionId!, artifactBindingId: (token as any).artifactBindingId, roleBindings: (token as any).roleBindings, artifactHash: token.artifactHash, failedRuleIds: token.failedRuleIds };
+  const request = { contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter" as const, chapterId: "c", revisionId: "v", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j", attempt: 2, repair: { token, expected } };
+  const deps: any = { now, ticketSecret: "s", ticketTtlMs: 60_000, statePort: { consumeRepair: async ({ repairId }: any) => { consumes++; if (consumed.has(repairId)) return false; consumed.add(repairId); return true; } } };
+  const plan = scheduleExperience(request, deps); assert.equal(plan.stage, "rewrite"); assert.equal(plan.ticket.attempt, 2); assert.equal(plan.expectedArtifactDigest, undefined); assert.notEqual(plan.artifactBindingId, (token as any).artifactBindingId); assert.deepEqual((plan as any).repairRuleIds, token.failedRuleIds); assert.equal(consumes, 0);
+  assert.equal(scheduleExperience(request, deps).repairAuthorization?.token.repairId, token.repairId);
+  assert.throws(() => scheduleExperience({ ...request, attempt: 3 }, deps), { code: "plan_mismatch" });
+  assert.throws(() => scheduleExperience({ ...request, repair: { token: { ...token, failedRuleIds: ["forged"] }, expected } }, deps), { code: "plan_mismatch" });
+
+  let prematureConsumes = 0;
+  const freshDeps: any = { ...deps, statePort: { consumeRepair: () => { prematureConsumes++; return true; } } };
+  assert.throws(() => scheduleExperience({ ...request, stage: "opening" }, freshDeps), { code: "invalid_stage" });
+  assert.equal(prematureConsumes, 0);
+});
+
+test("deterministic modality adapters reject unrealized events but allow explicit realization reversals", () => {
+  const unrealized: Array<[any, string]> = [
+    ["event-negated", "Aria did not open the gate."],
+    ["event-intent", "Aria plans to open the gate tomorrow."],
+    ["event-failed-attempt", "Aria attempted and failed to open the gate."],
+    ["event-simulation", "In a dream simulation Aria opened the gate."],
+    ["event-simulation", "The oracle predicted Aria would open the gate."],
+    ["event-hearsay", "Rumour says Aria opened the gate."],
+    ["helper-substitution", "A helper opened it for Aria."],
+    ["contains-pasted-label", "The descriptor label says she is invincible."],
+  ];
+  for (const [id, text] of unrealized) assert.equal(runRuleAdapter(id, text), true, `${id}:${text}`);
+  assert.equal(runRuleAdapter("event-negated", "他没有退后，反而击败了守卫。"), false);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "敌人讥笑面板没有反馈，下一刻面板弹出永久奖励。"), false);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "旁观者误以为主角惨败，尘埃散去他毫发无损并一击制胜。"), false);
+});
+
+test("adapter applicability is closed by narrative category", () => {
+  assert.equal(adapterAppliesTo("curated-mechanic-unavailable", "mechanic"), true);
+  assert.equal(adapterAppliesTo("curated-mechanic-unavailable", "voice"), false);
+  assert.equal(adapterAppliesTo("curated-outcome-weakened", "conflict_outcome"), true);
+  assert.equal(adapterAppliesTo("helper-substitution", "relationship"), false);
+  assert.equal(adapterAppliesTo("event-simulation", "relationship"), true);
 });

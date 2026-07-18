@@ -82,8 +82,8 @@ export interface SemanticEvidenceClaim {
   supported: boolean;
   confidence: number;
   anchors: SemanticEvidenceAnchor[];
-  slotAnchorIndices: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", number>>;
-  slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange", string>>;
+  slotAnchorIndices: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", number>>;
+  slots?: Partial<Record<"actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "counterpartId" | "opponent" | "opponentId", string>>;
   metrics?: Record<string, number>;
 }
 
@@ -97,11 +97,22 @@ export interface SemanticEvidenceCase {
   synthesis: { sharedCause: string; dimensionRoles: [string, string] };
   signals: Array<{ dimensionId: string; signalId: string; kind: string; interpretation: string; description: string; semanticSlots?: Record<string, string>; policy: EvidencePolicy; canonFactReferences: CanonFactReferenceV2[]; prohibitions: Array<{ id: string; kind: string; severity: string; ruleAdapterId?: string }> }>;
 }
-export interface SemanticSharedCauseClaim { eventId: string; supported: boolean; confidence: number; anchors: SemanticEvidenceAnchor[] }
+export interface SemanticSharedCauseLink { dimensionId: string; signalId: string; claimAnchorIndex: number; sharedAnchorIndex: number }
+export interface SemanticSharedCauseClaim { eventId: string; supported: boolean; confidence: number; anchors: SemanticEvidenceAnchor[]; links: SemanticSharedCauseLink[] }
 export interface SemanticVerdict { version: 1; claims: SemanticEvidenceClaim[]; sharedCause: SemanticSharedCauseClaim }
 
+export interface SemanticBlueprintVerdict {
+  version: 1;
+  kind: "blueprint";
+  signals: Array<{ dimensionId: string; signalId: string; pointer: string; supported: boolean }>;
+  promises: Array<{ promiseId: string; pointer: string; supported: boolean }>;
+  ending: { targetPointer: string; costPointer: string; supported: boolean; systemState: "available" | "unavailable" | "not_applicable"; protagonistOutcome: "fulfilled" | "defeated" | "unresolved"; hasRealCost: boolean };
+  sharedCause: { pointer: string; dimensionIds: string[]; supported: boolean };
+  confidence: number;
+}
+
 export interface ExperienceSemanticJudgePort {
-  judge(input: SemanticEvidenceCase, options?: { signal: AbortSignal }): Promise<SemanticVerdict>;
+  judge(input: SemanticEvidenceCase, options?: { signal: AbortSignal }): Promise<SemanticVerdict | SemanticBlueprintVerdict>;
 }
 
 export interface ExperienceStageTicket {
@@ -133,9 +144,10 @@ export interface ScheduleExperienceRequest {
   revisionId?: string;
   /** Digest of the pre-approved output manifest, when a producer has one. */
   expectedArtifactDigest?: string;
+  artifactBindingId?: string;
   roleBindings?: { protagonistId: string; aliases: string[]; counterpartIds?: string[]; opponentIds?: string[] };
   chapterNumber?: number;
-  failedRuleIds?: string[];
+  repair?: { token: ExperienceRepairToken; expected: RepairTokenContext };
   jobId: string;
   attempt: number;
 }
@@ -151,6 +163,7 @@ export interface ExperienceStagePlan {
   chapterId?: string;
   revisionId?: string;
   expectedArtifactDigest?: string;
+  artifactBindingId: string;
   roleBindings: { protagonistId: string; aliases: string[]; counterpartIds: string[]; opponentIds: string[] };
   stage: ExperienceStage;
   artifactKind: ExperienceArtifactKind;
@@ -163,6 +176,10 @@ export interface ExperienceStagePlan {
   dueSoftPromiseIds: string[];
   carriedDebtPromiseIds: string[];
   newDebts: ScheduledExperienceDebt[];
+  /** Failed rules authorized by a consumed repair token; empty for first drafts. */
+  repairRuleIds: string[];
+  /** Signed failed-draft authorization, consumed atomically with assessment. */
+  repairAuthorization?: { token: ExperienceRepairToken; expected: RepairTokenContext; tokenDigest: string };
   authorizationMac: string;
   ticket: ExperienceStageTicket;
 }
@@ -204,7 +221,8 @@ export interface ExperienceLedgerPatch {
   newDebtsByDimension: Record<string, ExperienceDebtV2[]>;
   deliveredPromiseIds: string[];
   evidenceIds: string[];
-  promiseEvidenceLinks: Record<string, string[]>;
+  /** Promise -> dimension -> evidence IDs; `both` promises never collapse axes. */
+  promiseEvidenceLinks: Record<string, Record<string, string[]>>;
 }
 
 export type ExperienceSchedulingErrorCode =
@@ -282,15 +300,21 @@ export interface AssessmentState {
   existingEvidenceIds: readonly string[];
   chapterId?: string;
   revisionId?: string;
-  expectedArtifactDigest?: string;
+  artifactBindingId: string;
+  expectedArtifactDigest: string | null;
 }
 
 export interface AssessmentStatePort {
   read(input: { ticketId: string; jobId: string }): Promise<AssessmentState> | AssessmentState;
-  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest?: string } }): Promise<boolean> | boolean;
-  consumePermit(input: { permitId: string; ticketId: string }): Promise<boolean> | boolean;
-  consumeRepair(input: { repairId: string; ticketId: string }): Promise<boolean> | boolean;
+  consumeTicket(input: { ticketId: string; artifactHash: string; outcomeId: string; outcome: "accepted" | "rewrite" | "rejected" | "blueprint"; newEvidenceIds: readonly string[]; repairAuthorization?: { repairId: string; tokenDigest: string; expected: RepairTokenContext }; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest?: string; existingEvidenceIds: readonly string[] } }): Promise<boolean> | boolean;
+  consumePermit(input: { permitId: string; ticketId: string; permitDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId: string; revisionId: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
+  consumeRepair(input: { repairId: string; ticketId: string; tokenDigest: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest: string } }): Promise<boolean> | boolean;
+  bindArtifactDigest?(input: { ticketId: string; artifactBindingId: string; artifactHash: string; expected: { activationId: string; branchId: string; canonVersion: number; ledgerRevision: number; attempt: number; chapterId?: string; revisionId?: string; expectedArtifactDigest: null } }): Promise<boolean> | boolean;
 }
+
+export type RepairTokenContext =
+  | { ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string; stage: ExperienceStage; artifactKind: "blueprint"; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number; chapterNumber: number; artifactBindingId: string; roleBindings: ExperienceStagePlan["roleBindings"]; artifactHash: string; failedRuleIds: readonly string[] }
+  | { ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string; stage: ExperienceStage; artifactKind: "chapter" | "retcon_revision"; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number; chapterNumber: number; chapterId: string; revisionId: string; artifactBindingId: string; roleBindings: ExperienceStagePlan["roleBindings"]; artifactHash: string; failedRuleIds: readonly string[] };
 
 export interface PublicationPermitContext {
   ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
@@ -300,7 +324,7 @@ export interface PublicationPermitContext {
 
 export interface ExperienceRepairToken {
   version: 1; repairId: string; ticketId: string; jobId: string; attempt: number; contractRevisionId: string; activationId: string; branchId: string;
-  stage: ExperienceStage; artifactKind: ExperienceArtifactKind; expectedCanonVersion: number; ledgerRevision: number; chapterId?: string; revisionId?: string; artifactHash: string; failedRuleIds: string[]; expiresAt: string; signature: string;
+  stage: ExperienceStage; artifactKind: ExperienceArtifactKind; ruleGraphVersion: string; expectedCanonVersion: number; ledgerRevision: number; chapterNumber: number; chapterId?: string; revisionId?: string; artifactBindingId: string; roleBindings: ExperienceStagePlan["roleBindings"]; artifactHash: string; failedRuleIds: string[]; expiresAt: string; signature: string;
 }
 
 export type ExperienceAssessment =

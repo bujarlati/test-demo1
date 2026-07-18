@@ -46,6 +46,7 @@ function sameFact(left: { id: string; revisionId: string; kind: string }, right:
 }
 
 function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: ExperienceLedgerPatch, deps: LedgerDependencies): void {
+  if (!patch.promiseEvidenceLinks || typeof patch.promiseEvidenceLinks !== "object" || Array.isArray(patch.promiseEvidenceLinks) || Object.values(patch.promiseEvidenceLinks).some((links) => !links || typeof links !== "object" || Array.isArray(links) || Object.values(links).some((ids) => !Array.isArray(ids) || ids.some((id) => typeof id !== "string")))) throw new ExperienceSchedulingError("unauthorized_delivery");
   const { plan, canon, evidenceIds } = deps.authorization;
   if (!authenticAuthorizations.has(deps.authorization)) throw new ExperienceSchedulingError("plan_mismatch");
   const { authorizationMac, ...unsignedPlan } = plan;
@@ -82,7 +83,12 @@ function assertTrustedAuthorization(ledger: ExperienceLedgerV2, patch: Experienc
     if (relevantDimensions.some((dimensionId) => (patch.deliveredSignalIdsByDimension[dimensionId] ?? []).length < promise.minimumSignals)) {
       throw new ExperienceSchedulingError("unauthorized_delivery");
     }
+    const links = patch.promiseEvidenceLinks[promiseId];
+    if (!links || Object.keys(links).sort().join("|") !== [...relevantDimensions].sort().join("|")) throw new ExperienceSchedulingError("unauthorized_delivery");
+    const linked = relevantDimensions.flatMap((dimensionId) => links[dimensionId] ?? []);
+    if (relevantDimensions.some((dimensionId) => (links[dimensionId] ?? []).length < promise.minimumSignals) || new Set(linked).size !== linked.length || linked.some((id) => !patch.evidenceIds.includes(id))) throw new ExperienceSchedulingError("unauthorized_delivery");
   }
+  if (Object.keys(patch.promiseEvidenceLinks).sort().join("|") !== [...patch.deliveredPromiseIds].sort().join("|")) throw new ExperienceSchedulingError("unauthorized_delivery");
   if (new Set(patch.evidenceIds).size !== patch.evidenceIds.length || patch.evidenceIds.length !== evidenceIds.length || patch.evidenceIds.some((evidenceId) => !evidenceIds.includes(evidenceId))) throw new ExperienceSchedulingError("unauthorized_delivery");
   for (const [dimensionId, facts] of Object.entries(patch.persistentResultsByDimension)) {
     const planned = plannedDimensions.get(dimensionId)!;

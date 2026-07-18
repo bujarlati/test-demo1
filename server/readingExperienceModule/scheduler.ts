@@ -102,9 +102,9 @@ export function sameMac(left: string, right: string): boolean {
 }
 
 function derivedStage(request: ScheduleExperienceRequest): ExperienceStage {
+  if (request.repair) return "rewrite";
   if (request.artifactKind === "blueprint") return "blueprint";
   if (request.artifactKind === "retcon_revision") return "retcon";
-  if (request.failedRuleIds?.length) return "rewrite";
   return request.chapterNumber === request.activation.effectiveFromChapter ? "opening" : "continuation";
 }
 
@@ -222,10 +222,10 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
   if (request.artifactKind !== "blueprint") {
-    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !request.expectedArtifactDigest?.trim() || !request.roleBindings?.protagonistId.trim() || !Array.isArray(request.roleBindings.aliases) || request.roleBindings.aliases.length === 0 || request.roleBindings.aliases.some((alias) => !alias.trim())) throw new ExperienceSchedulingError("invalid_authorization_payload");
+    if (!request.chapterId?.trim() || !request.revisionId?.trim() || !request.roleBindings?.protagonistId.trim() || !Array.isArray(request.roleBindings.aliases) || request.roleBindings.aliases.length === 0 || request.roleBindings.aliases.some((alias) => !alias.trim())) throw new ExperienceSchedulingError("invalid_authorization_payload");
   }
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
@@ -272,6 +272,7 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     ...(request.chapterId ? { chapterId: request.chapterId } : {}),
     ...(request.revisionId ? { revisionId: request.revisionId } : {}),
     ...(request.expectedArtifactDigest ? { expectedArtifactDigest: request.expectedArtifactDigest } : {}),
+    artifactBindingId: request.artifactBindingId ?? `binding_${stableToken(canonicalAuthorizationPayload([request.contract.id, request.activation.id, request.canon.branchId, request.chapterId ?? "blueprint", request.revisionId ?? "blueprint", request.jobId, request.attempt]))}`,
     roleBindings: {
       protagonistId: request.roleBindings?.protagonistId ?? "",
       aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [],
@@ -292,7 +293,41 @@ export function scheduleExperience(request: ScheduleExperienceRequest, deps: Sch
     dueSoftPromiseIds: soft.due.map((promise) => promise.id),
     carriedDebtPromiseIds: soft.carried,
     newDebts: soft.debts,
+    repairRuleIds: request.repair ? [...new Set(request.repair.token.failedRuleIds)].sort() : [],
+    ...(request.repair ? { repairAuthorization: { token: structuredClone(request.repair.token), expected: structuredClone(request.repair.expected), tokenDigest: createHash("sha256").update(canonicalAuthorizationPayload(request.repair.token)).digest("hex") } } : {}),
     ticket: { ...unsigned, signature: signExperienceStageTicket(unsigned, deps.ticketSecret) },
   };
   return deepFreeze(structuredClone({ ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, deps.ticketSecret) }));
+}
+
+export function repairContext(token: import("./types").ExperienceRepairToken): import("./types").RepairTokenContext {
+  const common = { ticketId: token.ticketId, jobId: token.jobId, attempt: token.attempt, contractRevisionId: token.contractRevisionId, activationId: token.activationId, branchId: token.branchId, stage: token.stage, artifactKind: token.artifactKind, ruleGraphVersion: token.ruleGraphVersion, expectedCanonVersion: token.expectedCanonVersion, ledgerRevision: token.ledgerRevision, chapterNumber: token.chapterNumber, artifactBindingId: token.artifactBindingId, roleBindings: token.roleBindings, artifactHash: token.artifactHash, failedRuleIds: token.failedRuleIds };
+  return token.artifactKind === "blueprint" ? common as import("./types").RepairTokenContext : { ...common, chapterId: token.chapterId!, revisionId: token.revisionId! } as import("./types").RepairTokenContext;
+}
+
+export function verifyRepairAuthorization(token: import("./types").ExperienceRepairToken, expected: import("./types").RepairTokenContext, secret: string, now: Date): boolean {
+  try {
+    const { signature, ...unsigned } = token;
+    const expectedSignature = createHmac("sha256", secret).update("reading-experience:repair:v1").update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
+    return sameMac(signature, expectedSignature) && Number.isFinite(Date.parse(token.expiresAt)) && Date.parse(token.expiresAt) > now.getTime() && canonicalAuthorizationPayload(expected) === canonicalAuthorizationPayload(repairContext(token));
+  } catch { return false; }
+}
+
+function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+  const repair = request.repair!; const token = repair.token; const { signature, ...unsigned } = token;
+  void signature; void unsigned;
+  if (!verifyRepairAuthorization(token, repair.expected, deps.ticketSecret, deps.now())) throw new ExperienceSchedulingError("plan_mismatch");
+  const requestRoles = { protagonistId: request.roleBindings?.protagonistId ?? "", aliases: request.roleBindings?.aliases ? [...request.roleBindings.aliases] : [], counterpartIds: request.roleBindings?.counterpartIds ? [...request.roleBindings.counterpartIds] : [], opponentIds: request.roleBindings?.opponentIds ? [...request.roleBindings.opponentIds] : [] };
+  if (request.attempt !== token.attempt + 1 || request.jobId !== token.jobId || request.contract.id !== token.contractRevisionId || request.contract.ruleGraphVersion !== token.ruleGraphVersion || request.activation.id !== token.activationId || request.canon.branchId !== token.branchId || request.canon.canonVersion !== token.expectedCanonVersion || request.ledger.revision !== token.ledgerRevision || request.artifactKind !== token.artifactKind || chapterNumber(request) !== token.chapterNumber || canonicalAuthorizationPayload(requestRoles) !== canonicalAuthorizationPayload(token.roleBindings) || request.artifactBindingId === token.artifactBindingId || request.expectedArtifactDigest === token.artifactHash || (token.artifactKind !== "blueprint" && (request.chapterId !== token.chapterId || request.revisionId !== token.revisionId))) throw new ExperienceSchedulingError("plan_mismatch");
+  // Scheduling is a pure synchronous operation.  The authorization is carried
+  // by the signed plan and consumed in the assessment CAS.
+  const plan = scheduleTrusted(request, deps);
+  if (plan.artifactBindingId === token.artifactBindingId || plan.expectedArtifactDigest === token.artifactHash) throw new ExperienceSchedulingError("plan_mismatch");
+  return plan;
+}
+
+export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+  if (request.repair) return authorizeRepair(request, deps);
+  if (request.stage === "rewrite") throw new ExperienceSchedulingError("invalid_stage");
+  return scheduleTrusted(request, deps);
 }

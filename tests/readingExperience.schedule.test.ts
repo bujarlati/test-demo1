@@ -116,7 +116,7 @@ test("tickets use canonical fixed-field signing and reject tamper, expiry, reuse
   const payload = [ticket.id, ticket.contractRevisionId, ticket.activationId, ticket.ledgerRevision, ticket.branchId, ticket.expectedCanonVersion, ticket.ruleGraphVersion, ticket.stage, ticket.artifactKind, ticket.jobId, ticket.attempt, ticket.expiresAt].join("\u001f");
   assert.equal(ticket.signature, createHmac("sha256", secret).update(payload).digest("base64url"));
   assert.equal(verifyExperienceStageTicket(ticket, deps), true);
-  const patch = { ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  const patch = { ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] }, "soft-rolling": { dimension_action: ["evidence-1"] } } };
   const trustedDeps = ledgerDepsFor(plan);
   const updated = applyExperienceLedgerPatch(ledger(), patch, trustedDeps);
   assert.equal(updated.revision, 4);
@@ -131,7 +131,7 @@ test("tickets use canonical fixed-field signing and reject tamper, expiry, reuse
 
 test("ledger patches are immutable CAS updates and only soft debts are stored", () => {
   const plan = scheduleExperience(request({ chapterNumber: 5, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }) }), deps);
-  const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: plan.newDebts }, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: plan.newDebts }, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] }, "soft-rolling": { dimension_action: ["evidence-1"] } } };
   const initial = ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }], history: [{ ticketId: "prior-ticket", expectedRevision: 2, nextRevision: 3, chapterNumber: 1, appliedAt: "2026-07-16T00:00:00.000Z" }] });
   const trustedDeps = ledgerDepsFor(plan);
   const updated = applyExperienceLedgerPatch(initial, patch, trustedDeps);
@@ -151,7 +151,7 @@ test("due soft promises raise the selected per-dimension minimum and overdue deb
   assert.equal(softPlan.promptProjection.dimensions.find((dimension) => dimension.id === "dimension_action")?.signalIds.length, 2);
   const insufficientPatch = {
     ticket: softPlan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2,
-    deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["soft-rolling"], evidenceIds: [],
+    deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["soft-rolling"], evidenceIds: [], promiseEvidenceLinks: { "soft-rolling": { dimension_action: [] } },
   };
   assert.throws(() => applyExperienceLedgerPatch(ledger(), insufficientPatch, { ...deps, contract: revised, authorization: createLedgerAuthorization(softPlan, request().canon, [], secret), liveCanon: request().canon }), { code: "unauthorized_delivery" });
 
@@ -176,10 +176,9 @@ test("rolling windows start at activation and evaluate only after N active prior
 test("supplied stage must agree with artifact, activation chapter, and retry state", () => {
   assert.equal(scheduleExperience(request({ stage: "blueprint", artifactKind: "blueprint", chapterNumber: 2 }), deps).stage, "blueprint");
   assert.equal(scheduleExperience(request({ stage: "retcon", artifactKind: "retcon_revision", chapterNumber: 2 }), deps).stage, "retcon");
-  assert.equal(scheduleExperience(request({ stage: "rewrite", failedRuleIds: ["rule-1"] }), deps).stage, "rewrite");
+  assert.throws(() => scheduleExperience(request({ stage: "rewrite" }), deps), { code: "invalid_stage" });
   assert.equal(scheduleExperience(request({ stage: "continuation", activation: { ...activation(), effectiveFromChapter: 1 } }), deps).stage, "continuation");
   assert.throws(() => scheduleExperience(request({ stage: "opening", artifactKind: "blueprint" }), deps), { code: "invalid_stage" });
-  assert.throws(() => scheduleExperience(request({ stage: "continuation", failedRuleIds: ["rule-1"] }), deps), { code: "invalid_stage" });
 });
 
 test("malformed voice or pacing dimensions without distribution evidence are rejected", () => {
@@ -200,7 +199,7 @@ test("one shared hard promise cannot replace independent per-dimension presence"
 test("ledger applies only the trusted scheduled plan, selected signals, due promises, evidence and canon facts", () => {
   const plan = scheduleExperience(request(), deps);
   const authorization = createLedgerAuthorization(plan, request().canon, ["evidence-1"], secret);
-  const safePatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: { dimension_action: [{ id: "canon-fact", revisionId: "chapter-1", kind: "mechanic" }] }, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  const safePatch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: { dimension_action: [{ id: "canon-fact", revisionId: "chapter-1", kind: "mechanic" }] }, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] }, "soft-rolling": { dimension_action: ["evidence-1"] } } };
   const trustedDeps = { ...deps, authorization, liveCanon: request().canon };
   assert.throws(() => applyExperienceLedgerPatch(ledger(), { ...safePatch, chapterNumber: 999 }, trustedDeps), { code: "plan_mismatch" });
   assert.throws(() => applyExperienceLedgerPatch(ledger(), { ...safePatch, deliveredSignalIdsByDimension: { dimension_action: ["invented-signal"], dimension_voice: [] } }, trustedDeps), { code: "unauthorized_delivery" });
@@ -227,7 +226,7 @@ test("successful patches require every scheduled obligation and the live canon",
   const plan = scheduleExperience(request({ chapterNumber: 5, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }) }), deps);
   const authorization = createLedgerAuthorization(plan, request().canon, ["evidence-1"], secret);
   const trusted = { ...deps, authorization, liveCanon: request().canon };
-  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: plan.newDebts }, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: plan.newDebts }, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] }, "soft-rolling": { dimension_action: ["evidence-1"] } } };
   assert.throws(() => applyExperienceLedgerPatch(ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }), { ...base, deliveredSignalIdsByDimension: { dimension_action: [], dimension_voice: [] } }, trusted), { code: "unauthorized_delivery" });
   assert.throws(() => applyExperienceLedgerPatch(ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }), { ...base, evidenceIds: [] }, trusted), { code: "unauthorized_delivery" });
   assert.throws(() => applyExperienceLedgerPatch(ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }), { ...base, newDebtsByDimension: {} }, trusted), { code: "unauthorized_delivery" });
@@ -238,9 +237,9 @@ test("scheduler rejects impossible or duplicate signal fulfillment and keeps non
   const impossible = contract();
   impossible.promises[0].minimumSignals = 3;
   assert.throws(() => scheduleExperience(request({ contract: impossible }), deps), { code: "insufficient_signals" });
-  assert.equal(scheduleExperience(request({ artifactKind: "blueprint", failedRuleIds: ["retry"] }), deps).stage, "blueprint");
-  assert.equal(scheduleExperience(request({ artifactKind: "retcon_revision", failedRuleIds: ["retry"] }), deps).stage, "retcon");
-  assert.throws(() => scheduleExperience(request({ artifactKind: "blueprint", stage: "rewrite", failedRuleIds: ["retry"] }), deps), { code: "invalid_stage" });
+  assert.equal(scheduleExperience(request({ artifactKind: "blueprint" }), deps).stage, "blueprint");
+  assert.equal(scheduleExperience(request({ artifactKind: "retcon_revision" }), deps).stage, "retcon");
+  assert.throws(() => scheduleExperience(request({ artifactKind: "blueprint", stage: "rewrite" }), deps), { code: "invalid_stage" });
 });
 
 test("authorization rejects fabricated plans and scheduling never freezes caller-owned data", () => {
@@ -261,7 +260,7 @@ test("CAS rejects an authorization MACed with an attacker-chosen key", () => {
   const { authorizationMac: _ignored, ...unsignedPlan } = { ...plan, chapterNumber: 99 };
   const forgedPlan = { ...unsignedPlan, authorizationMac: signExperiencePlan(unsignedPlan, "attacker-key") };
   const forged = createLedgerAuthorization(forgedPlan, request().canon, ["evidence-1"], "attacker-key");
-  const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"] };
+  const patch = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 2, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_relationship"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: {}, deliveredPromiseIds: ["hard-action", "hard-voice", "soft-rolling"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] }, "soft-rolling": { dimension_action: ["evidence-1"] } } };
   assert.throws(() => applyExperienceLedgerPatch(ledger(), patch, { ...deps, authorization: forged, liveCanon: request().canon }), { code: "plan_mismatch" });
 });
 
@@ -317,7 +316,7 @@ test("a due both-dimension rolling promise creates and applies one debt per dime
   ]);
   const debtForPatch = ({ promiseId, dueByChapter }: { promiseId: string; dueByChapter: number }): ExperienceDebtV2 => ({ promiseId, dueByChapter });
   const authorization = createLedgerAuthorization(plan, request().canon, ["evidence-1"], secret);
-  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0])], dimension_voice: [debtForPatch(plan.newDebts[1])] }, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-1"] };
+  const base = { ticket: plan.ticket, expectedRevision: 3, nextRevision: 4, contractRevisionId: "contract-r1", activationId: "activation-r1", branchId: "branch-main", expectedCanonVersion: 7, chapterNumber: 5, deliveredSignalIdsByDimension: { dimension_action: ["dimension_action_mechanic"], dimension_voice: ["dimension_voice_voice", "dimension_voice_pacing"] }, persistentResultsByDimension: {}, newDebtsByDimension: { dimension_action: [debtForPatch(plan.newDebts[0])], dimension_voice: [debtForPatch(plan.newDebts[1])] }, deliveredPromiseIds: ["hard-action", "hard-voice"], evidenceIds: ["evidence-1"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-1"] }, "hard-voice": { dimension_voice: ["evidence-1"] } } };
   const trusted = { ...deps, contract: revised, authorization, liveCanon: request().canon };
   const updated = applyExperienceLedgerPatch(initial, base, trusted);
   assert.equal(updated.dimensions.flatMap((dimension) => dimension.debts).length, 2);
