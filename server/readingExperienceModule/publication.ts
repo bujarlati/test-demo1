@@ -1,7 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import type { CanonFactCandidateV2, ExperienceEvidenceV2 } from "../../src/types";
 import type { ExperienceLedgerPatch, ExperiencePublicationPermit, LedgerEvidenceBinding, PublicationPermitContext } from "./types";
-import { canonicalAuthorizationPayload, sameMac } from "./scheduler";
+import { boundedAuthorizationSnapshot, canonicalAuthorizationPayload, sameMac } from "./scheduler";
 
 const permitDomain = "reading-experience:permit:v1";
 const permitContextKeys = ["ticketId", "jobId", "attempt", "contractRevisionId", "activationId", "branchId", "stage", "artifactKind", "ruleGraphVersion", "expectedCanonVersion", "ledgerRevision", "chapterId", "revisionId", "artifactBindingId", "artifactHash", "evidenceIds", "evidenceBindings", "evidenceRootHash", "ledgerPatchHash"].sort();
@@ -78,21 +78,37 @@ function validPermitContext(value: unknown): value is PublicationPermitContext {
     && typeof context.ledgerPatchHash === "string" && /^[a-f\d]{64}$/i.test(context.ledgerPatchHash);
 }
 
-export function verifyPublicationPermitSignature(value: unknown, context: PublicationPermitContext, secret: string): boolean {
+export interface VerifiedPublicationPermitSnapshot {
+  permit: ExperiencePublicationPermit;
+  context: PublicationPermitContext;
+}
+
+function publicationPermitSnapshot(value: unknown, context: PublicationPermitContext, secret: string, now?: Date): VerifiedPublicationPermitSnapshot | undefined {
   try {
-    if (!validPermitContext(context) || !value || typeof value !== "object" || Array.isArray(value)) return false;
-    const permit = value as ExperiencePublicationPermit;
+    const safeValue = boundedAuthorizationSnapshot(value); const safeContext = boundedAuthorizationSnapshot(context);
+    if (!validPermitContext(safeContext) || !safeValue || typeof safeValue !== "object" || Array.isArray(safeValue)) return undefined;
+    const permit = safeValue as ExperiencePublicationPermit;
     const permitKeys = [...permitContextKeys, "version", "permitId", "expiresAt", "signature"].sort();
-    if (Object.keys(value).sort().join("|") !== permitKeys.join("|")) return false;
+    if (Object.keys(safeValue).sort().join("|") !== permitKeys.join("|")) return undefined;
     const { signature, ...unsigned } = permit;
-    if (permit.version !== 1 || typeof signature !== "string" || typeof permit.permitId !== "string" || !permit.permitId || typeof permit.expiresAt !== "string" || !Number.isFinite(Date.parse(permit.expiresAt))) return false;
+    if (permit.version !== 1 || typeof signature !== "string" || typeof permit.permitId !== "string" || !permit.permitId || typeof permit.expiresAt !== "string" || !Number.isFinite(Date.parse(permit.expiresAt))) return undefined;
     const expected = createHmac("sha256", secret).update(permitDomain).update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
-    return sameMac(signature, expected) && Object.entries(context).every(([key, expectedValue]) => canonicalAuthorizationPayload((permit as unknown as Record<string, unknown>)[key]) === canonicalAuthorizationPayload(expectedValue));
-  } catch { return false; }
+    if (!sameMac(signature, expected) || !Object.entries(safeContext).every(([key, expectedValue]) => canonicalAuthorizationPayload((permit as unknown as Record<string, unknown>)[key]) === canonicalAuthorizationPayload(expectedValue))) return undefined;
+    if (now && Date.parse(permit.expiresAt) <= now.getTime()) return undefined;
+    return { permit, context: safeContext };
+  } catch { return undefined; }
+}
+
+export function verifyPublicationPermitSignature(value: unknown, context: PublicationPermitContext, secret: string): boolean {
+  return !!publicationPermitSnapshot(value, context, secret);
 }
 
 export function verifyPublicationPermit(value: unknown, context: PublicationPermitContext, secret: string, now: Date): boolean {
-  return verifyPublicationPermitSignature(value, context, secret) && Date.parse((value as ExperiencePublicationPermit).expiresAt) > now.getTime();
+  return !!publicationPermitSnapshot(value, context, secret, now);
+}
+
+export function verifiedPublicationPermitSnapshot(value: unknown, context: PublicationPermitContext, secret: string, now: Date): VerifiedPublicationPermitSnapshot | undefined {
+  return publicationPermitSnapshot(value, context, secret, now);
 }
 
 export function publicationPermitDigest(permit: ExperiencePublicationPermit): string {

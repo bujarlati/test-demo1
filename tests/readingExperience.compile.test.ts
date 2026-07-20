@@ -226,6 +226,114 @@ test("compile treats malformed interpretation responses as an invalid-model-outp
   });
 });
 
+test("compile rejects interpretation accessors without execution and proxies without traversal", async () => {
+  const run = async (jobId: string, mutate: (draft: InterpretationDraft) => unknown) => {
+    const { deps } = scriptedExperiencePorts();
+    return compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意" }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId,
+    }, { interpret: async (input) => mutate(await deps.interpretationPort.interpret(input)) as InterpretationDraft }, deps.now);
+  };
+
+  let getterReads = 0;
+  const accessorResult = await run("accessor_draft", (draft) => {
+    Object.defineProperty(draft, "provenanceVersion", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error("model-output getters must not execute");
+      },
+    });
+    return draft;
+  });
+  assert.equal(accessorResult.ok, false);
+  if (!accessorResult.ok) assert.equal(accessorResult.error.code, "invalid_model_output");
+  assert.equal(getterReads, 0);
+
+  const proxyReads: PropertyKey[] = [];
+  const proxyResult = await run("proxy_draft", (draft) => new Proxy(draft, {
+    get(target, property, receiver) {
+      proxyReads.push(property);
+      return Reflect.get(target, property, receiver);
+    },
+  }));
+  assert.equal(proxyResult.ok, false);
+  if (!proxyResult.ok) assert.equal(proxyResult.error.code, "invalid_model_output");
+  // Promise resolution performs the unavoidable single `then` lookup; the compiler performs no proxy reads.
+  assert.deepEqual(proxyReads, ["then"]);
+});
+
+test("compile rejects cyclic and aliased interpretation object graphs", async () => {
+  const run = async (jobId: string, mutate: (draft: InterpretationDraft) => void) => {
+    const { deps } = scriptedExperiencePorts();
+    return compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意" }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId,
+    }, { interpret: async (input) => {
+      const draft = await deps.interpretationPort.interpret(input);
+      mutate(draft);
+      return draft;
+    } }, deps.now);
+  };
+
+  const cyclic = await run("cyclic_draft", (draft) => { (draft as any).self = draft; });
+  assert.equal(cyclic.ok, false);
+  if (!cyclic.ok) assert.equal(cyclic.error.code, "invalid_model_output");
+
+  const aliased = await run("aliased_draft", (draft) => {
+    draft.dimensions[0].observableSignals[1].verification = draft.dimensions[0].observableSignals[0].verification;
+  });
+  assert.equal(aliased.ok, false);
+  if (!aliased.ok) assert.equal(aliased.error.code, "invalid_model_output");
+});
+
+test("compile rejects oversized and string-shaped interpretation fields before traversal", async () => {
+  const run = async (jobId: string, mutate: (draft: InterpretationDraft) => unknown) => {
+    const { deps } = scriptedExperiencePorts();
+    return compileExperience({
+      intent: { descriptors: [{ text: "赛博禅意" }, { text: "烟火气" }], locale: "zh-CN" },
+      context: { genre: "科幻", inspiration: "旧站" }, parentRevisionId: null, requestedRevision: 1, jobId,
+    }, { interpret: async (input) => mutate(await deps.interpretationPort.interpret(input)) as InterpretationDraft }, deps.now);
+  };
+
+  let categoryReads = 0;
+  const oversizedCategories = new Array(8);
+  Object.defineProperty(oversizedCategories, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      categoryReads += 1;
+      throw new Error("oversized categories must not be traversed");
+    },
+  });
+  let prohibitionReads = 0;
+  const oversizedProhibitions = new Array(9);
+  Object.defineProperty(oversizedProhibitions, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      prohibitionReads += 1;
+      throw new Error("oversized prohibitions must not be traversed");
+    },
+  });
+
+  const cases: Array<[string, (draft: InterpretationDraft) => unknown]> = [
+    ["string_categories", (draft) => { (draft.dimensions[0] as any).categories = "protagonist_action"; return draft; }],
+    ["oversized_categories", (draft) => { (draft.dimensions[0] as any).categories = oversizedCategories; return draft; }],
+    ["oversized_prohibitions", (draft) => { (draft.dimensions[0] as any).prohibitions = oversizedProhibitions; return draft; }],
+    ["oversized_string", (draft) => { draft.provenanceVersion = "v".repeat(1_025); return draft; }],
+    ["string_draft", () => "not an interpretation draft"],
+  ];
+  for (const [jobId, mutate] of cases) {
+    const result = await run(jobId, mutate);
+    assert.equal(result.ok, false, jobId);
+    if (!result.ok) assert.equal(result.error.code, "invalid_model_output", jobId);
+  }
+  assert.equal(categoryReads, 0);
+  assert.equal(prohibitionReads, 0);
+});
+
 test("compile records the actual per-dimension interpretation provenance", async () => {
   const { deps } = scriptedExperiencePorts();
   const result = await compileExperience({

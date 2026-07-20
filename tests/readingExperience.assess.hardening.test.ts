@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import { hashArtifact, groundClaim, sourceForArtifact } from "../server/readingExperienceModule/evidence";
-import { canonicalAuthorizationPayload, contractRevisionIdentity, scheduleExperience } from "../server/readingExperienceModule/scheduler";
-import type { ExperienceRepairToken } from "../server/readingExperienceModule/types";
+import { canonicalAuthorizationPayload, contractRevisionIdentity, scheduleExperience, verifyRepairAuthorization } from "../server/readingExperienceModule/scheduler";
+import { consumePublicationPermit, verifyPublicationPermit } from "../server/readingExperienceModule/assessor";
+import { evidenceRootHash, issuePublicationPermit, verifyPublicationPermitSignature } from "../server/readingExperienceModule/publication";
+import type { ExperienceRepairToken, PublicationPermitContext } from "../server/readingExperienceModule/types";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
 import { adapterAppliesTo, evidencePolicyFor, runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
+import { pacingFacetIsRealized } from "../server/readingExperienceModule/pacingSemantics";
 
 const now = () => new Date("2026-07-18T00:00:00.000Z");
 
@@ -81,6 +84,103 @@ test("failedRuleIds is a compatibility assertion, never a rewrite authorization"
   assert.throws(() => scheduleExperience({ ...base, failedRuleIds: ["evidence.not_realized", "evidence.not_realized"] }, deps), { code: "plan_mismatch" });
 });
 
+function publicationFixture() {
+  const context: PublicationPermitContext = {
+    ticketId: "publication-ticket", jobId: "publication-job", attempt: 1, contractRevisionId: "r", activationId: "a", branchId: "b",
+    stage: "opening", artifactKind: "chapter", ruleGraphVersion: "g", expectedCanonVersion: 1, ledgerRevision: 1,
+    chapterId: "c", revisionId: "v", artifactBindingId: "publication-binding", artifactHash: "artifact-digest",
+    evidenceIds: [], evidenceBindings: [], evidenceRootHash: evidenceRootHash([]), ledgerPatchHash: "a".repeat(64),
+  };
+  const permit = issuePublicationPermit(context, "publication-permit", "2026-07-18T00:05:00.000Z", "s");
+  const state = {
+    activationId: "a", branchId: "b", canonVersion: 1, ledgerRevision: 1, attempt: 1,
+    consumedTicketIds: ["publication-ticket"], consumedPermitIds: [], consumedRepairIds: [], existingEvidenceIds: [],
+    chapterId: "c", revisionId: "v", artifactBindingId: "publication-binding", expectedArtifactDigest: "artifact-digest",
+  };
+  return { context, permit, state };
+}
+
+test("publication verification rejects accessors without executing them", () => {
+  const { context, permit } = publicationFixture(); let getterReads = 0;
+  const accessorPermit = { ...permit } as typeof permit;
+  Object.defineProperty(accessorPermit, "expiresAt", { enumerable: true, configurable: true, get: () => { getterReads += 1; return permit.expiresAt; } });
+  assert.equal(verifyPublicationPermitSignature(accessorPermit, context, "s"), false);
+  assert.equal(verifyPublicationPermit(accessorPermit, context, "s", now()), false);
+  assert.equal(getterReads, 0);
+});
+
+test("publication verification and consumption snapshot proxies once and never use raw getters", async () => {
+  const { context, permit, state } = publicationFixture(); let rawGets = 0; let reads = 0; let consumes = 0;
+  const tracked = <T extends object>(value: T): T => new Proxy(value, { get(target, key, receiver) { rawGets += 1; return Reflect.get(target, key, receiver); } });
+  const proxiedPermit = tracked(permit); const proxiedContext = tracked(context);
+  assert.equal(verifyPublicationPermit(proxiedPermit, proxiedContext, "s", now()), true);
+  assert.equal(rawGets, 0);
+  const deps: any = {
+    now, ticketSecret: "s",
+    statePort: {
+      read: async () => { reads += 1; permit.ticketId = "raw-drift"; context.ticketId = "raw-drift"; return state; },
+      consumePermit: async (input: any) => { consumes += 1; assert.equal(input.permitId, permit.permitId); assert.equal(input.ticketId, "publication-ticket"); assert.equal(input.context.ticketId, "publication-ticket"); return true; },
+    },
+  };
+  assert.equal(await consumePublicationPermit(proxiedPermit, proxiedContext, deps), true);
+  assert.equal(rawGets, 0); assert.equal(reads, 1); assert.equal(consumes, 1);
+});
+
+test("invalid publication accessors and throwing snapshots fail closed before state ports", async () => {
+  const { context, permit, state } = publicationFixture(); let getterReads = 0; let reads = 0; let consumes = 0;
+  const accessorPermit = { ...permit } as typeof permit;
+  Object.defineProperty(accessorPermit, "ticketId", { enumerable: true, configurable: true, get: () => { getterReads += 1; return permit.ticketId; } });
+  const deps: any = {
+    now, ticketSecret: "s",
+    statePort: {
+      read: async () => { reads += 1; return state; },
+      consumePermit: async () => { consumes += 1; return true; },
+    },
+  };
+  assert.equal(await consumePublicationPermit(accessorPermit, context, deps), false);
+  assert.equal(getterReads, 0); assert.equal(reads, 0); assert.equal(consumes, 0);
+
+  const oversizedPermit = { ...permit, permitId: "p".repeat(1_000_001) };
+  assert.equal(await consumePublicationPermit(oversizedPermit, context, deps), false);
+  assert.equal(reads, 0); assert.equal(consumes, 0);
+
+  const throwing = new Proxy(permit, { ownKeys: () => { throw new Error("snapshot failure"); } });
+  assert.equal(await consumePublicationPermit(throwing, context, deps), false);
+  assert.equal(reads, 0); assert.equal(consumes, 0);
+
+  const accessorState = { ...state };
+  Object.defineProperty(accessorState, "activationId", { enumerable: true, configurable: true, get: () => { getterReads += 1; return state.activationId; } });
+  const stateDeps: any = { ...deps, statePort: { read: async () => { reads += 1; return accessorState; }, consumePermit: async () => { consumes += 1; return true; } } };
+  assert.equal(await consumePublicationPermit(permit, context, stateDeps), false);
+  assert.equal(getterReads, 0); assert.equal(reads, 1); assert.equal(consumes, 0);
+});
+
+test("repair scheduling snapshots request and token proxies and rejects accessors without execution", () => {
+  const token = signedRepair(); const expected = { ticketId: token.ticketId, jobId: token.jobId, attempt: token.attempt, contractRevisionId: token.contractRevisionId, activationId: token.activationId, branchId: token.branchId, stage: token.stage, artifactKind: token.artifactKind, ruleGraphVersion: token.ruleGraphVersion, expectedCanonVersion: token.expectedCanonVersion, ledgerRevision: token.ledgerRevision, chapterNumber: token.chapterNumber, chapterId: token.chapterId!, revisionId: token.revisionId!, artifactBindingId: token.artifactBindingId, roleBindings: token.roleBindings, artifactHash: token.artifactHash, failedRuleIds: token.failedRuleIds };
+  const base = { contract: contract(), activation, ledger, canon: { branchId: "b", canonVersion: 1, factReferences: [] }, artifactKind: "chapter" as const, chapterId: "c", revisionId: "v", artifactBindingId: "new-binding", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, repair: { token, expected }, jobId: "j", attempt: 2 };
+  let rawGets = 0;
+  const trackedToken = new Proxy(token, { get(target, key, receiver) { rawGets += 1; return Reflect.get(target, key, receiver); } });
+  const trackedExpected = new Proxy(expected, { get(target, key, receiver) { rawGets += 1; return Reflect.get(target, key, receiver); } });
+  assert.equal(verifyRepairAuthorization(trackedToken, trackedExpected, "s", now()), true);
+  assert.equal(rawGets, 0);
+  const trackedRequest = new Proxy({ ...base, repair: { token: trackedToken, expected: trackedExpected } }, { get(target, key, receiver) { rawGets += 1; return Reflect.get(target, key, receiver); } });
+  assert.equal(scheduleExperience(trackedRequest, { now, ticketSecret: "s", ticketTtlMs: 60_000 }).stage, "rewrite");
+  assert.equal(rawGets, 0);
+
+  let getterReads = 0; let nowCalls = 0;
+  const accessorToken = { ...token } as ExperienceRepairToken;
+  Object.defineProperty(accessorToken, "expiresAt", { enumerable: true, configurable: true, get: () => { getterReads += 1; return token.expiresAt; } });
+  assert.equal(verifyRepairAuthorization(accessorToken, expected, "s", now()), false);
+  assert.equal(getterReads, 0);
+  assert.throws(() => scheduleExperience({ ...base, repair: { token: accessorToken, expected } }, { now: () => { nowCalls += 1; return now(); }, ticketSecret: "s", ticketTtlMs: 60_000 }), { code: "invalid_authorization_payload" });
+  assert.equal(getterReads, 0); assert.equal(nowCalls, 0);
+
+  const shared = { payload: "x".repeat(600_000) }; let amplifiedNowCalls = 0; let ticketIdCalls = 0;
+  const amplified = { ...base, amplification: Array.from({ length: 20 }, () => shared) } as typeof base;
+  assert.throws(() => scheduleExperience(amplified, { now: () => { amplifiedNowCalls += 1; return now(); }, ticketSecret: "s", ticketTtlMs: 60_000, createTicketId: () => { ticketIdCalls += 1; return "unexpected"; } }), { code: "invalid_authorization_payload" });
+  assert.equal(amplifiedNowCalls, 0); assert.equal(ticketIdCalls, 0);
+});
+
 test("deterministic modality adapters reject unrealized events but allow explicit realization reversals", () => {
   const unrealized: Array<[any, string]> = [
     ["event-negated", "Aria did not open the gate."],
@@ -97,7 +197,8 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "敌人讥笑面板没有反馈，下一刻面板弹出永久奖励。"), false);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "旁观者误以为主角惨败，尘埃散去他毫发无损并一击制胜。"), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The enemy said the system was unavailable, but Aria did not hesitate and the system became available with a reward."), false);
-  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but Aria did not hesitate and she won the victory."), false);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but Aria did not hesitate and she won the victory.", [], { protagonistAliases: ["Aria"] }), false);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought Mira lost, but Mira won the victory.", [], { protagonistAliases: ["Mira"] }), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The enemy said the system was unavailable, but the system is not available."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she did not win the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but the system plans and activates."), true);
@@ -107,6 +208,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but in a dream the system recovered and activated."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but in a dream she recovered and won the victory."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but in a dream she recovered and she won the victory."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system is permanently unavailable, but in a dream the system remains dark but the system activates with a reward."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "Aria's system is permanently unavailable, but Bob's system activates with a reward."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "主角的系统永久失效，却敌人的系统启动并发放奖励。"), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "Aria's system is permanently unavailable, but the system activates with a reward."), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
@@ -149,8 +254,12 @@ test("deterministic modality adapters reject unrealized events but allow explici
     "Aria cancelled the plan to open the gate and claim victory.",
     "Aria dropped the plan to open the gate and claim victory.",
     "Aria abandoned the plan to retreat or open the gate and claim victory.",
+    "Aria abandoned the plan to retreat and open the gate and claim victory.",
   ]) assert.equal(runRuleAdapter("event-intent", cancelledOnly, completeBinding as any), true, cancelledOnly);
   assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃了计划打开城门并取得胜利。", chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃了计划退后并打开城门并取得胜利。", chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃了退后并打开城门并取得胜利的计划。", chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-intent", "Aria cancelled the plan and in it Aria opened the gate for victory.", completeBinding as any), true);
   assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃计划并打开城门并取得胜利。", chineseBinding as any), false);
   assert.equal(runRuleAdapter("event-negated", "阿丽雅没有退后并打开城门并取得胜利。", chineseBinding as any), false);
   assert.equal(runRuleAdapter("event-negated", "阿丽雅没有打开城门并取得胜利。", chineseBinding as any), true);
@@ -161,13 +270,38 @@ test("deterministic modality adapters reject unrealized events but allow explici
     ["event-simulation", "The oracle predicted Aria retreated and opened the gate for victory."],
     ["event-hearsay", "Rumour says Aria retreated and opened the gate for victory."],
     ["event-hearsay", "Rumour says Aria retreated and Aria opened the gate for victory."],
+    ["event-simulation", "In a dream Aria retreated then Aria opened the gate for victory."],
+    ["event-simulation", "In a dream: Aria retreated; Aria opened the gate for victory."],
+    ["event-hearsay", "Rumour says Aria retreated but Aria opened the gate for victory."],
+    ["event-hearsay", "据说阿丽雅先退后，然后阿丽雅打开城门并取得胜利。"],
   ] as const) assert.equal(runRuleAdapter(id, unrealizedCoordination, completeBinding as any), true, unrealizedCoordination);
+  for (const actualAfterReport of [
+    "Aria heard the alarm and opened the gate for victory.",
+    "Aria dismissed the rumour and opened the gate for victory.",
+    "The dream ended and Aria opened the gate for victory.",
+    "Aria woke from the dream and opened the gate for victory.",
+    "Aria rejected the prediction and opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter(actualAfterReport.includes("rumour") || actualAfterReport.includes("heard") ? "event-hearsay" : "event-simulation", actualAfterReport, completeBinding as any), false, actualAfterReport);
   for (const foreignActor of [
     "Aria did not open the gate and Bob opened the gate for victory.",
     "Aria did not open the gate or Bob opened the gate for victory.",
     "Aria did not open the gate but Bob opened the gate for victory.",
     "Aria did not open the gate and the gate opened itself for victory.",
+    "Aria did not open the gate and Holly opened the gate for victory.",
+    "Aria did not open the gate and after Bob arrived Bob opened the gate for victory.",
+    "Aria did not open the gate and Bob stood beside Aria and opened the gate for victory.",
+    "Aria did not open the gate, but Aria's clone opened the gate for victory.",
+    "Aria did not hesitate to watch Bob open the gate for victory.",
   ]) assert.equal(runRuleAdapter("event-negated", foreignActor, completeBinding as any), true, foreignActor);
+  for (const foreignEffect of [
+    "Aria planned to retreat, but Aria opened the gate and Bob claimed victory.",
+    "Aria did not open the gate and Aria opened the gate but Bob claimed victory.",
+    "Aria abandoned the plan to open the gate and opened the window for victory.",
+    "Aria planned to retreat, but Aria opened the gate beside a banner reading victory.",
+    "Aria did not win and opened the gate hoping for victory.",
+  ]) assert.equal(runRuleAdapter(foreignEffect.includes("did not") ? "event-negated" : "event-intent", foreignEffect, completeBinding as any), true, foreignEffect);
+  const relationshipBinding = { actor: "Aria", action: "bowed", counterpart: "guard", reciprocalAction: "lowered", relationshipChange: "travel together", requiredSlots: ["actor", "action", "counterpart", "reciprocalAction", "relationshipChange"] } as const;
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to leave, but Aria bowed to the guard and Bob lowered his spear and Bob chose to travel together.", relationshipBinding as any), true);
   assert.equal(runRuleAdapter("event-negated", "阿丽雅没有打开城门并鲍勃打开城门取得胜利。", chineseBinding as any), true);
   for (const affirmativeExpression of [
     "阿丽雅忍不住打开城门并取得胜利。",
@@ -176,22 +310,174 @@ test("deterministic modality adapters reject unrealized events but allow explici
     "阿丽雅不假思索地打开城门并取得胜利。",
     "阿丽雅毫不费力地打开城门并取得胜利。",
     "阿丽雅不慌不忙地打开城门并取得胜利。",
+    "阿丽雅不费吹灰之力打开城门并取得胜利。",
+    "阿丽雅不露声色地打开城门并取得胜利。",
+    "阿丽雅不顾一切打开城门并取得胜利。",
+    "阿丽雅不遗余力地打开城门并取得胜利。",
+    "阿丽雅不得已打开城门并取得胜利。",
+    "阿丽雅不惜代价打开城门并取得胜利。",
+    "阿丽雅以无坚不摧之势打开城门并取得胜利。",
+    "阿丽雅无所不能地打开城门并取得胜利。",
   ]) assert.equal(runRuleAdapter("event-negated", affirmativeExpression, chineseBinding as any), false, affirmativeExpression);
   for (const [action, object, realized] of [
     ["struck", "guard", "Aria did not hesitate and struck the guard for victory."],
     ["slew", "beast", "Aria did not hesitate and slew the beast for victory."],
-    ["cut", "rope", "Aria did not hesitate and cut the rope for victory."],
+    ["cut", "rope", "Aria did not hesitate and Aria cut the rope for victory."],
     ["broke", "seal", "Aria did not hesitate and broke the seal for victory."],
     ["ran", "gauntlet", "Aria did not hesitate and ran the gauntlet for victory."],
   ] as const) {
     const genericBinding = { actor: "Aria", action, object, outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
     assert.equal(runRuleAdapter("event-negated", realized, genericBinding as any), false, realized);
   }
+  for (const [action, object, realized] of [
+    ["struck", "guard", "Aria did not retreat and struck the guard for victory."],
+    ["slew", "beast", "Aria never retreated and slew the beast for victory."],
+    ["broke", "seal", "Aria never retreated and broke the seal for victory."],
+    ["ran", "gauntlet", "Aria did not retreat and ran the gauntlet for victory."],
+  ] as const) assert.equal(runRuleAdapter("event-negated", realized, { actor: "Aria", action, object, outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as any), false, realized);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not wait or open the gate for victory.", completeBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not hesitate and open the gate for victory.", completeBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", "Aria did not hesitate to open the gate for victory.", completeBinding as any), false);
+  for (const fulfilledPlan of [
+    "Aria followed the plan and opened the gate for victory.",
+    "Aria executed the plan and opened the gate for victory.",
+    "Aria completed the plan and opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", fulfilledPlan, completeBinding as any), false, fulfilledPlan);
   assert.equal(runRuleAdapter("event-failed-attempt", "她险些打开门。"), true);
   assert.equal(runRuleAdapter("event-negated", "他没有退后，而是迎面击败守卫。"), false);
   assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also crossed it."), false);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后他在复赛获胜。"), true);
   for (const [id, text] of [["event-negated", "她并未打开门。"], ["event-intent", "她准备明日行动。"], ["event-failed-attempt", "她尝试打开门。"], ["event-simulation", "她幻想自己已经获胜。"], ["event-hearsay", "听说她打开了门。"]] as const) assert.equal(runRuleAdapter(id, text), true, `${id}:${text}`);
+});
+
+test("deterministic modality adapters resist nested reports, identity swaps, and lexical scope evasions", () => {
+  const binding = { actor: "Aria", action: "open", object: "gate", outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+  const chineseBinding = { actor: "阿丽雅", action: "打开", object: "城门", outcome: "胜利", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+
+  for (const nestedReport of [
+    'Rumour says: "Aria retreated. Aria opened the gate for victory."',
+    'In a dream: "Aria retreated. Aria opened the gate for victory."',
+    'The oracle predicted: "Aria retreated. Aria opened the gate for victory."',
+  ]) assert.equal(runRuleAdapter(nestedReport.startsWith("Rumour") ? "event-hearsay" : "event-simulation", nestedReport, binding as any), true, nestedReport);
+  for (const nestedMechanic of [
+    'The system is permanently unavailable, but in a dream: "The system stayed dark. The system activates with a reward."',
+    'The system is permanently unavailable, but rumour says: "The system stayed dark. The system activates with a reward."',
+    "The system is permanently unavailable, but in a dream: 'The dream ended. The system activates with a reward.'",
+    "The system is permanently unavailable, but in a dream the narrator said actually the system activates with a reward.",
+  ]) assert.equal(runRuleAdapter("curated-mechanic-unavailable", nestedMechanic), true, nestedMechanic);
+
+  for (const ownerSwap of [
+    "Her system is permanently unavailable, but his system activates with a reward.",
+    "The system serving Aria is permanently unavailable, but the system serving Bob activates with a reward.",
+    "The system belonging to Aria is permanently unavailable, but the system belonging to Bob activates with a reward.",
+    "The system was permanently unavailable, but another system activates with a reward.",
+    "The system was permanently unavailable, but Bob claimed the system activates with a reward.",
+    "The system was permanently unavailable, but a banner reads system available.",
+  ]) assert.equal(runRuleAdapter("curated-mechanic-unavailable", ownerSwap), true, ownerSwap);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "Aria's system is permanently unavailable, but her system activates with a reward."), false);
+
+  for (const [id, unrealizedWording] of [
+    ["event-intent", "阿丽雅想要打开城门并取得胜利。"],
+    ["event-failed-attempt", "阿丽雅试着打开城门并取得胜利。"],
+    ["event-simulation", "阿丽雅似乎打开城门并取得胜利。"],
+    ["event-hearsay", "据报道阿丽雅打开城门并取得胜利。"],
+    ["event-intent", "Aria wanted to open the gate for victory."],
+    ["event-simulation", "Aria pretended to open the gate for victory."],
+    ["event-hearsay", "Bob said Aria opened the gate for victory."],
+  ] as const) assert.equal(runRuleAdapter(id, unrealizedWording, id.startsWith("event-") ? (unrealizedWording.includes("阿丽雅") ? chineseBinding : binding) as any : undefined), true, unrealizedWording);
+
+  for (const hearsay of [
+    "Aria heard Aria opened the gate for victory.",
+    "Aria dismissed the rumour that Aria opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-hearsay", hearsay, binding as any), true, hearsay);
+  for (const actualAfterDirectSpeech of [
+    "Aria said the password and opened the gate for victory.",
+    "Aria reported for duty and opened the gate for victory.",
+    "Aria claimed the prize and opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-hearsay", actualAfterDirectSpeech, binding as any), false, actualAfterDirectSpeech);
+  for (const simulation of [
+    "Aria dreamed she opened the gate for victory.",
+    "Aria dreamt she opened the gate for victory.",
+    "In a dream Aria retreated. Aria opened the gate for victory.",
+    "Aria rejected the prediction that Aria opened the gate for victory.",
+    "Aria woke from the dream where Aria opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-simulation", simulation, binding as any), true, simulation);
+
+  for (const cancelledReference of [
+    "Aria cancelled the plan, in which Aria opened the gate for victory.",
+    "Aria cancelled the plan; in it Aria opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", cancelledReference, binding as any), true, cancelledReference);
+  for (const unrealizedExecution of [
+    "Aria refused to execute the plan to open the gate for victory.",
+    "Aria discussed how to execute the plan to open the gate for victory.",
+    "Aria hoped to execute the plan to open the gate for victory.",
+    "Aria executed the plan not to open the gate for victory.",
+    "Aria followed the plan merely to try to open the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", unrealizedExecution, binding as any), true, unrealizedExecution);
+
+  for (const foreignActor of [
+    "Aria did not retreat and her twin opened the gate for victory.",
+    "Aria did not retreat and another warrior opened the gate for victory.",
+    "Aria did not retreat and somebody opened the gate for victory.",
+    "Aria did not retreat and bob opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-negated", foreignActor, binding as any), true, foreignActor);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅没有打开城门，却阿丽雅娜打开城门并取得胜利。", chineseBinding as any), true);
+  for (const foreignSlot of [
+    "Aria planned to retreat, but Aria opened the gate and someone secured victory.",
+    "Aria planned to retreat, but Aria opened the window beside the gate for victory.",
+    "Aria planned to retreat, but Aria opened the gate after Bob secured victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", foreignSlot, binding as any), true, foreignSlot);
+  const relationship = { actor: "Aria", action: "bowed", counterpart: "Rook", reciprocalAction: "lowered", relationshipChange: "travel together", requiredSlots: ["actor", "action", "counterpart", "reciprocalAction", "relationshipChange"] } as const;
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to leave, but Aria bowed to Rook and someone lowered his spear and someone chose to travel together.", relationship as any), true);
+  const guardRelationship = { ...relationship, counterpart: "guard" } as const;
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to leave, but Aria bowed to the guard and lowered her own spear and chose to travel together.", guardRelationship as any), true);
+
+  const cutBinding = { actor: "Aria", action: "cut", object: "rope", outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+  for (const homographicComplement of [
+    ["event-negated", "Aria did not retreat or cut the rope for victory."],
+    ["event-failed-attempt", "Aria tried to retreat and cut the rope for victory."],
+    ["event-intent", "Aria abandoned the plan to retreat and cut the rope for victory."],
+  ] as const) assert.equal(runRuleAdapter(homographicComplement[0], homographicComplement[1], cutBinding as any), true, homographicComplement[1]);
+  for (const sharedNegation of [
+    "Aria neither opened the gate nor secured victory.",
+    "Neither did Aria open the gate nor secure victory.",
+    "Aria did not retreat, nor did Aria open the gate or secure victory.",
+  ]) assert.equal(runRuleAdapter("event-negated", sharedNegation, binding as any), true, sharedNegation);
+
+  for (const negatedChinese of [
+    "阿丽雅未打开城门并取得胜利。",
+    "阿丽雅没把城门打开并取得胜利。",
+    "阿丽雅并没把城门打开并取得胜利。",
+    "阿丽雅压根没能真正打开城门并取得胜利。",
+    "阿丽雅从未真正打开城门并取得胜利。",
+    "阿丽雅并非打开城门，而是绕过城门取得胜利。",
+    "阿丽雅不是打开城门，而是绕过城门取得胜利。",
+  ]) assert.equal(runRuleAdapter("event-negated", negatedChinese, chineseBinding as any), true, negatedChinese);
+  for (const doubleNegative of [
+    "阿丽雅不是没有打开城门并取得胜利。",
+    "阿丽雅并非没有打开城门并取得胜利。",
+    "阿丽雅绝非没有打开城门并取得胜利。",
+    "阿丽雅没有不打开城门并取得胜利。",
+    "阿丽雅未尝没有打开城门并取得胜利。",
+  ]) assert.equal(runRuleAdapter("event-negated", doubleNegative, chineseBinding as any), false, doubleNegative);
+
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to retreat but opened the gate for victory.", binding as any), false);
+  assert.equal(runRuleAdapter("event-failed-attempt", "阿丽雅试图退后，却打开城门取得胜利。", chineseBinding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅没有退后，反而打开城门并取得胜利。", chineseBinding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅未曾退后，反而打开城门并取得胜利。", chineseBinding as any), false);
+  for (const negatedOutcome of [
+    "Aria opened the gate but victory never came.",
+    "Aria opened the gate but victory did not come.",
+    "Aria opened the gate but victory would never come.",
+    "Aria opened the gate but victory was not achieved.",
+    "Aria did not hesitate and opened the gate in pursuit of victory.",
+  ]) assert.equal(runRuleAdapter("event-negated", negatedOutcome, binding as any), true, negatedOutcome);
+  for (const fulfilledChinesePlan of [
+    "阿丽雅按计划打开城门并取得胜利。",
+    "阿丽雅执行了既定计划，打开城门并取得胜利。",
+  ]) assert.equal(runRuleAdapter("event-intent", fulfilledChinesePlan, chineseBinding as any), false, fulfilledChinesePlan);
+  assert.equal(runRuleAdapter("event-simulation", "梦境消散，阿丽雅打开城门并取得胜利。", chineseBinding as any), false);
+  assert.equal(runRuleAdapter("event-hearsay", "传闻不攻自破，阿丽雅打开城门并取得胜利。", chineseBinding as any), false);
 });
 
 test("adapter applicability is closed by narrative category", () => {
@@ -216,15 +502,54 @@ test("distribution metrics bind delivery geometry to signal anchors and pacing t
     assert.notEqual(left.metrics?.anchor_spread, right.metrics?.anchor_spread);
     assert.equal(left.metrics?.paragraph_consistency, right.metrics?.paragraph_consistency);
   }
+  const delimiterCollision = groundClaim(source, {
+    ...claim(["Opening goal", "A measured response", "The ending records the consequence."]),
+    metrics: { ["anchor_spread\u001fscene_coverage\u001fparagraph_consistency"]: 1 },
+  }, voice);
+  assert.deepEqual(delimiterCollision, { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: "d" });
 
   const pacingPolicy = { kind: "distribution" as const, metricIds: ["anchor_spread", "scene_coverage", "beat_density", "turn_position"] as any, minimumAnchors: 3, requireSemanticJudge: true as const, requiredRegions: ["opening", "middle", "ending"] as const, regionSemantics: "paragraph" as const, metricThresholds: { anchor_spread: .01, scene_coverage: .01, beat_density: .01, turn_position: .01 } };
   const pacing = { id: "pacing", dimensionId: "d", verification: pacingPolicy } as any;
   const pacingClaim: any = { ...claim(["Opening goal", "A measured response", "The rhythm turns decisively."]), signalId: "pacing", metrics: { anchor_spread: 0, scene_coverage: 0, beat_density: 0, turn_position: 0 }, distributionAnchorIndices: { goal: [0], pressure: [1], beat: [1, 2], turn: [2] } };
   const paced = groundClaim(source, pacingClaim, pacing); assert.equal("ruleId" in paced, false);
+  const unsorted = groundClaim(source, { ...pacingClaim, anchors: [...pacingClaim.anchors].reverse() }, pacing);
+  assert.deepEqual(unsorted, { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: "d" });
   const untyped = groundClaim(source, { ...pacingClaim, distributionAnchorIndices: undefined }, pacing);
   assert.deepEqual(untyped, { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: "d" });
   const collapsed = groundClaim(source, { ...pacingClaim, distributionAnchorIndices: { goal: [2], pressure: [2], beat: [2], turn: [2] } }, pacing);
   assert.deepEqual(collapsed, { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: "d" });
+});
+
+test("pacing facet semantics fail closed on any modal anchor and accept exact realized sub-anchors", () => {
+  const realized = (text: string) => pacingFacetIsRealized({ anchorIndex: 0, facets: ["beat"], text });
+  for (const laundering of [
+    "Aria plans to cross the bridge, but a bell rang.",
+    "The oracle predicts pressure will rise, then rain fell.",
+    "A simulated ambush would close the road; a raven landed.",
+    "The route might turn, but the crowd shouted.",
+    "Aria plans to cross the bridge and darkness.",
+    "Aria plans to cross the sealed bridge and opens a notebook.",
+    "The oracle predicts that the pursuit will tighten and opens the archive.",
+    "A simulated ambush would force Aria back and opens the gate.",
+    "The route might turn and takes water.",
+    "阿璃计划穿过封桥并打开笔记本。",
+    "先知预测追兵会逼近并打开档案。",
+    "模拟伏击会迫使阿璃后退并打开大门。",
+    "路线可能转向并取走清水。",
+    "Aria did not slow down and crossed the courtyard.",
+    "Aria tried the northern route and reached the tower.",
+    "Aria hoped for a clear road and crossed the bridge.",
+    "阿璃试图走北路并抵达高塔。",
+    "阿璃并未放慢脚步且穿过庭院。",
+  ]) assert.equal(realized(laundering), false, laundering);
+  for (const atomic of [
+    "The guard said the road was sealed.",
+    "reached the tower",
+    "crossed the courtyard",
+    "抵达高塔",
+    "穿过庭院",
+  ]) assert.equal(realized(atomic), true, atomic);
+  assert.equal(realized("Aria tried the northern route, then reached the tower."), false, "ambiguous multi-proposition anchors require an exact sub-anchor");
 });
 
 test("long prose does not rescue voice anchors clustered at the opening", () => {

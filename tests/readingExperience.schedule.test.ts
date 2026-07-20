@@ -136,6 +136,78 @@ test("role identities and normalized aliases are globally disjoint for every art
   assert.throws(() => scheduleExperience(request({ artifactKind: "blueprint", roleBindings: undefined }), deps), { code: "invalid_authorization_payload" });
 });
 
+test("trusted role bindings reject control characters and resource-exhausting alias sets", () => {
+  const oversizedAliases = Array.from({ length: 129 }, (_, index) => `Aria-${index}`);
+  const oversizedEntities = Array.from({ length: 65 }, (_, index) => ({ id: `opponent-${index}`, aliases: [`Rook-${index}`] }));
+  for (const roleBindings of [
+    { protagonistId: "protagonist-1", aliases: ["Aria\u0000Bob"] },
+    { protagonistId: "protagonist-1", aliases: ["A".repeat(129)] },
+    { protagonistId: "protagonist-1", aliases: oversizedAliases },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], opponentIds: oversizedEntities.map((item) => item.id), opponents: oversizedEntities },
+  ]) assert.throws(() => scheduleExperience(request({ roleBindings }), deps), { code: "invalid_authorization_payload" });
+});
+
+test("raw role bindings reject strings masquerading as lists before normalization", () => {
+  for (const roleBindings of [
+    { protagonistId: "protagonist-1", aliases: "Aria" },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], counterpartIds: "ab", counterparts: [{ id: "a", aliases: ["Rook"] }, { id: "b", aliases: ["Mira"] }] },
+    { protagonistId: "protagonist-1", aliases: ["Aria"], counterpartIds: ["guard"], counterparts: [{ id: "guard", aliases: "Rook" }] },
+  ]) assert.throws(() => scheduleExperience(request({ roleBindings }), deps), { code: "invalid_authorization_payload" });
+});
+
+test("raw role binding limits are checked before array values can be copied", () => {
+  let reads = 0;
+  const oversizedAliases = new Array(129);
+  Object.defineProperty(oversizedAliases, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error("oversized aliases must not be read");
+    },
+  });
+  assert.throws(
+    () => scheduleExperience(request({ roleBindings: { protagonistId: "protagonist-1", aliases: oversizedAliases } }), deps),
+    { code: "invalid_authorization_payload" },
+  );
+  assert.equal(reads, 0);
+});
+
+test("raw role bindings reject accessors and custom iterables without executing them", () => {
+  let accessorReads = 0;
+  const accessorBindings = { protagonistId: "protagonist-1" } as Record<string, unknown>;
+  Object.defineProperty(accessorBindings, "aliases", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      return ["Aria"];
+    },
+  });
+
+  let iterations = 0;
+  const iterableAliases = {
+    [Symbol.iterator]() {
+      iterations += 1;
+      return ["Aria"][Symbol.iterator]();
+    },
+  };
+
+  assert.throws(() => scheduleExperience(request({ roleBindings: accessorBindings }), deps), { code: "invalid_authorization_payload" });
+  assert.throws(() => scheduleExperience(request({ roleBindings: { protagonistId: "protagonist-1", aliases: iterableAliases } }), deps), { code: "invalid_authorization_payload" });
+  assert.equal(accessorReads, 0);
+  assert.equal(iterations, 0);
+});
+
+test("trusted role bindings compare entity ids without delimiter collisions", () => {
+  assert.throws(() => scheduleExperience(request({ roleBindings: {
+    protagonistId: "protagonist-1",
+    aliases: ["Aria"],
+    counterpartIds: ["a|b", "c"],
+    counterparts: [{ id: "a", aliases: ["Rook"] }, { id: "b|c", aliases: ["Mira"] }],
+  } }), deps), { code: "invalid_authorization_payload" });
+});
+
 test("custom contract IDs with empty provenance cannot bypass immutable identity verification", () => {
   const missing = request();
   delete (missing.contract as any).identity;

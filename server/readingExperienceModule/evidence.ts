@@ -2,9 +2,26 @@ import { createHash } from "node:crypto";
 import type { DistributionMetricId, EvidencePolicy, ExperienceEvidenceV2, ObservableSignalV2, TextAnchorV2 } from "../../src/types";
 import type { SemanticEvidenceAnchor, SemanticEvidenceClaim } from "./types";
 import { canonicalAuthorizationPayload } from "./scheduler";
+import type { PacingFacetBinding } from "./pacingSemantics";
 
 export interface EvidenceFinding { ruleId: string; severity: "rewrite" | "rejected"; dimensionId?: string }
 export interface GroundedClaim { claim: SemanticEvidenceClaim; anchors: TextAnchorV2[]; metrics?: Record<string, number> }
+
+const pacingFacetIds = ["goal", "pressure", "beat", "turn"] as const;
+
+/** Bind each typed pacing facet to the exact grounded anchor selected by the judge. */
+export function bindPacingFacets(claim: SemanticEvidenceClaim, anchors: readonly TextAnchorV2[]): PacingFacetBinding[] {
+  const facetsByAnchor = new Map<number, Array<typeof pacingFacetIds[number]>>();
+  for (const facet of pacingFacetIds) {
+    for (const anchorIndex of claim.distributionAnchorIndices?.[facet] ?? []) {
+      const facets = facetsByAnchor.get(anchorIndex) ?? [];
+      facets.push(facet); facetsByAnchor.set(anchorIndex, facets);
+    }
+  }
+  return [...facetsByAnchor.entries()]
+    .sort(([left], [right]) => left - right)
+    .flatMap(([anchorIndex, facets]) => anchors[anchorIndex] ? [{ anchorIndex, facets, text: anchors[anchorIndex]!.text }] : []);
+}
 
 export function sourceForArtifact(artifact: { kind: string; value?: unknown; title?: string; paragraphs?: string[] }): string {
   if (artifact.kind === "blueprint") return canonicalAuthorizationPayload(artifact.value);
@@ -97,14 +114,16 @@ export function groundClaim(source: string, claim: SemanticEvidenceClaim, signal
   const anchors = claim.anchors.map(({ start, end, quote }: SemanticEvidenceAnchor) => ({ start, end, text: quote }));
   if (anchors.some((anchor) => !Number.isInteger(anchor.start) || !Number.isInteger(anchor.end) || anchor.start < 0 || anchor.end <= anchor.start || anchor.end > source.length || source.slice(anchor.start, anchor.end) !== anchor.text)) return { ruleId: "evidence.anchor_not_grounded", severity: "rewrite", dimensionId: signal.dimensionId };
   if (hasDuplicateOrOverlap(anchors)) return { ruleId: "evidence.anchor_overlap", severity: "rewrite", dimensionId: signal.dimensionId };
+  const configuredBodyStart = options.bodyStart ?? 0;
+  if (!Number.isInteger(configuredBodyStart) || configuredBodyStart < 0 || configuredBodyStart > source.length) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+  if (signal.verification.kind !== "distribution" && anchors.some((anchor) => anchor.start < configuredBodyStart)) return { ruleId: "evidence.anchor_not_grounded", severity: "rewrite", dimensionId: signal.dimensionId };
   if (signal.verification.kind === "distribution") {
     const policy = signal.verification as Extract<EvidencePolicy, { kind: "distribution" }>;
-    const bodyStart = options.bodyStart ?? 0;
-    if (!Number.isInteger(bodyStart) || bodyStart < 0 || bodyStart > source.length) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+    const bodyStart = configuredBodyStart;
     if (anchors.some((anchor) => anchor.start < bodyStart)) return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };
     if (policy.metricIds.some((id) => !metricIds.has(id))) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
     const metricKeys = Object.keys(claim.metrics ?? {}).sort(); const expected = [...policy.metricIds].sort();
-    if (metricKeys.join("\u001f") !== expected.join("\u001f")) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
+    if (metricKeys.length !== expected.length || metricKeys.some((key, index) => key !== expected[index])) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
     const voiceMetrics = policy.metricIds.some((id) => voiceFacetMetrics.has(id));
     const pacingMetrics = policy.metricIds.some((id) => pacingFacetMetrics.has(id));
     const facets = claim.distributionAnchorIndices;
@@ -118,6 +137,7 @@ export function groundClaim(source: string, claim: SemanticEvidenceClaim, signal
       if (distinctVoiceFacets.size < 3) return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };
     }
     if (pacingMetrics) {
+      if (anchors.some((anchor, index) => index > 0 && anchors[index - 1]!.end > anchor.start)) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
       if (facets!.turn!.length !== 1 || facets!.turn![0] !== anchors.length - 1) return { ruleId: "invalid_model_output", severity: "rewrite", dimensionId: signal.dimensionId };
       const goal = Math.min(...facets!.goal!); const pressure = Math.min(...facets!.pressure!); const beat = Math.min(...facets!.beat!); const turn = facets!.turn![0]; const distinct = new Set(Object.values(facets!).flat());
       if (distinct.size < 3 || !(goal < pressure && pressure <= beat && beat <= turn) || regionFor(source, anchors[goal], policy, bodyStart) !== "opening" || regionFor(source, anchors[turn], policy, bodyStart) !== "ending") return { ruleId: "evidence.distribution_insufficient", severity: "rewrite", dimensionId: signal.dimensionId };

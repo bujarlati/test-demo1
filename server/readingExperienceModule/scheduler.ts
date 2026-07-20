@@ -14,9 +14,63 @@ import type {
   AssessmentContractProjection,
 } from "./types";
 import { isRuleAdapterId } from "./ruleAdapters";
-import { normalizeRoleBindings, validTrustedRoleBindings } from "./roles";
+import { normalizeRoleBindings, validRawRoleBindings, validTrustedRoleBindings } from "./roles";
 
 const ticketSeparator = "\u001f";
+const authorizationSnapshotBudget = Object.freeze({
+  maxDepth: 32,
+  maxNodes: 200_000,
+  maxArrayLength: 50_000,
+  maxObjectProperties: 10_000,
+  maxStringLength: 1_000_000,
+  maxTotalStringCharacters: 8_000_000,
+});
+
+/** Copies untrusted authorization data without invoking accessors and freezes the result. */
+export function boundedAuthorizationSnapshot<T>(value: T): T | undefined {
+  const active = new WeakSet<object>();
+  let nodes = 0; let stringCharacters = 0;
+  const invalid = (): never => { throw new ExperienceSchedulingError("invalid_authorization_payload"); };
+  const countString = (input: string): string => {
+    if (input.length > authorizationSnapshotBudget.maxStringLength) return invalid();
+    stringCharacters += input.length;
+    if (stringCharacters > authorizationSnapshotBudget.maxTotalStringCharacters) return invalid();
+    return input;
+  };
+  const copy = (input: unknown, depth: number): unknown => {
+    if (depth > authorizationSnapshotBudget.maxDepth || ++nodes > authorizationSnapshotBudget.maxNodes) return invalid();
+    if (input === null || typeof input === "boolean" || typeof input === "number" && Number.isFinite(input) || input === undefined) return input;
+    if (typeof input === "string") return countString(input);
+    if (typeof input !== "object") return invalid();
+    if (active.has(input)) return invalid();
+    const prototype = Object.getPrototypeOf(input); const descriptors = Object.getOwnPropertyDescriptors(input); const keys = Reflect.ownKeys(descriptors);
+    if (keys.some((key) => typeof key !== "string")) return invalid();
+    active.add(input);
+    try {
+      if (Array.isArray(input)) {
+        if (prototype !== Array.prototype) return invalid();
+        const lengthDescriptor = descriptors.length;
+        if (!lengthDescriptor || !("value" in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 || lengthDescriptor.value > authorizationSnapshotBudget.maxArrayLength || keys.length !== lengthDescriptor.value + 1) return invalid();
+        const output: unknown[] = new Array(lengthDescriptor.value);
+        for (let index = 0; index < lengthDescriptor.value; index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalid();
+          output[index] = copy(descriptor.value, depth + 1);
+        }
+        return Object.freeze(output);
+      }
+      if (prototype !== Object.prototype && prototype !== null || keys.length > authorizationSnapshotBudget.maxObjectProperties) return invalid();
+      const output = Object.create(prototype === null ? null : Object.prototype) as Record<string, unknown>;
+      for (const rawKey of keys) {
+        const key = countString(rawKey as string); const descriptor = descriptors[key];
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalid();
+        Object.defineProperty(output, key, { value: copy(descriptor.value, depth + 1), enumerable: true, configurable: true, writable: true });
+      }
+      return Object.freeze(output);
+    } finally { active.delete(input); }
+  };
+  try { return copy(value, 0) as T; } catch { return undefined; }
+}
 
 export class ExperienceSchedulingError extends Error {
   constructor(public readonly code: ExperienceSchedulingErrorCode) {
@@ -261,8 +315,8 @@ function deepFreeze<T>(value: T): T {
 
 function scheduleTrusted(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
   assertScheduleCompatibility(request);
+  if (!validRawRoleBindings(request.roleBindings)) throw new ExperienceSchedulingError("invalid_authorization_payload");
   const roles = normalizeRoleBindings(request.roleBindings);
-  if (request.roleBindings?.version !== undefined && request.roleBindings.version !== 1) throw new ExperienceSchedulingError("invalid_authorization_payload");
   if (!validTrustedRoleBindings(roles) || (request.artifactKind !== "blueprint" && (!request.chapterId?.trim() || !request.revisionId?.trim()))) throw new ExperienceSchedulingError("invalid_authorization_payload");
   const chapter = chapterNumber(request);
   const stage = stageFor(request);
@@ -356,17 +410,24 @@ export function repairContext(token: import("./types").ExperienceRepairToken): i
 }
 
 export function verifyRepairAuthorization(token: import("./types").ExperienceRepairToken, expected: import("./types").RepairTokenContext, secret: string, now: Date): boolean {
+  return !!verifiedRepairAuthorizationSnapshot(token, expected, secret, now);
+}
+
+function verifiedRepairAuthorizationSnapshot(token: import("./types").ExperienceRepairToken, expected: import("./types").RepairTokenContext, secret: string, now: Date): { token: import("./types").ExperienceRepairToken; expected: import("./types").RepairTokenContext } | undefined {
   try {
-    const { signature, ...unsigned } = token;
+    const safeToken = boundedAuthorizationSnapshot(token); const safeExpected = boundedAuthorizationSnapshot(expected);
+    if (!safeToken || !safeExpected) return undefined;
+    const { signature, ...unsigned } = safeToken;
     const expectedSignature = createHmac("sha256", secret).update("reading-experience:repair:v1").update("\u001f").update(canonicalAuthorizationPayload(unsigned)).digest("base64url");
-    return sameMac(signature, expectedSignature) && Number.isFinite(Date.parse(token.expiresAt)) && Date.parse(token.expiresAt) > now.getTime() && canonicalAuthorizationPayload(expected) === canonicalAuthorizationPayload(repairContext(token));
-  } catch { return false; }
+    return sameMac(signature, expectedSignature) && Number.isFinite(Date.parse(safeToken.expiresAt)) && Date.parse(safeToken.expiresAt) > now.getTime() && canonicalAuthorizationPayload(safeExpected) === canonicalAuthorizationPayload(repairContext(safeToken)) ? { token: safeToken, expected: safeExpected } : undefined;
+  } catch { return undefined; }
 }
 
 function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
-  const repair = request.repair!; const token = repair.token; const { signature, ...unsigned } = token;
-  void signature; void unsigned;
-  if (!verifyRepairAuthorization(token, repair.expected, deps.ticketSecret, deps.now())) throw new ExperienceSchedulingError("plan_mismatch");
+  const repair = request.repair!; const verified = verifiedRepairAuthorizationSnapshot(repair.token, repair.expected, deps.ticketSecret, deps.now());
+  if (!verified) throw new ExperienceSchedulingError("plan_mismatch");
+  const token = verified.token;
+  if (!validRawRoleBindings(request.roleBindings)) throw new ExperienceSchedulingError("invalid_authorization_payload");
   const requestRoles = normalizeRoleBindings(request.roleBindings);
   if (request.attempt !== token.attempt + 1 || request.jobId !== token.jobId || request.contract.id !== token.contractRevisionId || request.contract.ruleGraphVersion !== token.ruleGraphVersion || request.activation.id !== token.activationId || request.canon.branchId !== token.branchId || request.canon.canonVersion !== token.expectedCanonVersion || request.ledger.revision !== token.ledgerRevision || request.artifactKind !== token.artifactKind || chapterNumber(request) !== token.chapterNumber || canonicalAuthorizationPayload(requestRoles) !== canonicalAuthorizationPayload(token.roleBindings) || request.artifactBindingId === token.artifactBindingId || request.expectedArtifactDigest === token.artifactHash || (token.artifactKind !== "blueprint" && (request.chapterId !== token.chapterId || request.revisionId !== token.revisionId))) throw new ExperienceSchedulingError("plan_mismatch");
   // Scheduling is a pure synchronous operation.  The authorization is carried
@@ -376,7 +437,9 @@ function authorizeRepair(request: ScheduleExperienceRequest, deps: SchedulerDepe
   return plan;
 }
 
-export function scheduleExperience(request: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+export function scheduleExperience(input: ScheduleExperienceRequest, deps: SchedulerDependencies): ExperienceStagePlan {
+  const request = boundedAuthorizationSnapshot(input);
+  if (!request) throw new ExperienceSchedulingError("invalid_authorization_payload");
   if (request.failedRuleIds !== undefined) {
     if (!Array.isArray(request.failedRuleIds) || request.failedRuleIds.some((id) => typeof id !== "string" || !id.trim())) throw new ExperienceSchedulingError("plan_mismatch");
     const canonical = [...new Set(request.failedRuleIds)].sort();

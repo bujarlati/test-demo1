@@ -8,6 +8,7 @@ import type {
   ReadingExperienceIntent,
 } from "../../src/types";
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { canonicalAuthorizationPayload, contractRevisionId, contractRevisionIdentity } from "./scheduler";
 import { adapterAppliesTo, curatedInterpretation, curatedSynthesis, evidencePolicyFor, isRuleAdapterId } from "./ruleAdapters";
 import type {
@@ -36,6 +37,24 @@ const requiredSlotsByCategory: Partial<Record<ExperienceCategory, string[]>> = {
   conflict_outcome: ["actor", "action", "outcome"],
   world_reaction: ["actor", "reaction", "outcome"],
 };
+const MAX_MODEL_DEPTH = 10;
+const MAX_MODEL_NODES = 512;
+const MAX_MODEL_PROPERTIES = 1_024;
+const MAX_MODEL_PROPERTIES_PER_OBJECT = 16;
+const MAX_MODEL_STRING_LENGTH = 1_024;
+const MAX_MODEL_TOTAL_CHARACTERS = 32_768;
+const MAX_MODEL_ARRAY_LENGTH = 16;
+const MAX_PROHIBITIONS_PER_DIMENSION = 8;
+const modelArrayLimits: Readonly<Record<string, number>> = {
+  dimensions: 2,
+  categories: categories.length,
+  observableSignals: 6,
+  prohibitions: MAX_PROHIBITIONS_PER_DIMENSION,
+  dimensionRoles: 2,
+  requiredSlots: eventSlots.size,
+  metricIds: distributionMetricIds.size,
+  requiredRegions: 3,
+};
 
 type RejectedOutcome = Extract<CompileOutcome, { status: "rejected" }>;
 type NeedsResolutionOutcome = Extract<CompileOutcome, { status: "needs_resolution" }>;
@@ -53,6 +72,68 @@ type Validation =
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ModelSnapshotResult = { ok: true; value: unknown } | { ok: false };
+
+function snapshotInterpretationOutput(value: unknown): ModelSnapshotResult {
+  const state = { nodes: 0, properties: 0, characters: 0, seen: new WeakSet<object>() };
+  const invalid = (): ModelSnapshotResult => ({ ok: false });
+  const visit = (input: unknown, depth: number, fieldName?: string): ModelSnapshotResult => {
+    state.nodes += 1;
+    if (state.nodes > MAX_MODEL_NODES || depth > MAX_MODEL_DEPTH) return invalid();
+    if (input === null || input === undefined || typeof input === "boolean") return { ok: true, value: input };
+    if (typeof input === "number") return Number.isFinite(input) ? { ok: true, value: input } : invalid();
+    if (typeof input === "string") {
+      state.characters += input.length;
+      return input.length <= MAX_MODEL_STRING_LENGTH && state.characters <= MAX_MODEL_TOTAL_CHARACTERS ? { ok: true, value: input } : invalid();
+    }
+    if (typeof input !== "object" || utilTypes.isProxy(input) || state.seen.has(input)) return invalid();
+    state.seen.add(input);
+
+    if (Array.isArray(input)) {
+      if (Object.getPrototypeOf(input) !== Array.prototype) return invalid();
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(input, "length");
+      if (!lengthDescriptor || !("value" in lengthDescriptor) || !Number.isInteger(lengthDescriptor.value)) return invalid();
+      const length = lengthDescriptor.value as number;
+      const maximum = fieldName ? modelArrayLimits[fieldName] ?? MAX_MODEL_ARRAY_LENGTH : MAX_MODEL_ARRAY_LENGTH;
+      if (length > maximum) return invalid();
+      const keys = Reflect.ownKeys(input);
+      if (keys.some((key) => typeof key !== "string") || keys.length !== length + 1) return invalid();
+      state.properties += keys.length;
+      if (state.properties > MAX_MODEL_PROPERTIES) return invalid();
+      const snapshot: unknown[] = [];
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalid();
+        const nested = visit(descriptor.value, depth + 1);
+        if (!nested.ok) return nested;
+        snapshot.push(nested.value);
+      }
+      return { ok: true, value: snapshot };
+    }
+
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    const keys = Reflect.ownKeys(input);
+    if (keys.some((key) => typeof key !== "string") || keys.length > MAX_MODEL_PROPERTIES_PER_OBJECT) return invalid();
+    state.properties += keys.length;
+    if (state.properties > MAX_MODEL_PROPERTIES) return invalid();
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return invalid();
+      const nested = visit(descriptor.value, depth + 1, key);
+      if (!nested.ok) return nested;
+      snapshot[key] = nested.value;
+    }
+    return { ok: true, value: snapshot };
+  };
+  try {
+    return visit(value, 0);
+  } catch {
+    return invalid();
+  }
 }
 
 function hasOnlyKeys(value: UnknownRecord, keys: readonly string[]): boolean {
@@ -146,39 +227,43 @@ async function interpretationDraft(
       },
     };
   }
+  let untrustedDraft: unknown;
   try {
-    const draft = await port.interpret({ intent, context });
-    const version = isRecord(draft) && typeof draft.provenanceVersion === "string" ? normalizedText(draft.provenanceVersion) : "";
-    return {
-      ok: true,
-      value: {
-        draft,
-        provenance: intent.descriptors.map((descriptor) => ({ kind: "model", descriptor: descriptor.text, version })),
-      },
-    };
+    untrustedDraft = await port.interpret({ intent, context });
   } catch {
     return { ok: false, error: { code: "model_unavailable", message: "无法理解这组体验词，请稍后重试。", stage: "interpretation", retryable: true, jobId } };
   }
+  const snapshot = snapshotInterpretationOutput(untrustedDraft);
+  if (!snapshot.ok) return { ok: false, error: { code: "invalid_model_output", message: "体验词解释结果格式不正确，请稍后重试。", stage: "interpretation", retryable: false, jobId } };
+  const draft = snapshot.value;
+  const version = isRecord(draft) && typeof draft.provenanceVersion === "string" ? normalizedText(draft.provenanceVersion) : "";
+  return {
+    ok: true,
+    value: {
+      draft,
+      provenance: intent.descriptors.map((descriptor) => ({ kind: "model", descriptor: descriptor.text, version })),
+    },
+  };
 }
 
 function validVerification(value: unknown): value is EvidencePolicy {
   if (!isRecord(value) || typeof value.minimumAnchors !== "number" || !Number.isInteger(value.minimumAnchors) || value.minimumAnchors < 1 || value.minimumAnchors > 12) return false;
   if (value.kind === "event_slots") {
-    return hasOnlyKeys(value, ["kind", "requiredSlots", "minimumAnchors"]) && Array.isArray(value.requiredSlots) && value.requiredSlots.length > 0 && value.requiredSlots.every((slot) => typeof slot === "string" && eventSlots.has(slot)) && new Set(value.requiredSlots).size === value.requiredSlots.length;
+    return hasOnlyKeys(value, ["kind", "requiredSlots", "minimumAnchors"]) && Array.isArray(value.requiredSlots) && value.requiredSlots.length > 0 && value.requiredSlots.length <= eventSlots.size && value.requiredSlots.every((slot) => typeof slot === "string" && eventSlots.has(slot)) && new Set(value.requiredSlots).size === value.requiredSlots.length;
   }
   if (value.kind === "relationship_change") return hasOnlyKeys(value, ["kind", "requireReciprocalAction", "minimumAnchors"]) && value.requireReciprocalAction === true;
   if (value.kind === "distribution") {
     const regions = value.requiredRegions;
     const thresholds = value.metricThresholds;
     const metricIds = Array.isArray(value.metricIds) ? value.metricIds : [];
-    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.every((metric) => typeof metric === "string" && distributionMetricIds.has(metric)) && new Set(metricIds).size === metricIds.length && Array.isArray(regions) && regions.length > 0 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length && (value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && isRecord(thresholds) && Object.keys(thresholds).length === metricIds.length && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1);
+    return hasOnlyKeys(value, ["kind", "metricIds", "minimumAnchors", "requireSemanticJudge", "requiredRegions", "regionSemantics", "metricThresholds"]) && value.requireSemanticJudge === true && metricIds.length > 0 && metricIds.length <= distributionMetricIds.size && metricIds.every((metric) => typeof metric === "string" && distributionMetricIds.has(metric)) && new Set(metricIds).size === metricIds.length && Array.isArray(regions) && regions.length > 0 && regions.length <= 3 && regions.every((region) => region === "opening" || region === "middle" || region === "ending") && new Set(regions).size === regions.length && (value.regionSemantics === "proportional" || value.regionSemantics === "paragraph") && isRecord(thresholds) && Object.keys(thresholds).length === metricIds.length && Object.entries(thresholds).every(([id, threshold]) => metricIds.includes(id) && typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1);
   }
   return false;
 }
 
 function validSemanticSlots(value: unknown): boolean {
   if (value === undefined) return true;
-  if (!isRecord(value) || Object.keys(value).some((key) => !eventSlots.has(key))) return false;
+  if (!isRecord(value) || Object.keys(value).length > eventSlots.size || Object.keys(value).some((key) => !eventSlots.has(key))) return false;
   return Object.values(value).every((slot) => typeof slot === "string" && normalizedText(slot).length > 0 && normalizedText(slot).length <= 80);
 }
 
@@ -199,7 +284,7 @@ function validProhibition(value: unknown): boolean {
 
 function validStructuralDimension(value: unknown): value is InterpretationDimensionDraft {
   if (!isRecord(value) || typeof value.descriptor !== "string" || typeof value.interpretation !== "string" || !Array.isArray(value.categories) || !Array.isArray(value.observableSignals) || !Array.isArray(value.prohibitions) || typeof value.confidence !== "number") return false;
-  if (!hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) || value.categories.length < 1 || !value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) || new Set(value.categories).size !== value.categories.length || value.observableSignals.length < 2 || value.observableSignals.length > 6 || !value.observableSignals.every(validSignal) || value.prohibitions.length < 1 || !value.prohibitions.every(validProhibition)) return false;
+  if (!hasOnlyKeys(value, ["descriptor", "interpretation", "categories", "observableSignals", "prohibitions", "confidence"]) || value.categories.length < 1 || value.categories.length > categories.length || !value.categories.every((category) => typeof category === "string" && categories.includes(category as ExperienceCategory)) || new Set(value.categories).size !== value.categories.length || value.observableSignals.length < 2 || value.observableSignals.length > 6 || !value.observableSignals.every(validSignal) || value.prohibitions.length < 1 || value.prohibitions.length > MAX_PROHIBITIONS_PER_DIMENSION || !value.prohibitions.every(validProhibition)) return false;
   const dimensionCategories = value.categories as ExperienceCategory[];
   const observableSignals = value.observableSignals as InterpretationDimensionDraft["observableSignals"]; const prohibitions = value.prohibitions as InterpretationDimensionDraft["prohibitions"];
   return observableSignals.every((signal) => dimensionCategories.includes(signal.kind)) && dimensionCategories.every((category) => observableSignals.some((signal) => signal.kind === category)) && prohibitions.every((prohibition) => !prohibition.ruleAdapterId || dimensionCategories.some((category) => adapterAppliesTo(prohibition.ruleAdapterId!, category)));
