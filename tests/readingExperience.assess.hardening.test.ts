@@ -100,6 +100,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but Aria did not hesitate and she won the victory."), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The enemy said the system was unavailable, but the system is not available."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she did not win the victory."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but the system plans and activates."), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she plans and wins the victory."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but the system does not activate and work."), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she does not recover and win the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
@@ -114,6 +118,8 @@ test("deterministic modality adapters reject unrealized events but allow explici
   for (const contractedTail of [
     "Aria planned to open the gate and claim victory, but Aria doesn't open the gate or claim victory.",
     "Aria planned to open the gate and claim victory, but Aria won't open the gate or claim victory.",
+    "Aria planned to retreat, but Aria will not retreat and open the gate or claim victory.",
+    "Aria planned to retreat, but Aria did not retreat and open the gate or claim victory.",
   ]) {
     assert.equal(runRuleAdapter("event-intent", contractedTail, completeBinding as any), true);
     assert.equal(runRuleAdapter("event-negated", contractedTail, completeBinding as any), true);
@@ -122,6 +128,13 @@ test("deterministic modality adapters reject unrealized events but allow explici
   const chineseNegatedTail = "阿丽雅计划打开城门并取得胜利，却阿丽雅不打开城门也不取得胜利。";
   assert.equal(runRuleAdapter("event-intent", chineseNegatedTail, chineseBinding as any), true);
   assert.equal(runRuleAdapter("event-negated", chineseNegatedTail, chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅不退后并打开城门，也不取得胜利。", chineseBinding as any), true);
+  for (const affirmativeIdiom of [
+    "阿丽雅不得不打开城门并取得胜利。",
+    "阿丽雅不由得打开城门并取得胜利。",
+    "阿丽雅毫不犹豫地打开城门并取得胜利。",
+    "阿丽雅战无不胜，随后打开城门并取得胜利。",
+  ]) assert.equal(runRuleAdapter("event-negated", affirmativeIdiom, chineseBinding as any), false, affirmativeIdiom);
   for (const unrealizedTail of [
     "Aria planned to retreat, but Aria plans to open the gate for victory.",
     "Aria planned to retreat, but Aria attempted to open the gate for victory.",
