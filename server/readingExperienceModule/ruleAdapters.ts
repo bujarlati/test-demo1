@@ -135,7 +135,7 @@ export function evidencePolicyFor(category: ExperienceCategory): EvidencePolicy 
 
 /** Generic, data-selected deterministic shortcuts.  These are never keyed by a descriptor. */
 const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
-  "event-negated": /\b(?:not|never|cannot|didn't)\b|(?:没有|未能|并未|未曾|不曾)/i,
+  "event-negated": /\b(?:not|never|cannot|can[’']t|couldn[’']t|shouldn[’']t|wouldn[’']t|won[’']t|doesn[’']t|don[’']t|didn[’']t|isn[’']t|aren[’']t|wasn[’']t|weren[’']t|hasn[’']t|haven[’']t|hadn[’']t)\b|(?:没有|未能|并未|未曾|不曾|不(?!仅|但))/i,
   "event-intent": /\b(?:plan(?:s|ned)?|intend(?:s|ed)?|prepar(?:e|es|ed|ing))\b|(?:计划|打算|准备|将要)/i,
   "event-failed-attempt": /\b(?:attempt(?:s|ed)?|tr(?:y|ies|ied)|fail(?:s|ed)?)\b|(?:试图|尝试|险些|差点|失败)/i,
   "event-simulation": /\b(?:dream|simulation|predict(?:s|ed|ion)?|conditional|would|might|imagin(?:e|es|ed|ation))\b|(?:梦境|做梦|模拟|预测|预言|如果|幻想|想象)/i,
@@ -147,17 +147,25 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
 };
 
 const nonRealizationAdapterIds = ["event-negated", "event-intent", "event-failed-attempt", "event-simulation", "event-hearsay"] as const;
+const realizationSlots = new Set<RealizationSlot>(["action", "feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange"]);
+const propositionBoundary = /\b(?:and|then|but|instead)\b|(?:并且|然后|接着|继而|而后|反而|而是|随后|下一刻|紧接着|并|却)/giu;
 
 function realizationClauses(source: string): string[] {
   return source.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
 }
 
-function hasNonRealizationModality(source: string): boolean {
-  return nonRealizationAdapterIds.some((id) => {
+function isNotOnlyMatch(source: string, index: number): boolean {
+  return /^(?:not\s+only\b|不仅|不但)/iu.test(source.slice(index));
+}
+
+function nonRealizationMatches(source: string): Array<{ start: number; end: number }> {
+  return nonRealizationAdapterIds.flatMap((id) => {
     const pattern = genericAdapters[id];
     const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
-    return [...source.matchAll(matcher)].some((match) => id !== "event-negated" || !/^not\s+only\b/iu.test(source.slice(match.index!)));
-  });
+    return [...source.matchAll(matcher)]
+      .filter((match) => id !== "event-negated" || !isNotOnlyMatch(source, match.index!))
+      .map((match) => ({ start: match.index!, end: match.index! + match[0].length }));
+  }).sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
 export function isRuleAdapterId(id: string): id is GenericRuleAdapterId { return Object.hasOwn(genericAdapters, id); }
@@ -176,6 +184,8 @@ export function adapterAppliesTo(id: GenericRuleAdapterId, category: ExperienceC
 
 const reversalMarker = /(?:\b(?:but|instead|then|actually|in reality)\b|下一刻|随后|却|反而|而是|实际上|现实中|尘埃散去|紧接着)/i;
 const realizedAfterReversal = /(?:\b(?:opened?|defeated?|won|succeeded?|activated?|responded?|confirmed?|acted?)\b|打开|开启|击败|获胜|制胜|成功|生效|反馈|奖励|弹出|记录|改变|确认|亲眼看见|毫发无损)/i;
+const realizedMechanicAfterReversal = /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i;
+const realizedOutcomeAfterReversal = /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i;
 function termStem(value: string): string {
   const normalized = value.normalize("NFKC").toLocaleLowerCase().trim();
   return /^[a-z]+$/u.test(normalized) ? normalized.replace(/(?:ing|ed|es|s)$/u, "") : normalized;
@@ -205,6 +215,29 @@ function termIndex(source: string, term: string): number {
   return -1;
 }
 
+function termIndices(source: string, term: string): number[] {
+  const expected = termStem(term); if (!expected) return [];
+  const normalized = source.normalize("NFKC").toLocaleLowerCase();
+  if (!/^[a-z]+$/u.test(expected)) { const indices: number[] = []; let from = 0; while (from <= normalized.length) { const index = normalized.indexOf(expected, from); if (index < 0) break; indices.push(index); from = index + Math.max(1, expected.length); } return indices; }
+  const indices: number[] = []; const token = /[a-z]+/gu; for (const match of normalized.matchAll(token)) if (termStem(match[0]) === expected) indices.push(match.index!); return indices;
+}
+
+function propositionStart(source: string, termAt: number): number {
+  let start = 0;
+  for (const match of source.matchAll(propositionBoundary)) { if (match.index! >= termAt) break; start = match.index! + match[0].length; }
+  return start;
+}
+
+function isUnmodalizedOccurrence(source: string, termAt: number, modalities: ReadonlyArray<{ start: number; end: number }>): boolean {
+  const start = propositionStart(source, termAt);
+  return !modalities.some((modality) => modality.start >= start && modality.start <= termAt);
+}
+
+function hasUnmodalizedPattern(source: string, pattern: RegExp): boolean {
+  const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`); const modalities = nonRealizationMatches(source);
+  return [...source.matchAll(matcher)].some((match) => isUnmodalizedOccurrence(source, match.index! + match[0].length, modalities));
+}
+
 function boundRealizationInOneClause(tail: string, value: RealizationBinding): boolean {
   const predicate = value.action ?? value.reaction;
   if (!value.actor || !predicate) return false;
@@ -212,9 +245,10 @@ function boundRealizationInOneClause(tail: string, value: RealizationBinding): b
   const requiredSlots = value.requiredSlots?.length ? [...new Set(value.requiredSlots)] : knownSlots.filter((slot) => typeof value[slot] === "string" && !!value[slot]?.trim());
   if (requiredSlots.some((slot) => typeof value[slot] !== "string" || !value[slot]?.trim())) return false;
   return realizationClauses(tail).some((clause) => {
-    if (hasNonRealizationModality(clause)) return false;
-    const predicateAt = termIndex(clause, predicate); const actorAt = termIndex(clause, value.actor!);
-    return predicateAt >= 0 && actorAt >= 0 && actorAt < predicateAt && requiredSlots.every((slot) => termIndex(clause, value[slot]!) >= 0);
+    const actorIndices = termIndices(clause, value.actor!); const modalities = nonRealizationMatches(clause);
+    const predicateAt = termIndices(clause, predicate).find((index) => actorIndices.some((actorAt) => actorAt < index) && isUnmodalizedOccurrence(clause, index, modalities));
+    if (predicateAt === undefined || requiredSlots.some((slot) => termIndex(clause, value[slot]!) < 0)) return false;
+    return requiredSlots.filter((slot) => realizationSlots.has(slot)).every((slot) => termIndices(clause, value[slot]!).some((index) => isUnmodalizedOccurrence(clause, index, modalities)));
   });
 }
 
@@ -222,18 +256,18 @@ function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realizati
   const marker = reversalMarker.exec(source);
   if (!marker) return false;
   const tail = source.slice(marker.index + marker[0].length);
-  const realizedClauses = realizationClauses(tail).filter((clause) => !hasNonRealizationModality(clause));
-  if (id === "curated-mechanic-unavailable") return realizedClauses.some((clause) => /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(clause));
-  if (id === "curated-outcome-weakened") return realizedClauses.some((clause) => /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(clause));
+  const realizedClauses = realizationClauses(tail);
+  if (id === "curated-mechanic-unavailable") return realizedClauses.some((clause) => hasUnmodalizedPattern(clause, realizedMechanicAfterReversal));
+  if (id === "curated-outcome-weakened") return realizedClauses.some((clause) => hasUnmodalizedPattern(clause, realizedOutcomeAfterReversal));
   const binding: RealizationBinding = Array.isArray(realization) ? { actor: realization[0], action: realization[1], object: realization[2] } : realization as RealizationBinding;
   if (Object.values(binding).some((term) => typeof term === "string" && !!term.trim())) return boundRealizationInOneClause(tail, binding);
-  return realizedClauses.some((clause) => realizedAfterReversal.test(clause));
+  return realizedClauses.some((clause) => hasUnmodalizedPattern(clause, realizedAfterReversal));
 }
 
 export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realization: readonly string[] | RealizationBinding = []): boolean {
   const pattern = genericAdapters[id];
   const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
-  const matches = [...source.matchAll(matcher)].filter((match) => id !== "event-negated" || !/^not\s+only\b/iu.test(source.slice(match.index!)));
+  const matches = [...source.matchAll(matcher)].filter((match) => id !== "event-negated" || !isNotOnlyMatch(source, match.index!));
   if (!matches.length) return false;
   if (id === "curated-mechanic-unavailable" || id === "curated-outcome-weakened") {
     return matches.some((match, index) => {

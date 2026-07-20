@@ -96,6 +96,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("event-negated", "他没有退后，反而击败了守卫。"), false);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "敌人讥笑面板没有反馈，下一刻面板弹出永久奖励。"), false);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "旁观者误以为主角惨败，尘埃散去他毫发无损并一击制胜。"), false);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The enemy said the system was unavailable, but Aria did not hesitate and the system became available with a reward."), false);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but Aria did not hesitate and she won the victory."), false);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The enemy said the system was unavailable, but the system is not available."), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she did not win the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
@@ -107,6 +111,23 @@ test("deterministic modality adapters reject unrealized events but allow explici
   const negatedTail = "Aria planned to open the gate and claim victory, but Aria did not open the gate or claim victory.";
   assert.equal(runRuleAdapter("event-intent", negatedTail, completeBinding as any), true);
   assert.equal(runRuleAdapter("event-negated", negatedTail, completeBinding as any), true);
+  for (const contractedTail of [
+    "Aria planned to open the gate and claim victory, but Aria doesn't open the gate or claim victory.",
+    "Aria planned to open the gate and claim victory, but Aria won't open the gate or claim victory.",
+  ]) {
+    assert.equal(runRuleAdapter("event-intent", contractedTail, completeBinding as any), true);
+    assert.equal(runRuleAdapter("event-negated", contractedTail, completeBinding as any), true);
+  }
+  const chineseBinding = { actor: "阿丽雅", action: "打开", object: "城门", outcome: "胜利", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+  const chineseNegatedTail = "阿丽雅计划打开城门并取得胜利，却阿丽雅不打开城门也不取得胜利。";
+  assert.equal(runRuleAdapter("event-intent", chineseNegatedTail, chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", chineseNegatedTail, chineseBinding as any), true);
+  for (const unrealizedTail of [
+    "Aria planned to retreat, but Aria plans to open the gate for victory.",
+    "Aria planned to retreat, but Aria attempted to open the gate for victory.",
+    "Aria planned to retreat, but in a dream Aria opened the gate for victory.",
+    "Aria planned to retreat, but rumour says Aria opened the gate for victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", unrealizedTail, completeBinding as any), true, unrealizedTail);
   assert.equal(runRuleAdapter("event-failed-attempt", "她险些打开门。"), true);
   assert.equal(runRuleAdapter("event-negated", "他没有退后，而是迎面击败守卫。"), false);
   assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also crossed it."), false);

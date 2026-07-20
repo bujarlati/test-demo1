@@ -153,7 +153,7 @@ test("a planned opening and victory followed by only an actual opening does not 
 });
 
 test("a negated post-reversal clause cannot masquerade as a realized event", async () => {
-  const sentence = "Aria planned to open the gate and claim victory, but Aria did not open the gate or claim victory.";
+  const sentence = "Aria planned to open the gate and claim victory, but Aria doesn't open the gate or claim victory.";
   const customSource = source.replace("Aria opens the sealed gate and the mechanism records her choice.", sentence);
   const locate = (text: string) => { const start = customSource.indexOf(text); return { start, end: start + text.length, quote: text }; };
   const judged = verdict();
@@ -196,8 +196,13 @@ test("relationship response and change that exist only in a plan do not count as
 test("realized reversal remains valid for same-proposition but, 而是, and not-only prose", () => {
   const binding = { actor: "Aria", action: "opened", object: "gate", outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
   assert.equal(runRuleAdapter("event-intent", "Aria planned to open the gate, but Aria opened the gate and secured victory.", binding as any), false);
+  const unrelatedNegation = "Aria planned to retreat, but Aria did not hesitate and opened the gate for victory.";
+  assert.equal(runRuleAdapter("event-intent", unrelatedNegation, binding as any), false);
+  assert.equal(runRuleAdapter("event-negated", unrelatedNegation, binding as any), false);
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to retreat, but Aria abandoned the plan and opened the gate for victory.", binding as any), false);
   assert.equal(runRuleAdapter("event-negated", "Aria并未打开城门，而是Aria打开城门并赢得胜利。", { actor: "Aria", action: "打开", object: "城门", outcome: "胜利", requiredSlots: ["actor", "action", "object", "outcome"] } as any), false);
   assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also secured victory.", binding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "Aria不仅打开城门而且赢得胜利。"), false);
 });
 
 test("voice structure metrics cannot override a target-opposed semantic judgement", async () => {
