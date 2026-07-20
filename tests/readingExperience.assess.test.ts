@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalAuthorizationPayload, repairContext, scheduleExperience } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, contractRevisionIdentity, repairContext, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import { assessExperience, consumePublicationPermit, verifyPublicationPermit } from "../server/readingExperienceModule/assessor";
 import { createReadingExperienceModule } from "../server/readingExperienceModule";
 import { hashArtifact, sourceForArtifact } from "../server/readingExperienceModule/evidence";
 import { signExperiencePlan, signExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
 import { sortedEvidenceBindings } from "../server/readingExperienceModule/publication";
+import { runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
 import type { AssessExperienceRequest, AssessorDependencies, SemanticVerdict } from "../server/readingExperienceModule/types";
 import { StrictAssessmentStatePort } from "./fixtures/strictAssessmentStatePort";
@@ -17,7 +18,7 @@ const source = "Chapter title\nAria opens the sealed gate and the mechanism reco
 
 function contract(): CompiledExperienceContractRevision {
   const event = (id: string, kind: any, policy: any): ObservableSignalV2 => ({ id, dimensionId: "d1", kind, description: "opaque", semanticSlots: { actor: "Aria" }, verification: policy, persistence: kind === "mechanic" || kind === "relationship" ? "cross_chapter" : "chapter" });
-  return {
+  const unsigned: Omit<CompiledExperienceContractRevision, "identity"> = {
     id: "r1", schemaVersion: 2, revision: 1, parentRevisionId: null,
     intent: { descriptors: [{ text: "opaque-a" }, { text: "opaque-b" }], locale: "zh-CN" },
     dimensions: [
@@ -34,7 +35,9 @@ function contract(): CompiledExperienceContractRevision {
       { id: "p2", dimensionId: "d2", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] },
     ], prohibitions: [], ruleGraphVersion: "g1", provenance: [], createdAt: now().toISOString(),
   };
+  return { ...unsigned, identity: contractRevisionIdentity(unsigned) };
 }
+function resealContract(contractRevision: CompiledExperienceContractRevision): CompiledExperienceContractRevision { const { identity: _identity, ...unsigned } = contractRevision; void _identity; contractRevision.identity = contractRevisionIdentity(unsigned); return contractRevision; }
 function activation(): ExperienceContractActivation { return { id: "a1", contractRevisionId: "r1", branchId: "main", effectiveFromChapter: 1, effectiveFromCanonVersion: 1, effectiveThroughCanonVersion: null, activatedAt: now().toISOString() }; }
 function ledger(): ExperienceLedgerV2 { return { contractRevisionId: "r1", activationId: "a1", revision: 1, branchId: "main", throughCanonVersion: 1, dimensions: [{ dimensionId: "d1", lastDeliveredChapter: 0, silentChapters: 0, deliveredSignalIds: [], persistentResults: [], debts: [] }, { dimensionId: "d2", lastDeliveredChapter: 0, silentChapters: 0, deliveredSignalIds: [], persistentResults: [], debts: [] }], evidenceIds: [], promiseStates: [], consumedTicketIds: [], history: [] }; }
 function anchor(text: string) { const start = source.indexOf(text); return { start, end: start + text.length, quote: text }; }
@@ -43,7 +46,7 @@ function verdict(overrides: Partial<SemanticVerdict> = {}): SemanticVerdict { co
   { version: 1 as const, eventId: "shared-event", dimensionId: "d2", signalId: "voice", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice."), anchor("At dusk Aria wins the duel"), anchor("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
   { version: 1 as const, eventId: "pacing-event", dimensionId: "d2", signalId: "pacing", supported: true, confidence: .9, anchors: [anchor("The city guard lowers his spear"), anchor("A spare, precise sentence"), anchor("At dawn the rhythm turns with a clear new action.")], slotAnchorIndices: {}, metrics: { anchor_spread: .8, scene_coverage: 1 } },
 ]; return { version: 1, claims, sharedCause: { eventId: "shared-event", supported: true, confidence: .9, anchors: [anchor("Aria opens the sealed gate and the mechanism records her choice.")], links: [{ dimensionId: "d1", signalId: "mechanic", claimAnchorIndex: 0, sharedAnchorIndex: 0 }, { dimensionId: "d2", signalId: "voice", claimAnchorIndex: 0, sharedAnchorIndex: 0 }] } as any, ...overrides }; }
-function fixture(judge: AssessorDependencies["semanticJudgePort"]["judge"] = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
+function fixture(judge: AssessorDependencies["semanticJudgePort"]["judge"] = async () => verdict(), configure: (value: CompiledExperienceContractRevision) => void = () => {}) { const c = contract(); configure(c); resealContract(c); const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v1", title: "Chapter title", paragraphs: source.split("\n").slice(1) }; const digest = hashArtifact(artifact); const plan = scheduleExperience({ contract: c, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: "v1", expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j1", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t1" }); const state = { activationId: "a1", branchId: "main", canonVersion: 1, ledgerRevision: 1, attempt: 1, chapterId: "c1", revisionId: "v1", artifactBindingId: plan.artifactBindingId, expectedArtifactDigest: digest as string | null, consumedTicketIds: [] as string[], consumedPermitIds: [] as string[], consumedRepairIds: [] as string[], existingEvidenceIds: [] as string[] }; return { state, request: { plan, artifact } as AssessExperienceRequest, deps: { ticketSecret: secret, now, contract: c, semanticJudgePort: { judge }, statePort: { read: () => ({ ...state, consumedTicketIds: [...state.consumedTicketIds], consumedPermitIds: [...state.consumedPermitIds], consumedRepairIds: [...state.consumedRepairIds], existingEvidenceIds: [...state.existingEvidenceIds] }), bindArtifactDigest: ({ artifactBindingId, artifactHash }: any) => { if (state.artifactBindingId !== artifactBindingId || state.expectedArtifactDigest !== null) return false; state.expectedArtifactDigest = artifactHash; return true; }, consumeTicket: ({ ticketId, repairAuthorization }: any) => { if (state.consumedTicketIds.includes(ticketId) || repairAuthorization && state.consumedRepairIds.includes(repairAuthorization.repairId)) return false; state.consumedTicketIds.push(ticketId); if (repairAuthorization) state.consumedRepairIds.push(repairAuthorization.repairId); return true; }, consumePermit: ({ permitId }: any) => { if (state.consumedPermitIds.includes(permitId)) return false; state.consumedPermitIds.push(permitId); return true; }, consumeRepair: ({ repairId }: any) => { if (state.consumedRepairIds.includes(repairId)) return false; state.consumedRepairIds.push(repairId); return true; } } } }; }
 function blueprintVerdict(plan: AssessExperienceRequest["plan"]): any {
   const deliveries = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds.map((signalId) => ({ dimensionId: dimension.id, signalId })));
   return {
@@ -78,6 +81,7 @@ test("planned, negated, simulated and predicted prose cannot qualify as pacing",
   const distribution = (id: string, kind: "voice" | "pacing", metricIds: any[]) => ({ id, dimensionId: kind === "voice" ? "d1" : "d2", kind, description: "compiled distribution target", verification: { kind: "distribution" as const, metricIds, minimumAnchors: 3, requireSemanticJudge: true as const, requiredRegions: ["opening", "middle", "ending"] as any, regionSemantics: "paragraph" as const, metricThresholds: Object.fromEntries(metricIds.map((metric) => [metric, .01])) }, persistence: "chapter" as const });
   c.dimensions[0] = { ...c.dimensions[0], categories: ["voice"], observableSignals: [distribution("voice-only", "voice", ["anchor_spread", "scene_coverage", "paragraph_consistency"])] };
   c.dimensions[1] = { ...c.dimensions[1], categories: ["pacing"], observableSignals: [distribution("pacing-only", "pacing", ["anchor_spread", "scene_coverage", "beat_density", "turn_position"])] };
+  resealContract(c);
   const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v-plan", title: "Plan-only chapter", paragraphs: ["Aria plans a decisive action at dawn.", "She has not opened the gate.", "The oracle predicts pressure will rise.", "A simulated attack would change the route.", "They intend to respond tomorrow.", "Rumour says a turn might happen.", "The ending only predicts victory."] };
   const prose = sourceForArtifact(artifact); const at = (quote: string) => ({ start: prose.indexOf(quote), end: prose.indexOf(quote) + quote.length, quote });
   const common = at(artifact.paragraphs[0]);
@@ -107,7 +111,7 @@ test("event modality checks the containing clause even when judge anchors crop o
   base.state.consumedTicketIds.length = 0; base.state.revisionId = "v-cropped"; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
   const result = await assessExperience({ plan, artifact }, { ...base.deps, semanticJudgePort: { judge: async () => semantic } });
   assert.equal(result.ok, true, JSON.stringify(result));
-  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true, JSON.stringify(result.value)); }
 });
 test("one whole-sentence anchor cannot assign another actor's realization to every slot", async () => {
   const sentence = "Aria did not open the gate, but Bob opened the gate while Aria watched.";
@@ -127,6 +131,54 @@ test("one whole-sentence anchor cannot assign another actor's realization to eve
   base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
   const result = await assessExperience({ plan, artifact }, base.deps);
   assert.equal(result.ok, true); if (result.ok) assert.equal(result.value.status, "rewrite");
+});
+
+test("a planned opening and victory followed by only an actual opening does not realize the outcome", async () => {
+  const sentence = "Aria planned to open the gate and claim victory, but Aria opened the gate.";
+  const customSource = source.replace("Aria opens the sealed gate and the mechanism records her choice.", sentence);
+  const locate = (text: string) => { const start = customSource.indexOf(text); return { start, end: start + text.length, quote: text }; };
+  const judged = verdict();
+  judged.claims[0] = { ...judged.claims[0], anchors: [locate(sentence)], slotAnchorIndices: { actor: 0, action: 0, object: 0, outcome: 0 }, slots: { actor: "Aria", action: "opened", object: "gate", outcome: "victory" } };
+  judged.claims[1] = { ...judged.claims[1], anchors: [locate(sentence), locate("At dusk Aria wins the duel"), locate("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")] };
+  judged.claims[2] = { ...judged.claims[2], anchors: [locate("The city guard lowers his spear"), locate("A spare, precise sentence"), locate("At dawn the rhythm turns with a clear new action.")] };
+  judged.sharedCause.anchors = [locate(sentence)];
+  const base = fixture(async () => judged, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "mechanic"); });
+  const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v-outcome-reversal", title: "Chapter title", paragraphs: customSource.split("\n").slice(1) };
+  const digest = hashArtifact(artifact);
+  const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: artifact.revisionId, expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-outcome-reversal", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-outcome-reversal" });
+  base.state.consumedTicketIds.length = 0; base.state.revisionId = artifact.revisionId; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, base.deps);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
+});
+
+test("relationship response and change that exist only in a plan do not count as realized", async () => {
+  const sentence = "Aria planned that the guard would lower his spear and they would travel together, but Aria bowed to the guard.";
+  const customSource = source.replace("The city guard lowers his spear, then Aria answers with a bow and they choose to travel together.", sentence);
+  const locate = (text: string) => { const start = customSource.indexOf(text); return { start, end: start + text.length, quote: text }; };
+  const planned = locate("Aria planned that the guard would lower his spear and they would travel together");
+  const actual = locate("but Aria bowed to the guard.");
+  const judged = verdict();
+  judged.claims[0] = { version: 1, eventId: "shared-event", dimensionId: "d1", signalId: "relationship", supported: true, confidence: .9, anchors: [planned, actual], slotAnchorIndices: { actor: 1, action: 1, counterpart: 1, reciprocalAction: 0, relationshipChange: 0 }, slots: { actor: "Aria", action: "bowed", counterpart: "guard", counterpartId: "guard-id", reciprocalAction: "lower", relationshipChange: "travel together" } };
+  judged.claims[1] = { ...judged.claims[1], anchors: [planned, locate("At dusk Aria wins the duel"), locate("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")] };
+  judged.claims[2] = { ...judged.claims[2], anchors: [locate("Aria opens the sealed gate and the mechanism records her choice."), locate("A spare, precise sentence"), locate("At dawn the rhythm turns with a clear new action.")] };
+  judged.sharedCause.anchors = [planned];
+  judged.sharedCause.links[0] = { dimensionId: "d1", signalId: "relationship", claimAnchorIndex: 0, sharedAnchorIndex: 0 };
+  const base = fixture(async () => judged, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "relationship"); delete value.dimensions[0].observableSignals[0].semanticSlots; });
+  const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v-relationship-reversal", title: "Chapter title", paragraphs: customSource.split("\n").slice(1) };
+  const digest = hashArtifact(artifact);
+  const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: artifact.revisionId, expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }] }, chapterNumber: 1, jobId: "j-relationship-reversal", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-relationship-reversal" });
+  base.state.consumedTicketIds.length = 0; base.state.revisionId = artifact.revisionId; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, base.deps);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true, JSON.stringify(result.value)); }
+});
+
+test("realized reversal remains valid for same-proposition but, 而是, and not-only prose", () => {
+  const binding = { actor: "Aria", action: "opened", object: "gate", outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+  assert.equal(runRuleAdapter("event-intent", "Aria planned to open the gate, but Aria opened the gate and secured victory.", binding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "Aria并未打开城门，而是Aria打开城门并赢得胜利。", { actor: "Aria", action: "打开", object: "城门", outcome: "胜利", requiredSlots: ["actor", "action", "object", "outcome"] } as any), false);
+  assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also secured victory.", binding as any), false);
 });
 
 test("voice structure metrics cannot override a target-opposed semantic judgement", async () => {
@@ -245,7 +297,7 @@ test("all five event categories cover positive, exact-confidence boundary, and n
         if (kind === "relationship") base.claims[2] = { ...base.claims[2], anchors: [anchor("Aria opens the sealed gate"), anchor("A spare, precise sentence"), base.claims[2].anchors[2]] };
         return { ...base, claims: [claim, ...base.claims.slice(1)] };
       };
-      const { request, deps } = fixture(judged, (c) => { c.dimensions[0].observableSignals = [{ id, dimensionId: "d1", kind: kind as any, description: "scheduled concrete event", semanticSlots: kind === "world_reaction" || kind === "relationship" ? undefined : { actor: "Aria" }, verification: policy, persistence: kind === "relationship" || kind === "mechanic" ? "cross_chapter" : "chapter" }]; });
+      const { request, deps } = fixture(judged, (c) => { c.dimensions[0].observableSignals = [{ id, dimensionId: "d1", kind: kind as any, description: "scheduled concrete event", ...(kind === "world_reaction" || kind === "relationship" ? {} : { semanticSlots: { actor: "Aria" } }), verification: policy, persistence: kind === "relationship" || kind === "mechanic" ? "cross_chapter" : "chapter" }]; });
       const result = await assessExperience(request, deps); assert.equal(result.ok, true, `${kind}:${caseName}`); if (!result.ok) continue; assert.equal(result.value.status, expectedStatus, `${kind}:${caseName}:${JSON.stringify(result.value)}`);
       if (caseName === "negative" && result.value.status === "rewrite") assert.deepEqual(result.value.failedRuleIds, [negativeRule], kind);
     }
@@ -425,6 +477,7 @@ test("blueprint acceptance is semantic, pointer-grounded, and rejects a maliciou
     { id: "mechanic-ending", dimensionId: "both", kind: "invariant", description: "The compiled mechanic must remain usable.", severity: "block", ruleAdapterId: "curated-mechanic-unavailable" },
     { id: "outcome-ending", dimensionId: "both", kind: "invariant", description: "The compiled protagonist advantage must remain fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" },
   );
+  resealContract(deps.contract);
   const plan = scheduleExperience({ contract: deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: "j-blue-mal", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-blue-mal" });
   const artifact = { kind: "blueprint" as const, value: blueprintValue(plan, "系统在结局前被彻底摧毁，从此再也无法启动；Aria 放弃目标并向对手投降。") };
   let calls = 0; state.consumedTicketIds.length = 0; state.artifactBindingId = plan.artifactBindingId; state.expectedArtifactDigest = null;
@@ -451,11 +504,36 @@ test("blueprint hard invariants scan canonical fields and judge pointers cannot 
       { id: "mechanic-canonical", dimensionId: "both", kind: "invariant", description: "The compiled mechanic must remain usable.", severity: "block", ruleAdapterId: "curated-mechanic-unavailable" },
       { id: "outcome-canonical", dimensionId: "both", kind: "invariant", description: "The protagonist outcome must remain fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" },
     );
+    resealContract(base.deps.contract);
     const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: `j-blue-${attack.name}`, attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => `t-blue-${attack.name}` });
     const value = blueprintValue(plan) as any; const judged = blueprintVerdict(plan); attack.mutate(value, judged);
     base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = null;
     const result = await assessExperience({ plan, artifact: { kind: "blueprint", value } }, { ...base.deps, semanticJudgePort: { judge: async () => judged } });
     assert.equal(result.ok, true, attack.name); if (result.ok) assert.equal(result.value.status, "rewrite", attack.name);
+  }
+});
+
+test("blueprint nested objects reject hidden narrative fields before semantic judging", async () => {
+  const violation = "The system is permanently unavailable and the protagonist surrenders.";
+  const attacks: Array<{ name: string; mutate: (value: any) => void }> = [
+    { name: "ending hidden outcome", mutate: (value) => { value.endingContract.hiddenOutcome = violation; } },
+    { name: "chapter hidden outcome", mutate: (value) => { value.chapters[0].hiddenOutcome = violation; } },
+    { name: "shared hidden outcome", mutate: (value) => { value.sharedCause.hiddenOutcome = violation; } },
+  ];
+  for (const attack of attacks) {
+    let calls = 0;
+    const base = fixture();
+    base.deps.contract.prohibitions.push(
+      { id: "mechanic-hidden", dimensionId: "both", kind: "invariant", description: "The compiled mechanic must remain usable.", severity: "block", ruleAdapterId: "curated-mechanic-unavailable" },
+      { id: "outcome-hidden", dimensionId: "both", kind: "invariant", description: "The protagonist outcome must remain fulfilled.", severity: "block", ruleAdapterId: "curated-outcome-weakened" },
+    );
+    resealContract(base.deps.contract);
+    const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "blueprint", roleBindings: { protagonistId: "aria-id", aliases: ["Aria"] }, chapterNumber: 1, jobId: `j-hidden-${attack.name}`, attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => `t-hidden-${attack.name}` });
+    const value = blueprintValue(plan) as any; attack.mutate(value);
+    base.state.consumedTicketIds.length = 0; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = null;
+    const result = await assessExperience({ plan, artifact: { kind: "blueprint", value } }, { ...base.deps, semanticJudgePort: { judge: async () => { calls += 1; return blueprintVerdict(plan); } } });
+    assert.equal(result.ok, true, attack.name); if (result.ok) assert.equal(result.value.status, "rewrite", attack.name);
+    assert.equal(calls, 0, attack.name);
   }
 });
 

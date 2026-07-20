@@ -370,8 +370,16 @@ export interface DeliveryPromiseV2 {
   compensationWindow?: number;
 }
 
+export interface CompiledExperienceContractIdentityV1 {
+  version: 1;
+  kind: "canonical-sha256";
+  digest: string;
+}
+
 export interface CompiledExperienceContractRevision {
   id: string;
+  /** Versioned integrity proof over the logical ID and every immutable contract field. */
+  identity: CompiledExperienceContractIdentityV1;
   schemaVersion: 2;
   revision: number;
   parentRevisionId: string | null;

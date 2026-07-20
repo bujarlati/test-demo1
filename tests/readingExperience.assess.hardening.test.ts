@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import { hashArtifact, groundClaim, sourceForArtifact } from "../server/readingExperienceModule/evidence";
-import { canonicalAuthorizationPayload, scheduleExperience } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, contractRevisionIdentity, scheduleExperience } from "../server/readingExperienceModule/scheduler";
 import type { ExperienceRepairToken } from "../server/readingExperienceModule/types";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceLedgerV2, ObservableSignalV2 } from "../src/types";
 import { adapterAppliesTo, evidencePolicyFor, runRuleAdapter } from "../server/readingExperienceModule/ruleAdapters";
@@ -35,7 +35,8 @@ test("distribution policies reject unknown local metric ids", () => {
 
 function contract(): CompiledExperienceContractRevision {
   const dimensions = ["d1", "d2"].map((id) => ({ id, descriptor: `raw-${id}`, interpretation: `compiled interpretation ${id}`, categories: ["mechanic"], observableSignals: [{ id: `${id}-s`, dimensionId: id, kind: "mechanic", description: "compiled observable event", verification: { kind: "event_slots", requiredSlots: ["actor", "action", "object", "outcome"], minimumAnchors: 1 }, persistence: "cross_chapter" }], prohibitions: [], confidence: 1 })) as unknown as CompiledExperienceContractRevision["dimensions"];
-  return { id: "r", schemaVersion: 2, revision: 1, parentRevisionId: null, intent: { descriptors: [{ text: "raw-a" }, { text: "raw-b" }], locale: "zh-CN" }, dimensions, synthesis: { sharedCause: "compiled shared cause", dimensionRoles: ["cause role", "effect role"] }, promises: [{ id: "p1", dimensionId: "d1", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] }, { id: "p2", dimensionId: "d2", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] }], prohibitions: [], ruleGraphVersion: "g", provenance: [], createdAt: now().toISOString() };
+  const unsigned: Omit<CompiledExperienceContractRevision, "identity"> = { id: "r", schemaVersion: 2, revision: 1, parentRevisionId: null, intent: { descriptors: [{ text: "raw-a" }, { text: "raw-b" }], locale: "zh-CN" }, dimensions, synthesis: { sharedCause: "compiled shared cause", dimensionRoles: ["cause role", "effect role"] }, promises: [{ id: "p1", dimensionId: "d1", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] }, { id: "p2", dimensionId: "d2", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] }], prohibitions: [], ruleGraphVersion: "g", provenance: [], createdAt: now().toISOString() };
+  return { ...unsigned, identity: contractRevisionIdentity(unsigned) };
 }
 const activation: ExperienceContractActivation = { id: "a", contractRevisionId: "r", branchId: "b", effectiveFromChapter: 1, effectiveFromCanonVersion: 1, effectiveThroughCanonVersion: null, activatedAt: now().toISOString() };
 const ledger: ExperienceLedgerV2 = { contractRevisionId: "r", activationId: "a", revision: 1, branchId: "b", throughCanonVersion: 1, dimensions: [{ dimensionId: "d1", lastDeliveredChapter: 0, silentChapters: 0, deliveredSignalIds: [], persistentResults: [], debts: [] }, { dimensionId: "d2", lastDeliveredChapter: 0, silentChapters: 0, deliveredSignalIds: [], persistentResults: [], debts: [] }], evidenceIds: [], promiseStates: [], consumedTicketIds: [], history: [] };

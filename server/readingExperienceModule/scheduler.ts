@@ -99,13 +99,32 @@ export function assessmentContractIdentity(value: Omit<AssessmentContractProject
   return createHash("sha256").update("reading-experience:assessment-contract:v1").update("\u001f").update(canonicalAuthorizationPayload(value)).digest("base64url");
 }
 
-export function contractRevisionId(body: Omit<CompiledExperienceContractRevision, "id">): string {
+type ContractRevisionContent = Omit<CompiledExperienceContractRevision, "id" | "identity">;
+type UnsignedContractRevision = Omit<CompiledExperienceContractRevision, "identity">;
+
+export function contractRevisionId(body: ContractRevisionContent): string {
   const digest = createHash("sha256").update("reading-experience:contract-revision:v2").update("\u001f").update(canonicalAuthorizationPayload(body)).digest("base64url").slice(0, 22);
   return `experience_revision_${body.revision}_${digest}`;
 }
 
+export function contractRevisionIdentity(contract: UnsignedContractRevision): CompiledExperienceContractRevision["identity"] {
+  return {
+    version: 1,
+    kind: "canonical-sha256",
+    digest: createHash("sha256").update("reading-experience:contract-identity:v1").update("\u001f").update(canonicalAuthorizationPayload(contract)).digest("base64url"),
+  };
+}
+
 export function contractRevisionIdentityMatches(contract: CompiledExperienceContractRevision): boolean {
-  try { const { id, ...body } = contract; return id === contractRevisionId(body); } catch { return false; }
+  try {
+    const identity = contract.identity as unknown;
+    if (!identity || typeof identity !== "object" || Array.isArray(identity) || Object.getPrototypeOf(identity) !== Object.prototype) return false;
+    const record = identity as Record<string, unknown>;
+    if (Object.keys(record).sort().join("|") !== "digest|kind|version" || record.version !== 1 || record.kind !== "canonical-sha256" || typeof record.digest !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(record.digest)) return false;
+    const { identity: _identity, ...unsigned } = contract;
+    void _identity;
+    return sameMac(record.digest, contractRevisionIdentity(unsigned).digest);
+  } catch { return false; }
 }
 
 export function signLedgerAuthorizationRoot(plan: ExperienceStagePlan, canon: { branchId: string; canonVersion: number; factReferences: CanonFactReferenceV2[] }, evidenceBindings: LedgerEvidenceBinding[], authorizedPatchHash: string, publicationPermit: ExperiencePublicationPermit, secret: string): string {
@@ -141,7 +160,7 @@ function chapterNumber(request: ScheduleExperienceRequest): number {
 export function assertScheduleCompatibility(request: ScheduleExperienceRequest): void {
   const chapter = chapterNumber(request);
   const { activation, contract, ledger, canon } = request;
-  if ((contract.id.startsWith("experience_revision_") || contract.provenance.length > 0) && !contractRevisionIdentityMatches(contract)) throw new ExperienceSchedulingError("contract_mismatch");
+  if (!contractRevisionIdentityMatches(contract)) throw new ExperienceSchedulingError("contract_mismatch");
   if (activation.contractRevisionId !== contract.id || ledger.contractRevisionId !== contract.id) throw new ExperienceSchedulingError("contract_mismatch");
   if (ledger.activationId !== activation.id) throw new ExperienceSchedulingError("activation_mismatch");
   if (activation.branchId !== ledger.branchId || canon.branchId !== activation.branchId) throw new ExperienceSchedulingError("branch_mismatch");

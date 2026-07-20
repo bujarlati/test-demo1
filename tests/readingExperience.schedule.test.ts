@@ -3,7 +3,7 @@ import test from "node:test";
 import { createHmac } from "node:crypto";
 import { applyExperienceLedgerPatch, createLedgerAuthorization } from "../server/readingExperienceModule/ledger";
 import { evidenceRootHash, issuePublicationPermit, ledgerPatchHash, sortedEvidenceBindings } from "../server/readingExperienceModule/publication";
-import { canonicalAuthorizationPayload, scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
+import { canonicalAuthorizationPayload, contractRevisionIdentity, scheduleExperience, signExperiencePlan, verifyExperienceStageTicket } from "../server/readingExperienceModule/scheduler";
 import type { CompiledExperienceContractRevision, ExperienceContractActivation, ExperienceDebtV2, ExperienceEvidenceV2, ExperienceLedgerV2 } from "../src/types";
 import type { ExperienceLedgerPatch } from "../server/readingExperienceModule/types";
 
@@ -28,7 +28,7 @@ function contract(): CompiledExperienceContractRevision {
     prohibitions: [],
     confidence: 0.9,
   })) as unknown as CompiledExperienceContractRevision["dimensions"];
-  return {
+  const unsigned: Omit<CompiledExperienceContractRevision, "identity"> = {
     id: "contract-r1", schemaVersion: 2, revision: 1, parentRevisionId: null,
     intent: { descriptors: [{ text: "alpha" }, { text: "beta" }], locale: "zh-CN" }, dimensions,
     synthesis: { sharedCause: "A shared cause grounds both dimensions.", dimensionRoles: ["action", "voice"] },
@@ -39,6 +39,14 @@ function contract(): CompiledExperienceContractRevision {
     ],
     prohibitions: [], ruleGraphVersion: "rules-v1", provenance: [], createdAt: "2026-07-01T00:00:00.000Z",
   };
+  return { ...unsigned, identity: contractRevisionIdentity(unsigned) };
+}
+
+function resealContract(contractRevision: CompiledExperienceContractRevision): CompiledExperienceContractRevision {
+  const { identity: _identity, ...unsigned } = contractRevision;
+  void _identity;
+  contractRevision.identity = contractRevisionIdentity(unsigned);
+  return contractRevision;
 }
 
 function activation(): ExperienceContractActivation {
@@ -128,6 +136,30 @@ test("role identities and normalized aliases are globally disjoint for every art
   assert.throws(() => scheduleExperience(request({ artifactKind: "blueprint", roleBindings: undefined }), deps), { code: "invalid_authorization_payload" });
 });
 
+test("custom contract IDs with empty provenance cannot bypass immutable identity verification", () => {
+  const missing = request();
+  delete (missing.contract as any).identity;
+  assert.throws(() => scheduleExperience(missing, deps), { code: "contract_mismatch" });
+
+  const forged = request();
+  (forged.contract as any).identity = { version: 1, kind: "canonical-sha256", digest: "forged" };
+  assert.throws(() => scheduleExperience(forged, deps), { code: "contract_mismatch" });
+
+  const stale = request();
+  stale.contract.dimensions[0].interpretation = "tampered after the persisted identity was issued";
+  assert.throws(() => scheduleExperience(stale, deps), { code: "contract_mismatch" });
+
+  const unknownVersion = request();
+  (unknownVersion.contract.identity as any).version = 2;
+  assert.throws(() => scheduleExperience(unknownVersion, deps), { code: "contract_mismatch" });
+});
+
+test("explicit versioned identity preserves custom IDs with empty provenance", () => {
+  const plan = scheduleExperience(request(), deps);
+  assert.equal(plan.ticket.contractRevisionId, "contract-r1");
+  assert.deepEqual(contract().provenance, []);
+});
+
 test("hard presence cannot become debt while soft rolling promises can", () => {
   const plan = scheduleExperience(request({ chapterNumber: 5, ledger: ledger({ promiseStates: [{ promiseId: "soft-rolling", deliveredChapters: [1] }] }) }), deps);
   assert.deepEqual(plan.hardPresencePromiseIds, ["hard-action", "hard-voice"]);
@@ -198,6 +230,7 @@ test("ledger patches are immutable CAS updates and only soft debts are stored", 
 test("due soft promises raise the selected per-dimension minimum and overdue debt remains due", () => {
   const revised = contract();
   revised.promises.find((promise) => promise.id === "soft-rolling")!.minimumSignals = 2;
+  resealContract(revised);
   const softPlan = scheduleExperience(request({ contract: revised }), deps);
   assert.equal(softPlan.promptProjection.dimensions.find((dimension) => dimension.id === "dimension_action")?.signalIds.length, 2);
   const insufficientPatch = {
@@ -235,6 +268,7 @@ test("supplied stage must agree with artifact, activation chapter, and retry sta
 test("malformed voice or pacing dimensions without distribution evidence are rejected", () => {
   const revised = contract();
   revised.dimensions[1].observableSignals = revised.dimensions[1].observableSignals.map((signal) => ({ ...signal, verification: { kind: "event_slots", requiredSlots: ["actor"], minimumAnchors: 1 } }));
+  resealContract(revised);
   assert.throws(() => scheduleExperience(request({ contract: revised }), deps), { code: "invalid_distribution" });
 });
 
@@ -244,6 +278,7 @@ test("one shared hard promise cannot replace independent per-dimension presence"
     { id: "hard-both", dimensionId: "both", scope: { kind: "every_chapter" }, hardness: "hard", minimumSignals: 1, carryRuleIds: [] },
     ...revised.promises.filter((promise) => promise.hardness === "soft"),
   ];
+  resealContract(revised);
   assert.throws(() => scheduleExperience(request({ contract: revised }), deps), { code: "contract_mismatch" });
 });
 
@@ -267,7 +302,7 @@ test("signed promise links are dimension-bound and count distinct signals", () =
   const swappedAuthorization = ledgerAuthorization(plan, request().canon, evidence, swapped, secret);
   assert.throws(() => applyExperienceLedgerPatch(ledger(), swapped, { ...deps, authorization: swappedAuthorization, liveCanon: request().canon }), { code: "unauthorized_delivery" });
 
-  const revised = contract(); revised.promises.find((promise) => promise.id === "hard-action")!.minimumSignals = 2;
+  const revised = contract(); revised.promises.find((promise) => promise.id === "hard-action")!.minimumSignals = 2; resealContract(revised);
   const twoPlan = scheduleExperience(request({ contract: revised }), deps);
   const sameSignal: ExperienceLedgerPatch = { ...structuredClone(base), ticket: twoPlan.ticket, deliveredSignalIdsByDimension: { ...base.deliveredSignalIdsByDimension, dimension_action: ["dimension_action_mechanic", "dimension_action_relationship"] }, evidenceIds: ["evidence-action-a", "evidence-action-b", "evidence-voice"], promiseEvidenceLinks: { "hard-action": { dimension_action: ["evidence-action-a", "evidence-action-b"] }, "hard-voice": { dimension_voice: ["evidence-voice"] }, "soft-rolling": { dimension_action: ["evidence-action-a"] } } };
   const duplicateSignalEvidence = fakeEvidence(twoPlan, sameSignal);
@@ -303,6 +338,7 @@ test("successful patches require every scheduled obligation and the live canon",
 test("scheduler rejects impossible or duplicate signal fulfillment and keeps non-chapter retries artifact-specific", () => {
   const impossible = contract();
   impossible.promises[0].minimumSignals = 3;
+  resealContract(impossible);
   assert.throws(() => scheduleExperience(request({ contract: impossible }), deps), { code: "insufficient_signals" });
   assert.equal(scheduleExperience(request({ artifactKind: "blueprint" }), deps).stage, "blueprint");
   assert.equal(scheduleExperience(request({ artifactKind: "retcon_revision" }), deps).stage, "retcon");
@@ -378,6 +414,7 @@ test("authorization canonicalization is strict and deterministic", () => {
 test("a due both-dimension rolling promise creates and applies one debt per dimension", () => {
   const revised = contract();
   revised.promises = [...revised.promises.filter((promise) => promise.hardness === "hard"), { id: "soft-both", dimensionId: "both", scope: { kind: "rolling_window", chapters: 3, minimumDeliveries: 2 }, hardness: "soft", minimumSignals: 1, carryRuleIds: [], compensationWindow: 2 }];
+  resealContract(revised);
   const initial = ledger({ promiseStates: [{ promiseId: "soft-both", deliveredChapters: [] }] });
   const plan = scheduleExperience(request({ contract: revised, chapterNumber: 5, ledger: initial }), deps);
   assert.deepEqual(plan.newDebts, [
@@ -397,9 +434,9 @@ test("a due both-dimension rolling promise creates and applies one debt per dime
 
 test("fallback ticket ids hash canonical fields rather than delimiter joins", () => {
   const noInjectedId = { now, ticketSecret: secret, ticketTtlMs: 60_000 };
-  const leftContract = { ...contract(), id: "a\u001fb" };
+  const leftContract = resealContract({ ...contract(), id: "a\u001fb" });
   const leftActivation = { ...activation(), id: "c", contractRevisionId: leftContract.id };
-  const rightContract = { ...contract(), id: "a" };
+  const rightContract = resealContract({ ...contract(), id: "a" });
   const rightActivation = { ...activation(), id: "b\u001fc", contractRevisionId: rightContract.id };
   const left = request({ contract: leftContract, activation: leftActivation, ledger: ledger({ contractRevisionId: leftContract.id, activationId: leftActivation.id }) });
   const right = request({ contract: rightContract, activation: rightActivation, ledger: ledger({ contractRevisionId: rightContract.id, activationId: rightActivation.id }) });

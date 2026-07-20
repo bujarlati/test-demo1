@@ -167,13 +167,20 @@ function termStem(value: string): string {
   return /^[a-z]+$/u.test(normalized) ? normalized.replace(/(?:ing|ed|es|s)$/u, "") : normalized;
 }
 
+export type RealizationSlot = "actor" | "action" | "object" | "feedback" | "outcome" | "reaction" | "reciprocalAction" | "relationshipChange" | "counterpart" | "opponent";
+
 export interface RealizationBinding {
   actor?: string;
   action?: string;
   object?: string;
+  feedback?: string;
+  outcome?: string;
   reaction?: string;
+  reciprocalAction?: string;
+  relationshipChange?: string;
   counterpart?: string;
   opponent?: string;
+  requiredSlots?: ReadonlyArray<RealizationSlot>;
 }
 
 function termIndex(source: string, term: string): number {
@@ -187,11 +194,13 @@ function termIndex(source: string, term: string): number {
 function boundRealizationInOneClause(tail: string, value: RealizationBinding): boolean {
   const predicate = value.action ?? value.reaction;
   if (!value.actor || !predicate) return false;
-  const requiredObjects = [value.object, value.counterpart, value.opponent].filter((term): term is string => typeof term === "string" && !!term.trim());
+  const knownSlots = ["actor", "action", "object", "feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange", "counterpart", "opponent"] as const;
+  const requiredSlots = value.requiredSlots?.length ? [...new Set(value.requiredSlots)] : knownSlots.filter((slot) => typeof value[slot] === "string" && !!value[slot]?.trim());
+  if (requiredSlots.some((slot) => typeof value[slot] !== "string" || !value[slot]?.trim())) return false;
   const clauses = tail.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
   return clauses.some((clause) => {
     const predicateAt = termIndex(clause, predicate); const actorAt = termIndex(clause, value.actor!);
-    return predicateAt >= 0 && actorAt >= 0 && actorAt < predicateAt && requiredObjects.every((term) => termIndex(clause, term) >= 0);
+    return predicateAt >= 0 && actorAt >= 0 && actorAt < predicateAt && requiredSlots.every((slot) => termIndex(clause, value[slot]!) >= 0);
   });
 }
 

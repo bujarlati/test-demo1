@@ -3,7 +3,7 @@ import type { CanonFactCandidateV2, ExperienceEvidenceV2, ObservableSignalV2 } f
 import { evidenceFromClaim, groundClaim, hashArtifact, sourceForArtifact, type EvidenceFinding, type GroundedClaim } from "./evidence";
 import { assessmentContractIdentity, canonicalAuthorizationPayload, repairContext, sameMac, signExperiencePlan, verifyExperienceStageTicket, verifyRepairAuthorization } from "./scheduler";
 import type { AssessExperienceRequest, AssessmentContractProjection, AssessmentState, AssessorDependencies, ExperienceAssessment, ExperienceLedgerPatch, ExperienceOperationResult, ExperiencePublicationPermit, ExperienceRepairToken, ExperienceStagePlan, PublicationPermitContext, RepairTokenContext, SemanticBlueprintVerdict, SemanticEvidenceClaim } from "./types";
-import { adapterAppliesTo, isRuleAdapterId, runRuleAdapter } from "./ruleAdapters";
+import { adapterAppliesTo, isRuleAdapterId, runRuleAdapter, type RealizationBinding, type RealizationSlot } from "./ruleAdapters";
 import type { GenericRuleAdapterId } from "./types";
 import { canonFactCandidateId, cleanAuthorizationValue, evidenceRootHash, issuePublicationPermit, ledgerPatchHash, publicationPermitContext, publicationPermitDigest, sortedEvidenceBindings, verifyPublicationPermit as verifyPermit } from "./publication";
 import { canonicalRoleKey, validTrustedRoleBindings } from "./roles";
@@ -100,12 +100,13 @@ function localFinding(source: string, claim: SemanticEvidenceClaim, grounded: Gr
     const start = source.lastIndexOf("\n", Math.max(0, anchor.start - 1)) + 1; const next = source.indexOf("\n", anchor.end);
     return source.slice(start, next < 0 ? source.length : next);
   }).join(" "); const slots = claim.slots ?? {};
-  const realization = { actor: slots.actor, action: slots.action, object: slots.object, reaction: slots.reaction, counterpart: slots.counterpart, opponent: slots.opponent };
-  if ([...realizationAdapters, ...configuredAdapters].some((id) => adapterAppliesTo(id, signal.kind) && runRuleAdapter(id, text, realization))) return { ruleId: "evidence.not_realized", severity: "rewrite", dimensionId: signal.dimensionId };
   const present = (slot: string) => typeof slots[slot as keyof typeof slots] === "string" && (slots[slot as keyof typeof slots] as string).trim() && text.toLocaleLowerCase().includes((slots[slot as keyof typeof slots] as string).toLocaleLowerCase());
   const required: Record<string, string[]> = { mechanic: ["actor", "action", "object", "outcome"], protagonist_action: ["actor", "action", "outcome"], conflict_outcome: ["actor", "action", "opponent", "outcome"], world_reaction: ["actor", "reaction", "outcome"], relationship: ["actor", "action", "counterpart", "reciprocalAction", "relationshipChange"] };
   const policyRequired = signal.verification.kind === "event_slots" ? signal.verification.requiredSlots : [];
-  const requiredSlots = unique([...policyRequired, ...(required[signal.kind] ?? [])]);
+  const suppliedEffectSlots = (["feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange"] as RealizationSlot[]).filter((slot) => typeof slots[slot as keyof typeof slots] === "string" && !!slots[slot as keyof typeof slots]?.trim());
+  const requiredSlots = unique([...policyRequired, ...(required[signal.kind] ?? []), ...suppliedEffectSlots]) as RealizationSlot[];
+  const realization: RealizationBinding = { actor: slots.actor, action: slots.action, object: slots.object, feedback: slots.feedback, outcome: slots.outcome, reaction: slots.reaction, reciprocalAction: slots.reciprocalAction, relationshipChange: slots.relationshipChange, counterpart: slots.counterpart, opponent: slots.opponent, requiredSlots };
+  if ([...realizationAdapters, ...configuredAdapters].some((id) => adapterAppliesTo(id, signal.kind) && runRuleAdapter(id, text, realization))) return { ruleId: "evidence.not_realized", severity: "rewrite", dimensionId: signal.dimensionId };
   if (requiredSlots.some((slot) => !present(slot))) return { ruleId: "evidence.required_slot_missing", severity: "rewrite", dimensionId: signal.dimensionId };
   if (["protagonist_action", "conflict_outcome", "mechanic", "relationship"].includes(signal.kind) && (!roles.protagonistId || !roles.aliases.some((alias) => canonicalRoleKey(alias) === canonicalRoleKey(slots.actor ?? "")))) return { ruleId: "evidence.helper_substitution", severity: "rewrite", dimensionId: signal.dimensionId };
   if (signal.kind === "relationship") { const counterpart = roles.counterparts.find((item) => item.id === slots.counterpartId); if (!counterpart || !slots.counterpart || !counterpart.aliases.some((alias) => canonicalRoleKey(alias) === canonicalRoleKey(slots.counterpart!))) return { ruleId: "evidence.counterpart_untrusted", severity: "rewrite", dimensionId: signal.dimensionId }; }
@@ -182,7 +183,10 @@ async function issueRewrite(request: AssessExperienceRequest, findings: Evidence
 function validBlueprint(value: Record<string, unknown>, plan: ExperienceStagePlan): boolean {
   const allowed = ["axisSignalIds", "chapters", "endingContract", "hardPromiseIds", "meta", "protagonist", "schemaVersion", "sharedCause", "title"];
   if (Object.keys(value).some((key) => !allowed.includes(key))) return false;
-  const protagonist = value.protagonist as Record<string, unknown> | undefined; const ending = value.endingContract as Record<string, unknown> | undefined; const shared = value.sharedCause as Record<string, unknown> | undefined;
+  const exactObject = (candidate: unknown, allowedKeys: readonly string[], requiredKeys: readonly string[] = allowedKeys): candidate is Record<string, unknown> => !!candidate && typeof candidate === "object" && !Array.isArray(candidate) && Object.getPrototypeOf(candidate) === Object.prototype && Object.keys(candidate).every((key) => allowedKeys.includes(key)) && requiredKeys.every((key) => Object.hasOwn(candidate, key));
+  if (!exactObject(value.protagonist, ["id"]) || !exactObject(value.endingContract, ["target", "cost"], ["target"]) || !exactObject(value.sharedCause, ["event", "dimensionIds"]) || value.meta !== undefined && !exactObject(value.meta, ["prohibitionsSatisfied"])) return false;
+  const protagonist = value.protagonist; const ending = value.endingContract; const shared = value.sharedCause;
+  if (value.meta !== undefined && value.meta.prohibitionsSatisfied !== true) return false;
   const expectedSignals = plan.promptProjection.dimensions.flatMap((dimension) => dimension.signalIds).sort(); const suppliedSignals = Array.isArray(value.axisSignalIds) ? value.axisSignalIds : [];
   const expectedPromises = [...plan.hardPresencePromiseIds].sort(); const suppliedPromises = Array.isArray(value.hardPromiseIds) ? value.hardPromiseIds : [];
   if (value.schemaVersion !== 1 || typeof value.title !== "string" || !value.title.trim() || !protagonist || typeof protagonist.id !== "string" || !protagonist.id || protagonist.id !== plan.roleBindings.protagonistId || !ending || typeof ending.target !== "string" || !ending.target.trim() || (ending.cost !== undefined && typeof ending.cost !== "string")) return false;
