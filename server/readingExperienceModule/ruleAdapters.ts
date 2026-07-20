@@ -148,11 +148,12 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
 
 const nonRealizationAdapterIds = ["event-negated", "event-intent", "event-failed-attempt", "event-simulation", "event-hearsay"] as const;
 type NonRealizationAdapterId = typeof nonRealizationAdapterIds[number];
-interface ModalityMatch { id: NonRealizationAdapterId; start: number; end: number; }
+interface ModalityMatch { id: NonRealizationAdapterId; start: number; end: number; cancelledIntent: boolean; }
 const realizationSlots = new Set<RealizationSlot>(["action", "feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange"]);
 const propositionBoundary = /\b(?:and|or|then|but|instead|actually|in\s+reality)\b|(?:并且|或者|然后|接着|继而|而后|反而|而是|随后|下一刻|紧接着|并|或|也|却)/giu;
 const weakBoundaries = new Set(["and", "or", "并", "并且", "或", "或者", "也"]);
-const affirmativeNegationIdiom = /(?:不得不|不由得|毫不(?:犹豫|迟疑)|战无不胜|没有(?:丝毫|半点|任何)?(?:犹豫|迟疑|停顿))/giu;
+const weakScopePreservingModalities = new Set<NonRealizationAdapterId>(["event-intent", "event-simulation", "event-hearsay"]);
+const affirmativeNegationIdiom = /(?:\b(?:do|does|did)\s+not\s+(?:hesitate|flinch|pause|waver|wait)\b|\b(?:don[’']t|doesn[’']t|didn[’']t)\s+(?:hesitate|flinch|pause|waver|wait)\b|不得不|不能不|不会不|不可不|未尝不|何尝不|不由得|不禁|(?:忍|按捺)不住|情不自禁|迫不及待|不(?:假思索|慌不忙|紧不慢|卑不亢|知不觉|动声色|约而同|期而遇|谋而合)|毫不(?:犹豫|迟疑|费力|畏惧|在意|示弱|留情|客气)|战无不胜|无不|没有(?:丝毫|半点|任何)?(?:犹豫|迟疑|停顿))/giu;
 
 function realizationClauses(source: string): string[] {
   return source.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
@@ -178,7 +179,6 @@ function isCancelledIntent(source: string, start: number): boolean {
 
 function ignoredRuleMatch(id: GenericRuleAdapterId, source: string, start: number): boolean {
   if (id === "event-negated") return isNotOnlyMatch(source, start) || isInsideAffirmativeNegationIdiom(source, start);
-  if (id === "event-intent") return isCancelledIntent(source, start);
   return false;
 }
 
@@ -194,7 +194,7 @@ function isNonRealizationAdapterId(id: GenericRuleAdapterId): id is NonRealizati
 
 function nonRealizationMatches(source: string): ModalityMatch[] {
   return nonRealizationAdapterIds.flatMap((id) => {
-    return ruleMatches(id, source).map((match) => ({ id, ...match }));
+    return ruleMatches(id, source).map((match) => ({ id, ...match, cancelledIntent: id === "event-intent" && isCancelledIntent(source, match.start) }));
   }).sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
@@ -262,6 +262,13 @@ function hasFiniteAffirmativePredicate(source: string, start: number, termAt: nu
   return /\b(?:[a-z]{3,}(?:ed|es)|wins|works|opens|acts|claims|secures|responds|confirms|activates|becomes|won|lost|became|got|gave|took|made|saw|felt|found|kept|left|stood)\b/iu.test(segment);
 }
 
+function chineseNegationAllowsCoordinationBreak(source: string, modality: ModalityMatch): boolean {
+  if (modality.id !== "event-negated") return false;
+  const remainder = source.slice(modality.start);
+  if (remainder.startsWith("没有")) return true;
+  return remainder.startsWith("不") && !/^(?:不能|不会|不愿|不肯|不要|不敢|不想|不打算|不准备|不得)/u.test(remainder);
+}
+
 function modalityGovernsTerm(source: string, modality: ModalityMatch, termAt: number, actor: string): boolean {
   if (modality.start > termAt) return false;
   for (const boundary of source.matchAll(propositionBoundary)) {
@@ -272,8 +279,10 @@ function modalityGovernsTerm(source: string, modality: ModalityMatch, termAt: nu
     const afterBoundary = boundary.index! + boundary[0].length;
     const actorRepeated = !!actor && termIndices(source.slice(afterBoundary, termAt), actor).length > 0;
     if (actorRepeated) return false;
+    if (modality.cancelledIntent && ["and", "并", "并且", "也"].includes(normalized)) return false;
+    if (["并", "并且", "也"].includes(normalized) && chineseNegationAllowsCoordinationBreak(source, modality)) return false;
     const englishTarget = /^[a-z]/iu.test(source.slice(termAt));
-    if (modality.id !== "event-intent" && englishTarget && hasFiniteAffirmativePredicate(source, afterBoundary, termAt)) return false;
+    if (!weakScopePreservingModalities.has(modality.id) && englishTarget && hasFiniteAffirmativePredicate(source, afterBoundary, termAt)) return false;
   }
   return true;
 }
@@ -293,6 +302,30 @@ function hasUnmodalizedPattern(source: string, pattern: RegExp, actorPattern?: R
   });
 }
 
+function hasExplicitSubjectCandidate(prefix: string): boolean {
+  const value = prefix.normalize("NFKC").trim().replace(/^[\s,，:：-]+|[\s,，:：-]+$/gu, "");
+  if (!value) return false;
+  if (/^[a-z\s'’-]+$/iu.test(value)) {
+    const words = value.toLocaleLowerCase().match(/[a-z]+/gu) ?? [];
+    if (!words.length) return false;
+    if (["with", "without", "by", "through", "using", "after", "before", "in", "on", "at", "under", "over"].includes(words[0]!)) return false;
+    const modifiers = new Set(["again", "already", "also", "almost", "directly", "easily", "finally", "immediately", "instantly", "just", "merely", "now", "once", "personally", "quickly", "quietly", "simply", "slowly", "still", "suddenly", "then", "together"]);
+    return words.some((word) => !word.endsWith("ly") && !modifiers.has(word));
+  }
+  return !/^(?:(?:又|便|就|才|仍|还|已|立刻|立即|马上|随即|径直|亲手|轻易|猛地|狠狠地|迅速|缓缓|果断|直接))*$/u.test(value);
+}
+
+function actorBindsPredicate(source: string, predicateAt: number, actor: string): boolean {
+  let propositionStart = 0;
+  for (const boundary of source.matchAll(propositionBoundary)) {
+    if (boundary.index! >= predicateAt) break;
+    propositionStart = boundary.index! + boundary[0].length;
+  }
+  if (termIndices(source.slice(propositionStart, predicateAt), actor).length > 0) return true;
+  if (termIndices(source.slice(0, propositionStart), actor).length === 0) return false;
+  return !hasExplicitSubjectCandidate(source.slice(propositionStart, predicateAt));
+}
+
 function boundRealizationInOneClause(tail: string, value: RealizationBinding): boolean {
   const predicate = value.action ?? value.reaction;
   if (!value.actor || !predicate) return false;
@@ -300,8 +333,8 @@ function boundRealizationInOneClause(tail: string, value: RealizationBinding): b
   const requiredSlots = value.requiredSlots?.length ? [...new Set(value.requiredSlots)] : knownSlots.filter((slot) => typeof value[slot] === "string" && !!value[slot]?.trim());
   if (requiredSlots.some((slot) => typeof value[slot] !== "string" || !value[slot]?.trim())) return false;
   return realizationClauses(tail).some((clause) => {
-    const actorIndices = termIndices(clause, value.actor!); const modalities = nonRealizationMatches(clause);
-    const predicateAt = termIndices(clause, predicate).find((index) => actorIndices.some((actorAt) => actorAt < index) && isUnmodalizedTerm(clause, index, value.actor!, modalities));
+    const modalities = nonRealizationMatches(clause);
+    const predicateAt = termIndices(clause, predicate).find((index) => actorBindsPredicate(clause, index, value.actor!) && isUnmodalizedTerm(clause, index, value.actor!, modalities));
     if (predicateAt === undefined || requiredSlots.some((slot) => termIndex(clause, value[slot]!) < 0)) return false;
     return requiredSlots.filter((slot) => realizationSlots.has(slot)).every((slot) => termIndices(clause, value[slot]!).some((index) => isUnmodalizedTerm(clause, index, value.actor!, modalities)));
   });

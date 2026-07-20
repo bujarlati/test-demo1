@@ -104,6 +104,8 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she plans and wins the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but the system does not activate and work."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she does not recover and win the victory."), true);
+  assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but in a dream the system recovered and activated."), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but in a dream she recovered and won the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
@@ -141,6 +143,47 @@ test("deterministic modality adapters reject unrealized events but allow explici
     "Aria planned to retreat, but in a dream Aria opened the gate for victory.",
     "Aria planned to retreat, but rumour says Aria opened the gate for victory.",
   ]) assert.equal(runRuleAdapter("event-intent", unrealizedTail, completeBinding as any), true, unrealizedTail);
+  for (const cancelledOnly of [
+    "Aria abandoned the plan to open the gate and claim victory.",
+    "Aria cancelled the plan to open the gate and claim victory.",
+    "Aria dropped the plan to open the gate and claim victory.",
+    "Aria abandoned the plan to retreat or open the gate and claim victory.",
+  ]) assert.equal(runRuleAdapter("event-intent", cancelledOnly, completeBinding as any), true, cancelledOnly);
+  assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃了计划打开城门并取得胜利。", chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-intent", "阿丽雅放弃计划并打开城门并取得胜利。", chineseBinding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅没有退后并打开城门并取得胜利。", chineseBinding as any), false);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅没有打开城门并取得胜利。", chineseBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅未能退后并打开城门并取得胜利。", chineseBinding as any), true);
+  for (const [id, unrealizedCoordination] of [
+    ["event-simulation", "In a dream Aria retreated and opened the gate for victory."],
+    ["event-simulation", "The oracle predicted Aria retreated and opened the gate for victory."],
+    ["event-hearsay", "Rumour says Aria retreated and opened the gate for victory."],
+  ] as const) assert.equal(runRuleAdapter(id, unrealizedCoordination, completeBinding as any), true, unrealizedCoordination);
+  for (const foreignActor of [
+    "Aria did not open the gate and Bob opened the gate for victory.",
+    "Aria did not open the gate or Bob opened the gate for victory.",
+    "Aria did not open the gate but Bob opened the gate for victory.",
+    "Aria did not open the gate and the gate opened itself for victory.",
+  ]) assert.equal(runRuleAdapter("event-negated", foreignActor, completeBinding as any), true, foreignActor);
+  assert.equal(runRuleAdapter("event-negated", "阿丽雅没有打开城门并鲍勃打开城门取得胜利。", chineseBinding as any), true);
+  for (const affirmativeExpression of [
+    "阿丽雅忍不住打开城门并取得胜利。",
+    "阿丽雅情不自禁地打开城门并取得胜利。",
+    "阿丽雅迫不及待地打开城门并取得胜利。",
+    "阿丽雅不假思索地打开城门并取得胜利。",
+    "阿丽雅毫不费力地打开城门并取得胜利。",
+    "阿丽雅不慌不忙地打开城门并取得胜利。",
+  ]) assert.equal(runRuleAdapter("event-negated", affirmativeExpression, chineseBinding as any), false, affirmativeExpression);
+  for (const [action, object, realized] of [
+    ["struck", "guard", "Aria did not hesitate and struck the guard for victory."],
+    ["slew", "beast", "Aria did not hesitate and slew the beast for victory."],
+    ["cut", "rope", "Aria did not hesitate and cut the rope for victory."],
+    ["broke", "seal", "Aria did not hesitate and broke the seal for victory."],
+    ["ran", "gauntlet", "Aria did not hesitate and ran the gauntlet for victory."],
+  ] as const) {
+    const genericBinding = { actor: "Aria", action, object, outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+    assert.equal(runRuleAdapter("event-negated", realized, genericBinding as any), false, realized);
+  }
   assert.equal(runRuleAdapter("event-failed-attempt", "她险些打开门。"), true);
   assert.equal(runRuleAdapter("event-negated", "他没有退后，而是迎面击败守卫。"), false);
   assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also crossed it."), false);
