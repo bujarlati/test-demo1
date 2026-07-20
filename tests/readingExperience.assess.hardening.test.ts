@@ -106,6 +106,7 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but she does not recover and win the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "The system was unavailable, but in a dream the system recovered and activated."), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but in a dream she recovered and won the victory."), true);
+  assert.equal(runRuleAdapter("curated-outcome-weakened", "Onlookers thought the protagonist lost, but in a dream she recovered and she won the victory."), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-outcome-weakened", "主角惨败，随后阿丽雅打开窗户。"), true);
   assert.equal(runRuleAdapter("curated-mechanic-unavailable", "面板没有反馈，下一刻面板弹出奖励；后来系统永久失效。"), true);
@@ -156,8 +157,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("event-negated", "阿丽雅未能退后并打开城门并取得胜利。", chineseBinding as any), true);
   for (const [id, unrealizedCoordination] of [
     ["event-simulation", "In a dream Aria retreated and opened the gate for victory."],
+    ["event-simulation", "In a dream Aria retreated and Aria opened the gate for victory."],
     ["event-simulation", "The oracle predicted Aria retreated and opened the gate for victory."],
     ["event-hearsay", "Rumour says Aria retreated and opened the gate for victory."],
+    ["event-hearsay", "Rumour says Aria retreated and Aria opened the gate for victory."],
   ] as const) assert.equal(runRuleAdapter(id, unrealizedCoordination, completeBinding as any), true, unrealizedCoordination);
   for (const foreignActor of [
     "Aria did not open the gate and Bob opened the gate for victory.",

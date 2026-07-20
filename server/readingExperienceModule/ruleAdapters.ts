@@ -277,6 +277,7 @@ function modalityGovernsTerm(source: string, modality: ModalityMatch, termAt: nu
     const normalized = boundary[0].normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ");
     if (!weakBoundaries.has(normalized)) return false;
     const afterBoundary = boundary.index! + boundary[0].length;
+    if (modality.id === "event-simulation" || modality.id === "event-hearsay") continue;
     const actorRepeated = !!actor && termIndices(source.slice(afterBoundary, termAt), actor).length > 0;
     if (actorRepeated) return false;
     if (modality.cancelledIntent && ["and", "并", "并且", "也"].includes(normalized)) return false;
