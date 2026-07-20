@@ -152,6 +152,25 @@ test("a planned opening and victory followed by only an actual opening does not 
   if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true); }
 });
 
+test("a negated post-reversal clause cannot masquerade as a realized event", async () => {
+  const sentence = "Aria planned to open the gate and claim victory, but Aria did not open the gate or claim victory.";
+  const customSource = source.replace("Aria opens the sealed gate and the mechanism records her choice.", sentence);
+  const locate = (text: string) => { const start = customSource.indexOf(text); return { start, end: start + text.length, quote: text }; };
+  const judged = verdict();
+  judged.claims[0] = { ...judged.claims[0], anchors: [locate(sentence)], slotAnchorIndices: { actor: 0, action: 0, object: 0, outcome: 0 }, slots: { actor: "Aria", action: "open", object: "gate", outcome: "victory" } };
+  judged.claims[1] = { ...judged.claims[1], anchors: [locate(sentence), locate("At dusk Aria wins the duel"), locate("旁观者讥笑面板没有反馈，下一刻面板弹出永久奖励。")] };
+  judged.claims[2] = { ...judged.claims[2], anchors: [locate("The city guard lowers his spear"), locate("A spare, precise sentence"), locate("At dawn the rhythm turns with a clear new action.")] };
+  judged.sharedCause.anchors = [locate(sentence)];
+  const base = fixture(async () => judged, (value) => { value.dimensions[0].observableSignals = value.dimensions[0].observableSignals.filter((signal) => signal.id === "mechanic"); });
+  const artifact = { kind: "chapter" as const, chapterId: "c1", revisionId: "v-negated-reversal", title: "Chapter title", paragraphs: customSource.split("\n").slice(1) };
+  const digest = hashArtifact(artifact);
+  const plan = scheduleExperience({ contract: base.deps.contract, activation: activation(), ledger: ledger(), canon: { branchId: "main", canonVersion: 1, factReferences: [] }, artifactKind: "chapter", chapterId: "c1", revisionId: artifact.revisionId, expectedArtifactDigest: digest, roleBindings: { protagonistId: "aria-id", aliases: ["Aria"], counterpartIds: ["guard-id"], opponentIds: ["duelist-id"], counterparts: [{ id: "guard-id", aliases: ["guard"] }], opponents: [{ id: "duelist-id", aliases: ["duel"] }] }, chapterNumber: 1, jobId: "j-negated-reversal", attempt: 1 }, { ticketSecret: secret, ticketTtlMs: 60_000, now, createTicketId: () => "t-negated-reversal" });
+  base.state.consumedTicketIds.length = 0; base.state.revisionId = artifact.revisionId; base.state.artifactBindingId = plan.artifactBindingId; base.state.expectedArtifactDigest = digest;
+  const result = await assessExperience({ plan, artifact }, base.deps);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) { assert.equal(result.value.status, "rewrite"); if (result.value.status === "rewrite") assert.equal(result.value.failedRuleIds.includes("evidence.not_realized"), true, JSON.stringify(result.value)); }
+});
+
 test("relationship response and change that exist only in a plan do not count as realized", async () => {
   const sentence = "Aria planned that the guard would lower his spear and they would travel together, but Aria bowed to the guard.";
   const customSource = source.replace("The city guard lowers his spear, then Aria answers with a bow and they choose to travel together.", sentence);
@@ -490,6 +509,7 @@ test("blueprint acceptance is semantic, pointer-grounded, and rejects a maliciou
 test("blueprint hard invariants scan canonical fields and judge pointers cannot redirect them", async () => {
   const violation = "The system is permanently unavailable and the protagonist surrenders.";
   const attacks: Array<{ name: string; mutate: (value: any, judged: any) => void }> = [
+    { name: "title", mutate: (value) => { value.title = violation; } },
     { name: "ending target redirect", mutate: (value, judged) => { value.endingContract.target = violation; judged.ending.targetPointer = "/chapters/0/event"; } },
     { name: "ending cost redirect", mutate: (value, judged) => { value.endingContract.cost = violation; judged.ending.costPointer = "/chapters/0/cost"; } },
     { name: "chapter event", mutate: (value) => { value.chapters[0].event = violation; } },

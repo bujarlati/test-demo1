@@ -103,6 +103,10 @@ test("deterministic modality adapters reject unrealized events but allow explici
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Bob opened the gate while Aria watched.", ["Aria", "open", "gate"]), true);
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the window.", ["Aria", "open", "gate"]), true);
   assert.equal(runRuleAdapter("event-negated", "Aria did not open the gate, but Aria opened the gate.", ["Aria", "open", "gate"]), false);
+  const completeBinding = { actor: "Aria", action: "open", object: "gate", outcome: "victory", requiredSlots: ["actor", "action", "object", "outcome"] } as const;
+  const negatedTail = "Aria planned to open the gate and claim victory, but Aria did not open the gate or claim victory.";
+  assert.equal(runRuleAdapter("event-intent", negatedTail, completeBinding as any), true);
+  assert.equal(runRuleAdapter("event-negated", negatedTail, completeBinding as any), true);
   assert.equal(runRuleAdapter("event-failed-attempt", "她险些打开门。"), true);
   assert.equal(runRuleAdapter("event-negated", "他没有退后，而是迎面击败守卫。"), false);
   assert.equal(runRuleAdapter("event-negated", "Aria not only opened the gate but also crossed it."), false);

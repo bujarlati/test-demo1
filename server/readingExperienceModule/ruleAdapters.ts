@@ -146,6 +146,20 @@ const genericAdapters: Record<GenericRuleAdapterId, RegExp> = {
   "curated-outcome-weakened": /(?:protagonist|主角|主人公).{0,24}?(?:rescued|draws?|defeated|los(?:e|es|t)|surrenders?|gives?\s+up|被救场|战平|惨败|失去优势|投降|放弃目标)/i,
 };
 
+const nonRealizationAdapterIds = ["event-negated", "event-intent", "event-failed-attempt", "event-simulation", "event-hearsay"] as const;
+
+function realizationClauses(source: string): string[] {
+  return source.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
+}
+
+function hasNonRealizationModality(source: string): boolean {
+  return nonRealizationAdapterIds.some((id) => {
+    const pattern = genericAdapters[id];
+    const matcher = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+    return [...source.matchAll(matcher)].some((match) => id !== "event-negated" || !/^not\s+only\b/iu.test(source.slice(match.index!)));
+  });
+}
+
 export function isRuleAdapterId(id: string): id is GenericRuleAdapterId { return Object.hasOwn(genericAdapters, id); }
 
 const eventCategories = new Set<ExperienceCategory>(["mechanic", "protagonist_action", "conflict_outcome", "world_reaction", "relationship"]);
@@ -197,8 +211,8 @@ function boundRealizationInOneClause(tail: string, value: RealizationBinding): b
   const knownSlots = ["actor", "action", "object", "feedback", "outcome", "reaction", "reciprocalAction", "relationshipChange", "counterpart", "opponent"] as const;
   const requiredSlots = value.requiredSlots?.length ? [...new Set(value.requiredSlots)] : knownSlots.filter((slot) => typeof value[slot] === "string" && !!value[slot]?.trim());
   if (requiredSlots.some((slot) => typeof value[slot] !== "string" || !value[slot]?.trim())) return false;
-  const clauses = tail.split(/[,.!?;，。！？；]|\b(?:while|whereas)\b|(?:与此同时|同时|而后)/iu).map((clause) => clause.trim()).filter(Boolean);
-  return clauses.some((clause) => {
+  return realizationClauses(tail).some((clause) => {
+    if (hasNonRealizationModality(clause)) return false;
     const predicateAt = termIndex(clause, predicate); const actorAt = termIndex(clause, value.actor!);
     return predicateAt >= 0 && actorAt >= 0 && actorAt < predicateAt && requiredSlots.every((slot) => termIndex(clause, value[slot]!) >= 0);
   });
@@ -208,11 +222,12 @@ function hasRealizedReversal(id: GenericRuleAdapterId, source: string, realizati
   const marker = reversalMarker.exec(source);
   if (!marker) return false;
   const tail = source.slice(marker.index + marker[0].length);
-  if (id === "curated-mechanic-unavailable") return /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(tail);
-  if (id === "curated-outcome-weakened") return /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(tail);
+  const realizedClauses = realizationClauses(tail).filter((clause) => !hasNonRealizationModality(clause));
+  if (id === "curated-mechanic-unavailable") return realizedClauses.some((clause) => /(?:system|mechanic|panel|ability|系统|机制|面板|能力).{0,24}(?:works?|available|activat(?:e|es|ed)|feedback|reward|可用|启动|开启|生效|反馈|奖励|弹出)/i.test(clause));
+  if (id === "curated-outcome-weakened") return realizedClauses.some((clause) => /(?:protagonist|主角|主人公|\b(?:he|she|they)\b|他|她).{0,24}(?:wins?|defeats?|victory|unharmed|获胜|击败|制胜|胜利|毫发无损|保持优势)/i.test(clause));
   const binding: RealizationBinding = Array.isArray(realization) ? { actor: realization[0], action: realization[1], object: realization[2] } : realization as RealizationBinding;
   if (Object.values(binding).some((term) => typeof term === "string" && !!term.trim())) return boundRealizationInOneClause(tail, binding);
-  return realizedAfterReversal.test(tail);
+  return realizedClauses.some((clause) => realizedAfterReversal.test(clause));
 }
 
 export function runRuleAdapter(id: GenericRuleAdapterId, source: string, realization: readonly string[] | RealizationBinding = []): boolean {
