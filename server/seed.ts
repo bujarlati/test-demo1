@@ -258,6 +258,7 @@ function compactStory(
     characters: [],
     items: [],
     rules: [],
+    constraints: [],
     clues: [],
     preferences: [],
     conversation: [],
@@ -443,6 +444,7 @@ export function createSeedStore(): AppStore {
         hardness: "soft",
       },
     ],
+    constraints: [],
     clues: [
       {
         id: "clue_scar",

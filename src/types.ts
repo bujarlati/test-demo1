@@ -80,6 +80,60 @@ export interface StoryRule {
   hardness: "hard" | "soft";
 }
 
+export type StoryCoreEntityKind = "story" | "character" | "item" | "clue";
+
+export type StoryConstraintScalar = string | number | boolean | null;
+export type StoryConstraintValue = StoryConstraintScalar | StoryConstraintScalar[];
+export type StoryConstraintOperator = "eq" | "neq" | "in" | "not_in" | "exists";
+export type StoryConstraintSource = "reader" | "author" | "system" | "legacy_rule" | "legacy_preference";
+
+export interface StoryCoreEntity {
+  id: string;
+  kind: StoryCoreEntityKind;
+  name: string;
+}
+
+export interface StoryCoreEntityState {
+  entityId: string;
+  kind: StoryCoreEntityKind;
+  values: Record<string, StoryConstraintValue | undefined>;
+}
+
+export interface StoryConstraint {
+  id: string;
+  title: string;
+  description: string;
+  targetEntityId: string;
+  path: string;
+  operator: StoryConstraintOperator;
+  expectedValue: StoryConstraintValue;
+  source: StoryConstraintSource;
+  hardness: "hard" | "soft";
+  scope: "story" | "branch";
+  branchId: string;
+  status: "active" | "inactive";
+  baseCanonVersion: number;
+  createdAt: string;
+  idempotencyKey: string;
+  readOnly: boolean;
+  enforceable: boolean;
+}
+
+export interface CreateStoryConstraintInput {
+  title: string;
+  description: string;
+  targetEntityId: string;
+  path: string;
+  operator: StoryConstraintOperator;
+  expectedValue: StoryConstraintValue;
+  source: Exclude<StoryConstraintSource, "legacy_rule" | "legacy_preference">;
+  hardness: StoryConstraint["hardness"];
+  scope: StoryConstraint["scope"];
+  branchId: string;
+  baseCanonVersion: number;
+  idempotencyKey: string;
+}
+
 export interface StoryClue {
   id: string;
   title: string;
@@ -368,6 +422,10 @@ export interface StoryEvent {
   storyTime: string;
   branchId: string;
   originEventId?: string;
+  source?: "reader" | "agent" | "system";
+  idempotencyKey?: string;
+  baseCanonVersion?: number;
+  createdAt?: string;
   stateEffects?: {
     characters?: Array<{
       characterId: string;
@@ -382,6 +440,52 @@ export interface StoryEvent {
     items?: Array<{ itemId: string; status: StoryItem["status"]; holderCharacterId?: string; location: string }>;
     clues?: Array<{ clueId: string; status: StoryClue["status"] }>;
   };
+}
+
+export interface AppendStoryCoreEventInput {
+  chapterNumber: number;
+  revisionId: string;
+  type: StoryEventType;
+  title: string;
+  cause: string;
+  outcome: string;
+  participantIds: string[];
+  location: string;
+  dependsOn: string[];
+  storyTime: string;
+  stateEffects: NonNullable<StoryEvent["stateEffects"]>;
+  branchId: string;
+  baseCanonVersion: number;
+  idempotencyKey: string;
+  source: NonNullable<StoryEvent["source"]>;
+}
+
+export type AppendReaderStoryEventInput = Omit<
+  AppendStoryCoreEventInput,
+  "title" | "cause" | "outcome" | "source"
+>;
+
+export interface StoryWorldState {
+  storyId: string;
+  branchId: string;
+  canonVersion: number;
+  entities: StoryCoreEntity[];
+  states: StoryCoreEntityState[];
+  events: StoryEvent[];
+  eventCount: number;
+  constraints: StoryConstraint[];
+}
+
+export interface StoryConstraintCommandResult {
+  constraint: StoryConstraint;
+  worldState: StoryWorldState;
+  duplicate: boolean;
+}
+
+export interface StoryEventCommandResult {
+  event: StoryEvent;
+  worldState: StoryWorldState;
+  duplicate: boolean;
 }
 
 export interface Story {
@@ -414,6 +518,7 @@ export interface Story {
   characters: CharacterProfile[];
   items: StoryItem[];
   rules: StoryRule[];
+  constraints: StoryConstraint[];
   clues: StoryClue[];
   preferences: ReaderPreference[];
   conversation: ConversationMessage[];

@@ -9,7 +9,50 @@ import { createLegacyExperienceContract } from "./readingExperience";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const dataDirectory = path.join(currentDirectory, "data");
 const storePath = path.join(dataDirectory, "store.json");
-let saveQueue = Promise.resolve();
+
+export function createStoreSaveQueue(writeSnapshot: (snapshot: string) => Promise<void>) {
+  let queue = Promise.resolve();
+  return async (store: AppStore, rollbackOnFailure?: () => void): Promise<void> => {
+    // Capture before yielding to the queue. Otherwise a later request can mutate the
+    // shared store and leak its uncommitted state into an earlier successful write.
+    const snapshot = JSON.stringify(store, null, 2);
+    queue = queue.catch(() => undefined).then(async () => {
+      try {
+        await writeSnapshot(snapshot);
+      } catch (error) {
+        rollbackOnFailure?.();
+        throw error;
+      }
+    });
+    await queue;
+  };
+}
+
+export function createStoreMutationGate() {
+  let tail = Promise.resolve();
+  return async (): Promise<() => void> => {
+    const predecessor = tail.catch(() => undefined);
+    let releaseSlot!: () => void;
+    const slot = new Promise<void>((resolve) => {
+      releaseSlot = resolve;
+    });
+    tail = predecessor.then(() => slot);
+    await predecessor;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseSlot();
+    };
+  };
+}
+
+const enqueueStoreSave = createStoreSaveQueue(async (snapshot) => {
+  await mkdir(dataDirectory, { recursive: true });
+  const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, snapshot, "utf8");
+  await rename(temporaryPath, storePath);
+});
 
 function normalizeStore(store: AppStore): AppStore {
   store.safetyDecisions ??= [];
@@ -26,6 +69,7 @@ function normalizeStore(store: AppStore): AppStore {
     });
     story.proposals ??= [];
     story.items ??= [];
+    story.constraints ??= [];
     story.worldBible ??= {
       version: 1,
       organizations: [],
@@ -156,13 +200,6 @@ export async function loadStore(): Promise<AppStore> {
   }
 }
 
-export async function saveStore(store: AppStore): Promise<void> {
-  const snapshot = JSON.stringify(store, null, 2);
-  saveQueue = saveQueue.catch(() => undefined).then(async () => {
-    await mkdir(dataDirectory, { recursive: true });
-    const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, snapshot, "utf8");
-    await rename(temporaryPath, storePath);
-  });
-  await saveQueue;
+export async function saveStore(store: AppStore, rollbackOnFailure?: () => void): Promise<void> {
+  await enqueueStoreSave(store, rollbackOnFailure);
 }

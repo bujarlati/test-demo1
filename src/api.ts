@@ -2,6 +2,8 @@ import type {
   AuditEvent,
   AuthPayload,
   BootstrapPayload,
+  AppendReaderStoryEventInput,
+  CreateStoryConstraintInput,
   CreateStoryInput,
   ContentReport,
   GenerationJob,
@@ -15,6 +17,9 @@ import type {
   ReadingProgress,
   SafetyDecision,
   Story,
+  StoryConstraintCommandResult,
+  StoryEventCommandResult,
+  StoryWorldState,
 } from "./types";
 
 const tokenKey = "xumo-auth-token";
@@ -137,6 +142,33 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   bootstrap: () => request<BootstrapPayload>("/api/bootstrap"),
   story: (storyId: string) => request<Story>(`/api/stories/${storyId}`),
+  worldState: (storyId: string) => request<StoryWorldState>(`/api/stories/${storyId}/state`),
+  createConstraint: (
+    story: Story,
+    input: Omit<CreateStoryConstraintInput, "source" | "branchId" | "baseCanonVersion" | "idempotencyKey">,
+    idempotencyKey = crypto.randomUUID(),
+  ) => request<StoryConstraintCommandResult>(`/api/stories/${story.id}/constraints`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...input,
+      branchId: story.activeBranchId,
+      baseCanonVersion: story.canonVersion,
+      idempotencyKey,
+    }),
+  }),
+  appendEvent: (
+    story: Story,
+    input: Omit<AppendReaderStoryEventInput, "branchId" | "baseCanonVersion" | "idempotencyKey">,
+    idempotencyKey = crypto.randomUUID(),
+  ) => request<StoryEventCommandResult>(`/api/stories/${story.id}/events`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...input,
+      branchId: story.activeBranchId,
+      baseCanonVersion: story.canonVersion,
+      idempotencyKey,
+    }),
+  }),
   createStory: (input: CreateStoryInput, idempotencyKey = crypto.randomUUID()) =>
     request<Story>("/api/stories", { method: "POST", body: JSON.stringify({ ...input, idempotencyKey }) }),
   generateChapter: generateChapterStream,

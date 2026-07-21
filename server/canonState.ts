@@ -94,7 +94,10 @@ export function replayBranchState(story: Story, branchId: string) {
     for (const effect of event.stateEffects?.items ?? []) {
       const item = story.items.find((candidate) => candidate.id === effect.itemId);
       if (!item) throw new Error(`事件 ${event.id} 引用未知物品状态。`);
-      Object.assign(item, effect);
+      item.status = effect.status;
+      item.location = effect.location;
+      if (effect.status === "held" && effect.holderCharacterId) item.holderCharacterId = effect.holderCharacterId;
+      else delete item.holderCharacterId;
     }
     for (const effect of event.stateEffects?.clues ?? []) {
       const clue = story.clues.find((candidate) => candidate.id === effect.clueId);

@@ -26,7 +26,7 @@ import {
   type ExtractedChapterState,
 } from "./narrativeEngine";
 import { handleReaderMessage, rollbackRetcon } from "./retconService";
-import { loadStore, saveStore } from "./storage";
+import { createStoreMutationGate, loadStore, saveStore } from "./storage";
 import {
   commitNextChapter,
   finalizeStoryIfTargetReached,
@@ -44,6 +44,7 @@ import {
 import { accumulateModelUsage, recordFailedJobUsage } from "./modelUsage";
 import { deleteSecrets, storeSecret } from "./vault";
 import { assertSafetyAllowed, recordSafetyDecision, safetyCategories } from "./safetyService";
+import { appendStoryCoreEvent, createStoryConstraint, describeReaderStoryEvent, projectStoryWorldState } from "./storyCore";
 
 const app = express();
 const store = await loadStore();
@@ -64,14 +65,40 @@ const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(currentDirectory, "..");
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const storyCoreWriteWindows = new Map<string, { count: number; resetAt: number }>();
+const STORY_CORE_WRITES_PER_MINUTE = 60;
 const USER_DAILY_TOKEN_BUDGET = 1_500_000;
 const STORY_DAILY_TOKEN_BUDGET = 120_000;
+const acquireStoreMutation = createStoreMutationGate();
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
+app.use(async (request, response, next) => {
+  if (!request.path.startsWith("/api/") || request.path === "/api/health" || request.method === "OPTIONS") {
+    next();
+    return;
+  }
+  const release = await acquireStoreMutation();
+  if (request.destroyed || response.writableEnded) {
+    release();
+    return;
+  }
+  const originalEnd = response.end;
+  response.end = function (this: Response, ...args: unknown[]) {
+    try {
+      return Reflect.apply(originalEnd, this, args);
+    } finally {
+      // A transport-level close can happen while an async handler is still
+      // mutating or rolling back. The gate is released only at the handler's
+      // response-end boundary, after its commit/rollback path has completed.
+      release();
+    }
+  } as Response["end"];
+  next();
+});
 
-async function persist() {
-  await saveStore(store);
+async function persist(rollbackOnFailure?: () => void) {
+  await saveStore(store, rollbackOnFailure);
 }
 
 function currentUser(response: Response) {
@@ -130,6 +157,25 @@ function reserveIdempotencyKey(userId: string, idempotencyKey: string) {
 
 function hasIdempotencyKey(userId: string, idempotencyKey: string) {
   return store.idempotencyKeys.includes(`${userId}:${idempotencyKey}`);
+}
+
+function assertStoryCoreWriteRate(userId: string, storyId: string): void {
+  const now = Date.now();
+  const key = `${userId}:${storyId}`;
+  const window = storyCoreWriteWindows.get(key);
+  if (window && window.resetAt > now) {
+    if (window.count >= STORY_CORE_WRITES_PER_MINUTE) {
+      throw Object.assign(new Error("Story Core 写入过于频繁，请稍后重试。"), { status: 429 });
+    }
+    window.count += 1;
+    return;
+  }
+  storyCoreWriteWindows.set(key, { count: 1, resetAt: now + 60_000 });
+  if (storyCoreWriteWindows.size > 1_000) {
+    for (const [candidateKey, candidate] of storyCoreWriteWindows) {
+      if (candidate.resetAt <= now) storyCoreWriteWindows.delete(candidateKey);
+    }
+  }
 }
 
 function mergeConcurrentReaderState(next: Story, baseline: Story, current: Story) {
@@ -264,6 +310,56 @@ const modelConnectionSchema = z.object({
 });
 const modelConnectionUpdateSchema = modelConnectionSchema.partial().refine((value) => Object.keys(value).length > 0, "至少提供一个更新字段");
 
+const constraintScalarSchema = z.union([z.string().max(500), z.number().finite(), z.boolean(), z.null()]);
+const createConstraintSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+  description: z.string().trim().min(1).max(1_000),
+  targetEntityId: z.string().trim().min(1).max(120),
+  path: z.string().regex(/^[A-Za-z][A-Za-z0-9_.]{0,79}$/),
+  operator: z.enum(["eq", "neq", "in", "not_in", "exists"]),
+  expectedValue: z.union([constraintScalarSchema, z.array(constraintScalarSchema).max(50)]),
+  hardness: z.enum(["hard", "soft"]),
+  scope: z.enum(["story", "branch"]),
+  branchId: z.string().trim().min(1).max(120),
+  baseCanonVersion: z.number().int().nonnegative(),
+  idempotencyKey: z.string().trim().min(8).max(120).optional(),
+}).strict();
+
+const eventStateEffectsSchema = z.object({
+  characters: z.array(z.object({
+    characterId: z.string().trim().min(1).max(120),
+    status: z.string().trim().min(1).max(200).optional(),
+    lifecycle: z.enum(["alive", "dead", "missing", "presumed_dead"]).optional(),
+    location: z.string().trim().min(1).max(200).optional(),
+    goal: z.string().trim().min(1).max(500).optional(),
+    relationship: z.string().trim().min(1).max(500).optional(),
+    role: z.string().trim().min(1).max(200).optional(),
+  }).strict()).max(50).optional(),
+  items: z.array(z.object({
+    itemId: z.string().trim().min(1).max(120),
+    status: z.enum(["available", "held", "lost", "destroyed", "consumed"]),
+    holderCharacterId: z.string().trim().min(1).max(120).optional(),
+    location: z.string().trim().min(1).max(200),
+  }).strict()).max(50).optional(),
+  clues: z.array(z.object({
+    clueId: z.string().trim().min(1).max(120),
+    status: z.enum(["planted", "strengthened", "resolved"]),
+  }).strict()).max(50).optional(),
+}).strict();
+const appendEventSchema = z.object({
+  chapterNumber: z.number().int().positive(),
+  revisionId: z.string().trim().min(1).max(120),
+  type: z.enum(["discovery", "choice", "relationship", "death", "survival", "consequence"]),
+  participantIds: z.array(z.string().trim().min(1).max(120)).max(50),
+  location: z.string().trim().min(1).max(200),
+  dependsOn: z.array(z.string().trim().min(1).max(120)).max(50),
+  storyTime: z.string().trim().min(1).max(200),
+  stateEffects: eventStateEffectsSchema,
+  branchId: z.string().trim().min(1).max(120),
+  baseCanonVersion: z.number().int().nonnegative(),
+  idempotencyKey: z.string().trim().min(8).max(120).optional(),
+}).strict();
+
 app.get("/api/health", (_request, response) => {
   response.json({ ok: true, service: "xumo-api" });
 });
@@ -327,6 +423,88 @@ app.get("/api/stories/:storyId", async (request, response) => {
   user.activeStoryId = story.id;
   await persist();
   response.json(story);
+});
+
+app.get("/api/stories/:storyId/state", (request, response) => {
+  const story = storyOrThrow(request.params.storyId, currentUser(response));
+  response.json(projectStoryWorldState(story));
+});
+
+app.post("/api/stories/:storyId/constraints", async (request, response) => {
+  const user = currentUser(response);
+  const storedStory = storyOrThrow(request.params.storyId, user);
+  if (storyMutationLocks.has(storedStory.id)) {
+    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
+    return;
+  }
+  const body = createConstraintSchema.parse(request.body);
+  const idempotencyKey = body.idempotencyKey ?? request.header("idempotency-key");
+  if (!idempotencyKey) {
+    response.status(400).json({ message: "创建约束必须提供幂等键。" });
+    return;
+  }
+  assertStoryCoreWriteRate(user.id, storedStory.id);
+  storyMutationLocks.add(storedStory.id);
+  try {
+    const nextStory = structuredClone(storedStory);
+    const constraint = createStoryConstraint(nextStory, { ...body, source: "reader", idempotencyKey });
+    const duplicate = (storedStory.constraints ?? []).some((candidate) => candidate.idempotencyKey === idempotencyKey);
+    if (duplicate) {
+      response.json({ constraint, worldState: projectStoryWorldState(storedStory), duplicate: true });
+      return;
+    }
+    const index = storyIndexOrThrow(storedStory.id);
+    store.stories[index] = nextStory;
+    audit(store, user.id, "story.constraint-created", "story", storedStory.id, { constraintId: constraint.id });
+    const auditEventId = store.auditEvents[0]?.id;
+    await persist(() => {
+      const rollbackIndex = store.stories.findIndex((candidate) => candidate.id === storedStory.id);
+      if (rollbackIndex >= 0) store.stories[rollbackIndex] = storedStory;
+      if (auditEventId) store.auditEvents = store.auditEvents.filter((event) => event.id !== auditEventId);
+    });
+    response.status(201).json({ constraint, worldState: projectStoryWorldState(nextStory), duplicate: false });
+  } finally {
+    storyMutationLocks.delete(storedStory.id);
+  }
+});
+
+app.post("/api/stories/:storyId/events", async (request, response) => {
+  const user = currentUser(response);
+  const storedStory = storyOrThrow(request.params.storyId, user);
+  if (storyMutationLocks.has(storedStory.id)) {
+    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
+    return;
+  }
+  const body = appendEventSchema.parse(request.body);
+  const idempotencyKey = body.idempotencyKey ?? request.header("idempotency-key");
+  if (!idempotencyKey) {
+    response.status(400).json({ message: "提交事件必须提供幂等键。" });
+    return;
+  }
+  assertStoryCoreWriteRate(user.id, storedStory.id);
+  storyMutationLocks.add(storedStory.id);
+  try {
+    const nextStory = structuredClone(storedStory);
+    const narrative = describeReaderStoryEvent(nextStory, { ...body, idempotencyKey });
+    const event = appendStoryCoreEvent(nextStory, { ...body, ...narrative, source: "reader", idempotencyKey });
+    const duplicate = storedStory.events.some((candidate) => candidate.idempotencyKey === idempotencyKey);
+    if (duplicate) {
+      response.json({ event, worldState: projectStoryWorldState(storedStory), duplicate: true });
+      return;
+    }
+    const index = storyIndexOrThrow(storedStory.id);
+    store.stories[index] = nextStory;
+    audit(store, user.id, "story.event-appended", "story", storedStory.id, { eventId: event.id });
+    const auditEventId = store.auditEvents[0]?.id;
+    await persist(() => {
+      const rollbackIndex = store.stories.findIndex((candidate) => candidate.id === storedStory.id);
+      if (rollbackIndex >= 0) store.stories[rollbackIndex] = storedStory;
+      if (auditEventId) store.auditEvents = store.auditEvents.filter((candidate) => candidate.id !== auditEventId);
+    });
+    response.status(201).json({ event, worldState: projectStoryWorldState(nextStory), duplicate: false });
+  } finally {
+    storyMutationLocks.delete(storedStory.id);
+  }
 });
 
 app.post("/api/stories", async (request, response) => {

@@ -22,6 +22,7 @@ import {
 import { captureCanonState, deriveStateEffects } from "./canonState";
 import { narrativeProfileForGenre, sceneKitForGenre } from "./genreProfiles";
 import { createReadingExperienceContract, isSystemInvincibleExperience, parseReadingExperienceWords } from "./readingExperience";
+import { assertStoryHardConstraints } from "./storyCore";
 
 export function summarizeStory(story: Story): StorySummary {
   const activeChapter =
@@ -514,6 +515,7 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
         hardness: "hard",
       },
     ],
+    constraints: [],
     clues: [
       {
         id: `clue_${id}_1`,
@@ -595,6 +597,7 @@ export function commitNextChapter(
   if (branch) branch.headCanonVersion = story.canonVersion;
   story.updatedAt = createdAt;
   story.latestExcerpt = result.paragraphs.at(-1) ?? "";
+  assertStoryHardConstraints(story);
   story.readingProgress = {
     chapterId,
     scrollProgress: 0,
