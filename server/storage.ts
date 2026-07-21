@@ -1,13 +1,11 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AppStore } from "../src/types";
 import { createSeedStore } from "./seed";
 import { captureCanonState } from "./canonState";
 import { createLegacyExperienceContract } from "./readingExperience";
 
-const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-export const dataDirectory = path.join(currentDirectory, "data");
+export const dataDirectory = path.join(process.cwd(), "server", "data");
 const storePath = path.join(dataDirectory, "store.json");
 
 export function createStoreSaveQueue(writeSnapshot: (snapshot: string) => Promise<void>) {

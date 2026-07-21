@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
@@ -63,8 +62,7 @@ if (interruptedJobs.length > 0) {
   await saveStore(store);
 }
 const port = Number(process.env.PORT ?? 8787);
-const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const projectRoot = path.resolve(currentDirectory, "..");
+const projectRoot = process.cwd();
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const storyCoreWriteWindows = new Map<string, { count: number; resetAt: number }>();

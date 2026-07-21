@@ -1,6 +1,5 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 export interface AiTraceEvent {
   event: "request" | "response" | "parsed" | "error";
@@ -28,8 +27,7 @@ export interface AiTraceEvent {
 
 export type AiTraceWriter = (event: AiTraceEvent) => Promise<void>;
 
-const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-export const defaultAiTracePath = path.join(currentDirectory, "data", "ai-trace.jsonl");
+export const defaultAiTracePath = path.join(process.cwd(), "server", "data", "ai-trace.jsonl");
 let writeQueue = Promise.resolve();
 
 export function aiTraceEnabled(): boolean {
