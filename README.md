@@ -56,6 +56,8 @@ pnpm start
 
 在没有持久卷的站点运行时，可将 `XUMO_STORAGE_MODE` 设为 `memory`。这适合公开演示，但实例重启或重新部署会重置故事、会话和后来保存的模型连接；正式长期运行应通过 `XUMO_DATA_DIRECTORY` 挂载持久目录，或把存储层替换为托管数据库与密钥服务。
 
+当托管平台把构建产物挂载到独立目录时，可用 `XUMO_STATIC_DIRECTORY` 指向该目录；Sites Worker 使用 `/bundle`。
+
 ## 数据与密钥
 
 演示数据首次启动时由 `server/seed.ts` 生成。运行期故事、会话与 Revision 写入 `server/data/store.json`；模型 Key 使用 AES-256-GCM 加密后写入独立的 `server/data/secrets.json`。这些运行期文件均已忽略，不会提交到 Git。

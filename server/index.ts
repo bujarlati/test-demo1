@@ -1582,7 +1582,7 @@ app.get("/api/ops", requireAdmin, (_request, response) => {
 });
 
 if (process.env.NODE_ENV === "production") {
-  const distDirectory = path.join(projectRoot, "dist");
+  const distDirectory = process.env.XUMO_STATIC_DIRECTORY?.trim() || path.join(projectRoot, "dist");
   app.use(express.static(distDirectory));
   app.use((request, response, next) => {
     if (request.method !== "GET" || request.path.startsWith("/api/")) {
