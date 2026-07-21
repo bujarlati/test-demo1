@@ -11,4 +11,5 @@ test-results/
 server/data/store.json
 server/data/secrets.json
 server/data/.master-key
+server/data/ai-trace.jsonl
 *.log

@@ -47,6 +47,15 @@ export function createStoreMutationGate() {
   };
 }
 
+export function shouldAbandonQueuedRequest(
+  request: { aborted: boolean; destroyed: boolean },
+  response: { writableEnded: boolean },
+): boolean {
+  // A fully consumed JSON request can be marked destroyed even though the
+  // client did not abort. Only the explicit aborted signal is authoritative.
+  return request.aborted || response.writableEnded;
+}
+
 const enqueueStoreSave = createStoreSaveQueue(async (snapshot) => {
   await mkdir(dataDirectory, { recursive: true });
   const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useApp } from "../context/AppContext";
+import { recoveryNoticeForJob } from "../jobRecovery";
 import { Logo } from "./Logo";
 
 const navigation = [
@@ -22,6 +23,11 @@ const navigation = [
 export function AppShell() {
   const { data, logout } = useApp();
   const activeStory = data?.stories.find((story) => story.id === data.activeStoryId);
+  const pendingJob = data?.pendingJobs[0];
+  const availableStoryIds = new Set(data?.stories.map((story) => story.id) ?? []);
+  const recoveryNotice = data?.recoverableJobs
+    .map((job) => recoveryNoticeForJob(job, availableStoryIds))
+    .find((notice) => notice !== null);
   const visibleNavigation = data?.user.role === "admin"
     ? navigation
     : navigation.filter((item) => item.to !== "/settings/models" && item.to !== "/ops");
@@ -39,20 +45,20 @@ export function AppShell() {
           ))}
         </nav>
 
-        {Boolean(data?.pendingJobs.length) && (
+        {pendingJob && (
           <div className="sidebar__jobs" role="status" aria-live="polite">
             <LoaderCircle size={16} />
             <span>
-              <strong>续写仍在后台进行</strong>
-              <small>{data?.pendingJobs[0]?.storyTitle} · 第 {data?.pendingJobs[0]?.chapterNumber} 章</small>
+              <strong>{pendingJob.task === "opening" ? "新故事仍在生成" : "续写仍在后台进行"}</strong>
+              <small>{pendingJob.task === "opening" ? "正在准备第一章" : `${pendingJob.storyTitle} · 第 ${pendingJob.chapterNumber} 章`}</small>
             </span>
           </div>
         )}
 
-        {Boolean(data?.recoverableJobs.length) && !data?.pendingJobs.length && (
-          <NavLink className="sidebar__jobs sidebar__jobs--failed" to={`/story/${data?.recoverableJobs[0]?.storyId}`}>
+        {recoveryNotice && !pendingJob && (
+          <NavLink className="sidebar__jobs sidebar__jobs--failed" to={recoveryNotice.to}>
             <LoaderCircle size={16} />
-            <span><strong>上次续写被中断</strong><small>{data?.recoverableJobs[0]?.storyTitle} · 可安全重试</small></span>
+            <span><strong>{recoveryNotice.title}</strong><small>{recoveryNotice.detail}</small></span>
           </NavLink>
         )}
 

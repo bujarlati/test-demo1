@@ -3,7 +3,7 @@ import test from "node:test";
 import { captureCanonState, replayBranchState } from "../server/canonState";
 import { generateLocalChapter, planNextChapter } from "../server/narrativeEngine";
 import { createSeedStore } from "../server/seed";
-import { createStoreMutationGate, createStoreSaveQueue } from "../server/storage";
+import { createStoreMutationGate, createStoreSaveQueue, shouldAbandonQueuedRequest } from "../server/storage";
 import {
   appendStoryCoreEvent,
   createStoryConstraint,
@@ -512,4 +512,15 @@ test("store mutation gate prevents a failed transaction leaking into the next su
 
   assert.equal(JSON.parse(persisted[1]).users[0].activeStoryId, secondStoryId);
   assert.equal(store.users[0].activeStoryId, secondStoryId);
+});
+
+test("a consumed JSON request is not mistaken for an aborted queued request", () => {
+  assert.equal(shouldAbandonQueuedRequest(
+    { aborted: false, destroyed: true },
+    { writableEnded: false },
+  ), false);
+  assert.equal(shouldAbandonQueuedRequest(
+    { aborted: true, destroyed: true },
+    { writableEnded: false },
+  ), true);
 });

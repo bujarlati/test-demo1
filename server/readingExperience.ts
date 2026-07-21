@@ -149,10 +149,17 @@ function buildAxis(word: string, id: ReadingExperienceAxisId): ReadingExperience
 function buildOpeningRequirements(
   axes: ReadingExperienceContract["axes"],
 ): ReadingExperienceContract["openingRequirements"] {
+  const firstChapterSignals = (axis: ReadingExperienceAxisContract) => {
+    const modelSignal = axis.observableSignals.find((signal) => signal.id.includes("_model_signal_"));
+    const baselineSignal = axis.observableSignals.find((signal) => !signal.id.includes("_model_signal_"));
+    return modelSignal && baselineSignal
+      ? [modelSignal.id, baselineSignal.id]
+      : axis.observableSignals.slice(0, 2).map((signal) => signal.id);
+  };
   return [
     {
       chapterOffset: 0,
-      requiredSignalIds: axes.flatMap((axis) => axis.observableSignals.slice(0, 2).map((signal) => signal.id)),
+      requiredSignalIds: axes.flatMap(firstChapterSignals),
       mustHappen: axes.map((axis) => `第一章必须直接兑现“${axis.word}”：${axis.hardPromises[0].description}`),
     },
     {
@@ -266,7 +273,7 @@ export function deriveSignalEvidenceAnchors(description: string, axisWord: strin
   if (candidates.size < 2) {
     for (const candidate of shortCandidates) candidates.add(candidate);
   }
-  return [...candidates].slice(0, 36);
+  return [...candidates];
 }
 
 export function hasIndependentSignalEvidenceAnchors(anchors: readonly string[]): boolean {
@@ -290,13 +297,35 @@ function normalizedModelSignal(value: string | ModelExperienceSignalDraft): Mode
   return description ? { description, evidenceAnchors: value.evidenceAnchors } : undefined;
 }
 
+function groundedEvidenceAnchorsFromDescription(description: string, axisWord: string): string[] | undefined {
+  const candidates = deriveSignalEvidenceAnchors(description, axisWord);
+  let independentPair: [string, string] | undefined;
+  let widestSeparation = -1;
+  const normalizedDescription = description.normalize("NFKC").toLowerCase();
+  for (let leftIndex = 0; leftIndex < candidates.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < candidates.length; rightIndex += 1) {
+      const pair: [string, string] = [candidates[leftIndex], candidates[rightIndex]];
+      if (!hasIndependentSignalEvidenceAnchors(pair)) continue;
+      const separation = Math.abs(
+        normalizedDescription.indexOf(pair[0]) - normalizedDescription.indexOf(pair[1]),
+      );
+      if (separation <= widestSeparation) continue;
+      independentPair = pair;
+      widestSeparation = separation;
+    }
+  }
+  if (!independentPair) return undefined;
+  return independentPair.sort((left, right) =>
+    normalizedDescription.indexOf(left) - normalizedDescription.indexOf(right));
+}
+
 function validatedEvidenceAnchors(
   signal: ModelExperienceSignalDraft,
   axisWord: string,
 ): string[] {
   if (signal.evidenceAnchors === undefined) {
-    const derived = deriveSignalEvidenceAnchors(signal.description, axisWord);
-    if (derived.length < 2 || !hasIndependentSignalEvidenceAnchors(derived)) {
+    const derived = groundedEvidenceAnchorsFromDescription(signal.description, axisWord);
+    if (!derived) {
       throw new Error(`“${axisWord}”的模型信号缺少可核验的具体动作、对象或结果短语。`);
     }
     return derived;
@@ -314,6 +343,8 @@ function validatedEvidenceAnchors(
     anchors.some((anchor) => anchor === axisWord || genericEvidenceAnchors.has(anchor) || !signal.description.includes(anchor)) ||
     !hasIndependentSignalEvidenceAnchors(anchors)
   ) {
+    const derived = groundedEvidenceAnchorsFromDescription(signal.description, axisWord);
+    if (derived) return derived;
     throw new Error(`“${axisWord}”的模型信号必须给出 2—6 个来自描述本身、分别绑定具体动作与对象或结果的证据短语。`);
   }
   return anchors;
@@ -437,14 +468,14 @@ export function formatReadingExperienceForPrompt(contract: ReadingExperienceCont
           : signal.id.includes("_model_signal_")
             ? deriveSignalEvidenceAnchors(signal.description, axis.word)
             : [];
-        return `${signal.id}=${signal.description}${evidenceAnchors.length ? `【正文须逐字落地其中至少两个证据短语：${evidenceAnchors.join("、")}】` : ""}`;
+        return `${signal.id}=${signal.description}${evidenceAnchors.length ? `【语义识别参考：${evidenceAnchors.join("、")}】` : ""}`;
       });
       return [
         `体验轴“${axis.word}”：${axis.interpretation}`,
         `可观察信号：${formattedSignals.join("；")}`,
         `硬承诺：${axis.hardPromises.map((promise) => promise.description).join("；")}`,
         axis.observableSignals.some((signal) => signal.id.includes("_model_signal_"))
-          ? `语义锚点：正文不必出现“${axis.word}”这个词；每条被采用的模型信号必须把至少两个证据短语自然写进同一事件，并让它们分别落到具体动作与对象或结果上。禁止贴标签或拼到景物描写上。`
+          ? `语义证据：正文不必出现“${axis.word}”这个词，也不要求逐字复制参考短语；须用人物、动作、对象、结果或感官变化自然兑现信号，由审稿模型按大意判断，并从正文逐字引用证据。禁止贴标签或拼到景物描写上。`
           : "",
         `禁止捷径：${axis.forbiddenShortcuts.join("；") || "无"}`,
       ].join("\n");

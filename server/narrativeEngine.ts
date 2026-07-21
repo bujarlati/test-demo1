@@ -291,9 +291,10 @@ function matchingSignalAnchors(
   signal: ReadingExperienceSignal,
 ): string[] {
   const normalizedQuote = quote.normalize("NFKC").toLowerCase();
-  const anchors = signal.evidenceAnchors?.length
-    ? signal.evidenceAnchors
-    : deriveSignalEvidenceAnchors(signal.description, axisWord);
+  const anchors = [
+    ...(signal.evidenceAnchors ?? []),
+    ...deriveSignalEvidenceAnchors(signal.description, axisWord),
+  ];
   return Array.from(new Set(anchors
     .map((anchor) => anchor.normalize("NFKC").toLowerCase())
     .filter((anchor) => normalizedQuote.includes(anchor))));
@@ -313,25 +314,32 @@ function hasAffirmedReversalWithAnchors(text: string, anchors: string[]): boolea
 }
 
 function hasUnrealizedSignalClaim(text: string, anchors: string[]): boolean {
-  if (hasDreamOrHypotheticalCue(text)) return true;
   if (hasAffirmedReversalWithAnchors(text, anchors)) return false;
-  const escapedAnchors = anchors.map(escapeRegExp);
-  if (escapedAnchors.length === 0) return false;
-  const anchor = `(?:${escapedAnchors.join("|")})`;
-  const unrealizedBefore = new RegExp(
-    `(?:并未|没有|未能|没能|无法|不能|从未|未曾|不曾|尚未|还未|还没|计划|打算|准备|试图|企图|希望|想要|预测|预言|声称|扬言)[^。！？\\n]{0,24}${anchor}`,
-  );
-  const unrealizedAfter = new RegExp(
-    `${anchor}[^。！？\\n]{0,32}(?:并未发生|没有发生|尚未发生|还没发生|未实现|没有实现|尚未实现|没有成功|未能成功|失败|落空|只是(?:模拟|推演|预测|梦境|幻想))`,
-  );
-  if (unrealizedBefore.test(text) || unrealizedAfter.test(text)) return true;
-  return escapedAnchors.some((escapedAnchor) => {
+  if (anchors.length === 0) return false;
+  if (/(?:假如|如果|若是|只要|一旦|除非|倘若|假使|等到|待到)[^。！？\n]{0,96}(?:就|便|才|将|会)|(?:必须|需要|需得)[^。！？\n]{0,96}才/.test(text)) {
+    return true;
+  }
+  const scopedBefore = /(?:并未|没有|未能|没能|无法|不能|从未|未曾|不曾|尚未|还未|还没|计划|打算|准备|试图|企图|希望|想要|预测|预言|声称|扬言)[^，,；;。！？\n]{0,40}$|(?:在|于)(?:梦中|梦里|梦境中|梦境里|幻觉中|幻觉里|想象中|想象里|幻想中|幻想里|设想中|模拟中|模拟里|推演中|演算中|预测中|预演中)[^，,；;。！？\n]{0,64}$|(?:梦境|幻觉|幻想|想象|模拟|推演|演算|预测|预演)(?:画面|场景|结果|影像|中|里)[^，,；;。！？\n]{0,64}$|(?:假如|如果|若是|只要|一旦|除非|倘若|假使|等到|待到|必须|需要|需得)[^，,；;。！？\n]{0,64}$/;
+  const scopedAfter = /^(?:[^，,；;。！？\n]{0,40})(?:并未发生|没有发生|尚未发生|还没发生|未实现|没有实现|尚未实现|没有成功|未能成功|失败|落空|只是(?:模拟|推演|预测|梦境|幻想)|没有启动|没有采取行动|仍在继续|仍在坠落|尚未发生)/;
+  const anchorHasActualOccurrence = (anchor: string) => {
+    const escapedAnchor = escapeRegExp(anchor);
     for (const match of text.matchAll(new RegExp(escapedAnchor, "g"))) {
-      const prefix = text.slice(Math.max(0, (match.index ?? 0) - 32), match.index ?? 0);
-      if (isNegatedPrefix(prefix)) return true;
+      const index = match.index ?? 0;
+      const clauseStart = Math.max(
+        text.lastIndexOf("。", index - 1), text.lastIndexOf("！", index - 1),
+        text.lastIndexOf("？", index - 1), text.lastIndexOf("\n", index - 1),
+      ) + 1;
+      const clauseEndCandidates = ["。", "！", "？", "\n"]
+        .map((separator) => text.indexOf(separator, index + anchor.length))
+        .filter((candidate) => candidate >= 0);
+      const clauseEnd = clauseEndCandidates.length > 0 ? Math.min(...clauseEndCandidates) : text.length;
+      const prefix = text.slice(clauseStart, index);
+      const suffix = text.slice(index + anchor.length, clauseEnd);
+      if (!scopedBefore.test(prefix) && !scopedAfter.test(suffix) && !isNegatedPrefix(prefix)) return true;
     }
     return false;
-  });
+  };
+  return !anchors.some(anchorHasActualOccurrence);
 }
 
 function modelSignalClaimIsActual(
@@ -340,7 +348,7 @@ function modelSignalClaimIsActual(
   signal: ReadingExperienceSignal,
 ): boolean {
   const anchors = matchingSignalAnchors(quote, axisWord, signal);
-  return hasIndependentSignalEvidenceAnchors(anchors) && !hasUnrealizedSignalClaim(
+  return anchors.length > 0 && !hasUnrealizedSignalClaim(
     quote.normalize("NFKC").toLowerCase(),
     anchors,
   );
@@ -462,11 +470,14 @@ function hasDominantProtagonistVictory(
   const subject = protagonistActorPattern(context);
   const sentence = "[^。！？\\n]";
   const decisiveAction = "(?:一击|一招|一掌|一拳|一剑|一刀|一脚|一巴掌|一指|一眼|右拳|轰出|抬手|抬了抬手|抬起手指|抬起一指|抬起一只手|单手压下|反手挥出|挥出|弹指|挥手|挥掌|拍掌|挥袖|屈指|随手|打了个响指|打响指|一步踏出|目光一扫|轻轻一按|念头一动|碾压|横推|秒杀)";
-  const decisiveResult = "(?:击败|镇压|轰飞|横飞|斩杀|结束|倒飞|贯穿|洞穿|打穿|吞没|吞噬|湮灭|化为虚无|化作虚无|彻底消失|崩碎|崩散|崩解|碎裂|熄灭|跪下|跪地|跪伏|跪倒|压跪|双膝砸地|撞碎|砸进|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住|认输|昏死|动弹不得|失去战力|吐血倒地|碾碎|压碎|碾成碎末|碾成黑灰|化为飞灰|化成飞灰|炸成碎片|轰成碎片|爆成碎片|灰飞烟灭|爆成血雾|爬不起来|无法反抗|毫无反抗之力|毫无反抗余地|毫无还手之力|连第二招都无法抬起)";
+  const decisiveResult = "(?:击败|镇压|轰飞|横飞|打飞|击飞|震飞|拍飞|打退|击退|震退|斩杀|结束|倒飞|贯穿|洞穿|打穿|吞没|吞噬|湮灭|化为虚无|化作虚无|彻底消失|崩碎|崩散|崩解|碎裂|打碎|击碎|拍碎|震碎|熄灭|跪下|跪地|跪伏|跪倒|压跪|双膝砸地|撞碎|砸进|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|击倒|踩住|认输|昏死|动弹不得|失去战力|吐血倒地|碾碎|压碎|碾成碎末|碾成黑灰|化为飞灰|化成飞灰|炸成碎片|轰成碎片|爆成碎片|灰飞烟灭|爆成血雾|爬不起来|无法反抗|毫无反抗之力|毫无反抗余地|毫无还手之力|连第二招都无法抬起)";
   const opponent = "(?:敌人|对手|反派|强者|魔头|来敌|来援者|施术者|长老|宗主|帮主|副帮主|教主|护法|执事|统领|队长|首领|修士|魔修|杀手|刺客|特工|觉醒者|异能者|武者|武装人员|打手|歹徒|纵火者|绑匪|猎杀者|守卫|守军|敌军|士兵|黑衣人|壮汉|怪物|异兽|魔物|巨兽|兽潮|变异(?:犬|兽|怪物|生物|蜥蜴|巨兽|虫|体)|甲虫|巨蜥|石像鬼|巨熊|妖兽|凶兽|全场|所有人|那人|对方)";
+  const namedOpponent = "(?!(?:房门|石门|木门|大门|山门|墙壁|书架|桌椅|玉简|法器|兵器|宝甲))(?:(?:欧阳|上官|司马|诸葛|东方|皇甫|尉迟|公孙|慕容|宇文|长孙|令狐|轩辕|夏侯|南宫|独孤|百里)[\\u3400-\\u9fff]{1,2}|[赵钱孙李周吴郑王冯陈蒋沈韩杨朱秦许何吕张曹严华金魏陶姜谢邹苏潘葛范彭鲁韦马方俞任袁柳史唐费薛雷贺倪汤滕殷罗毕郝邬安常乐于傅齐康伍余顾孟平黄穆萧尹姚邵汪毛米戴宋庞熊纪舒项董梁杜阮蓝季强贾路江童颜郭梅林钟徐邱骆高夏蔡田樊胡霍万卢莫丁邓洪包左崔龚程邢裴陆荣翁羊惠甄靳段焦侯秋宁刘景詹龙叶司黎白古易廖文欧曾游权关][\\u3400-\\u9fff]{1,2})(?:长老|执事|宗主|堂主|护法|弟子)?";
+  const displacementResult = "(?:轰飞|打飞|击飞|震飞|拍飞|打退|击退|震退|打倒|击倒|压跪|跪下|跪地|吐血倒地|爬不起来|无法反抗|毫无还手之力)";
   const actionPattern = new RegExp(`(${subject})(${sentence}{0,32}?)(${decisiveAction})(${sentence}{0,36})(${decisiveResult})`, "g");
   const directVictoryPattern = new RegExp(`(${subject})(${sentence}{0,28}?)(?:碾压|横推|秒杀|击败|镇压|斩杀|轰飞|打趴|点杀|秒了|吓跪|拍死|劈死|打倒|震退|踩住)(?:了|掉)?${sentence}{0,12}${opponent}`, "g");
   const causativeVictoryPattern = new RegExp(`(${subject})${sentence}{0,20}(?:让|令|逼得)${sentence}{0,8}${opponent}${sentence}{0,12}(?:无法反抗|毫无反抗之力|毫无还手之力|跪下|跪地|认输|倒地不起)`, "g");
+  const namedTargetVictoryPattern = new RegExp(`(${subject})${sentence}{0,24}${decisiveAction}${sentence}{0,8}(?:把|将)${sentence}{0,4}(?:${namedOpponent}|${opponent})${sentence}{0,8}${displacementResult}`, "g");
   const crossSentenceVictoryPattern = new RegExp(
     `(${subject})(${sentence}{0,32}?)(${decisiveAction})${sentence}{0,24}[。！？](${sentence}{0,10}${opponent}${sentence}{0,12}(?:便|就|当场|直接|随即|已经|已)${sentence}{0,18}${decisiveResult})`,
     "g",
@@ -498,6 +509,7 @@ function hasDominantProtagonistVictory(
   return [...content.matchAll(actionPattern)].some((match) => validMatch(match, match[2] ?? "", true)) ||
     [...content.matchAll(directVictoryPattern)].some((match) => validMatch(match, match[2] ?? "")) ||
     [...content.matchAll(causativeVictoryPattern)].some((match) => validMatch(match)) ||
+    [...content.matchAll(namedTargetVictoryPattern)].some((match) => validMatch(match)) ||
     [...content.matchAll(crossSentenceVictoryPattern)].some((match) =>
       validMatch(match, match[2] ?? "", true) && !delegatedCrossSentenceResult.test(match[4] ?? ""),
     );
@@ -667,7 +679,8 @@ function hasPriorPersistentFactContinuity(
       const protagonistUsesState = protagonistParticipates && hasUnnegatedTerm(sentence, [
         "使用", "调用", "持有", "拥有", "握住", "挥动", "挥舞", "借助", "凭借", "依靠", "装备", "催动", "拔出",
         "保有", "掌控", "驱使", "驱动", "施展", "发动", "激活", "领取", "运用", "取出", "取用", "祭出", "以",
-        "斩开", "迎向", "压住", "击溃", "斩断", "挡下", "保护", "照料", "合作", "同行",
+        "运转", "凭着", "借着", "借由", "仗着", "依仗", "斩开", "迎向", "压住", "击溃", "斩断", "挡下",
+        "保护", "照料", "合作", "同行",
       ]);
       if (!invalidated && (durableStatus || protagonistUsesState || reacquired)) validContinuation = true;
     }
@@ -686,20 +699,19 @@ export function assertPersistentExperienceFacts(
     !Array.isArray(facts) || facts.length < 2 || facts.length > 8 ||
     !facts.every((fact) => {
       const normalized = typeof fact === "string" ? fact.trim() : "";
-      return Array.from(normalized).length >= 8 && Array.from(normalized).length <= 300 && content.includes(normalized);
+      const normalizedLength = Array.from(withoutLineBreaks(normalized)).length;
+      return normalizedLength >= 8 && normalizedLength <= 300 && contentContainsSourceQuote(content, normalized);
     })
   ) {
     throw new Error("开篇没有返回可由第二章继续使用的正文状态事实，已拒绝发布。");
   }
-  const containsUnrealizedModelSignal = facts.some((fact) => contract.axes.some((axis) =>
-    axis.observableSignals
+  const containsUnrealizedModelSignal = facts.some((fact) => contract.axes.some((axis) => {
+    const matchingSignals = axis.observableSignals
       .filter((signal) => signal.id.includes("_model_signal_"))
-      .some((signal) => {
-        const anchors = matchingSignalAnchors(fact, axis.word, signal);
-        return hasIndependentSignalEvidenceAnchors(anchors) &&
-          !modelSignalClaimIsActual(fact, axis.word, signal);
-      }),
-  ));
+      .filter((signal) => matchingSignalAnchors(fact, axis.word, signal).length > 0);
+    return matchingSignals.length > 0 &&
+      matchingSignals.every((signal) => !modelSignalClaimIsActual(fact, axis.word, signal));
+  }));
   if (containsUnrealizedModelSignal) {
     throw new Error("开篇状态事实把否定、计划、尝试或假想中的体验动作当成真实结果，已拒绝发布。");
   }
@@ -776,6 +788,15 @@ function quoteSimilarity(left: string, right: string): number {
   return sharedNgrams * 4 + sharedCharacters;
 }
 
+function withoutLineBreaks(value: string): string {
+  return value.replace(/\r\n?|\n/g, "");
+}
+
+export function contentContainsSourceQuote(content: string, quote: string): boolean {
+  const normalizedQuote = withoutLineBreaks(quote);
+  return normalizedQuote.length > 0 && withoutLineBreaks(content).includes(normalizedQuote);
+}
+
 export function groundReadingExperienceEvidence(
   contract: ReadingExperienceContract,
   content: string,
@@ -801,7 +822,7 @@ export function groundReadingExperienceEvidence(
       (axis.word !== "系统" || hasProtagonistSystemInteraction(candidate, context)) &&
       (axis.word !== "无敌" || hasDominantProtagonistVictory(candidate, context));
     if (
-      Array.from(originalQuote).length >= 8 && content.includes(originalQuote) &&
+      Array.from(withoutLineBreaks(originalQuote)).length >= 8 && contentContainsSourceQuote(content, originalQuote) &&
       semanticallySupportsAxis(originalQuote)
     ) {
       usedQuotes.add(originalQuote);
@@ -836,7 +857,7 @@ export function assertReadingExperienceEvidence(
       throw new Error(`正文缺少阅读体验轴“${axis.word}”的可核验正文证据，已阻止发布。`);
     }
     const quote = axisEvidence.quote.trim();
-    if (Array.from(quote).length < 8 || !content.includes(quote)) {
+    if (Array.from(withoutLineBreaks(quote)).length < 8 || !contentContainsSourceQuote(content, quote)) {
       throw new Error(`阅读体验轴“${axis.word}”的正文证据不是有效原文引用，已阻止发布。`);
     }
     if (!axisEvidence.signalIds.some((signalId) => validSignalIds.has(signalId))) {
@@ -1029,6 +1050,38 @@ function activeLead(story: Story) {
   );
 }
 
+function selectPriorPersistentContinuityFacts(story: Story, nextChapterNumber: number): string[] {
+  const lead = activeLead(story);
+  if (!lead || nextChapterNumber <= 1) return [];
+
+  const previousChapterNumber = nextChapterNumber - 1;
+  const previousRevisionIds = new Set(
+    story.chapters
+      .filter((chapter) => chapter.number === previousChapterNumber)
+      .map((chapter) => currentRevision(chapter)?.id)
+      .filter((revisionId): revisionId is string => Boolean(revisionId)),
+  );
+  const priorSources = lead.knowledgeSources.filter((source) =>
+    source.sourceChapter < nextChapterNumber && previousRevisionIds.has(source.sourceRevisionId),
+  );
+  const sourceRevisionIds = new Set(priorSources.map((source) => source.sourceRevisionId));
+  const priorCanonOutcomes = story.events
+    .filter((event) =>
+      event.active &&
+      event.branchId === story.activeBranchId &&
+      event.chapterNumber === previousChapterNumber &&
+      event.participantIds.includes(lead.id) &&
+      sourceRevisionIds.has(event.revisionId),
+    )
+    .map((event) => event.outcome.trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([
+    ...priorCanonOutcomes,
+    ...priorSources.map((source) => source.fact.trim()).filter(Boolean),
+  ]));
+}
+
 const deathPredicate = /死亡|死去|断气|曲线归零|身亡|咽气/g;
 
 function escapeRegExp(value: string) {
@@ -1094,6 +1147,28 @@ function itemStateConflicts(story: Story, text: string) {
     .map((item) => `${item.name}当前状态为 ${item.status}`);
 }
 
+function normalizedSemanticFact(value: string) {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function factGroundedInText(fact: string, text: string, minimumCoverage = 0.35) {
+  const normalizedFact = normalizedSemanticFact(fact);
+  const normalizedText = normalizedSemanticFact(text);
+  if (!normalizedFact || !normalizedText) return false;
+  if (normalizedText.includes(normalizedFact) || normalizedFact.includes(normalizedText)) return true;
+  if (normalizedFact.length < 4) return false;
+  const grams = new Set<string>();
+  for (let index = 0; index < normalizedFact.length - 1; index += 1) {
+    grams.add(normalizedFact.slice(index, index + 2));
+  }
+  const matched = [...grams].filter((gram) => normalizedText.includes(gram)).length;
+  return matched >= 3 && matched / grams.size >= minimumCoverage;
+}
+
+function factsSemanticallyOverlap(left: string, right: string) {
+  return factGroundedInText(left, right, 0.45) || factGroundedInText(right, left, 0.45);
+}
+
 function structuredCandidateConflicts(
   story: Story,
   draft: CandidateDraft,
@@ -1106,16 +1181,19 @@ function structuredCandidateConflicts(
     : story.characters.filter((character) => candidateText.includes(character.name)).map((character) => character.name);
   for (const name of participantNames) {
     const character = story.characters.find((item) => item.name === name);
-    if (!character) conflicts.push(`候选引用未知参与者 ${name}`);
-    else if (character.lifecycle === "dead" && !/回忆|档案|遗物|证词|曾经/.test(candidateText)) conflicts.push(`已死亡参与者 ${name} 无依据进入场景`);
+    if (!character) continue;
+    if (character.lifecycle === "dead" && !/回忆|档案|遗物|证词|曾经/.test(candidateText)) conflicts.push(`已死亡参与者 ${name} 无依据进入场景`);
   }
   const activeEvents = story.events.filter((event) => event.active && event.branchId === story.activeBranchId);
   const dependencyIds = draft.dependsOnEventIds ?? activeEvents.slice(-1).map((event) => event.id);
   for (const dependencyId of dependencyIds) {
     if (!activeEvents.some((event) => event.id === dependencyId)) conflicts.push(`依赖事件 ${dependencyId} 不属于活动分支`);
   }
-  if (draft.storyTime && !draft.storyTime.includes(`第${nextChapterNumber}章`) && !draft.storyTime.includes(`第 ${nextChapterNumber} 章`)) {
-    conflicts.push(`结构化时间 ${draft.storyTime} 不属于下一章`);
+  if (draft.storyTime) {
+    const referencedChapters = [...draft.storyTime.matchAll(/第\s*(\d+)\s*章/g)].map((match) => Number(match[1]));
+    if (referencedChapters.some((chapterNumber) => chapterNumber !== nextChapterNumber)) {
+      conflicts.push(`结构化时间 ${draft.storyTime} 引用了非下一章的章节编号`);
+    }
   }
   const claims = [...(draft.knowledgeClaims ?? [])];
   const hasExternalStructuredEnvelope = draft.participantNames !== undefined && draft.storyTime !== undefined &&
@@ -1131,15 +1209,13 @@ function structuredCandidateConflicts(
       if (!participantNames.includes(claim.characterName)) {
         conflicts.push(`knowledgeClaim 的角色 ${claim.characterName} 不在候选参与者中`);
       }
-      if (claim.fact.trim().length < 4 || !candidateText.includes(claim.fact.trim())) {
-        conflicts.push(`knowledgeClaim“${claim.fact}”未在候选正文中实际使用`);
-      }
+      if (claim.fact.trim().length < 4) conflicts.push("knowledgeClaim 的事实文本过短，无法可靠核验");
       if (!claim.sourceRevisionId) conflicts.push(`knowledgeClaim“${claim.fact}”缺少 sourceRevisionId`);
     }
     for (const dependency of draft.knowledgeAudit?.dependencies ?? []) {
       const supportingClaim = draft.knowledgeClaims!.some((claim) =>
         claim.characterName === dependency.characterName &&
-        (claim.fact.includes(dependency.fact) || dependency.fact.includes(claim.fact)),
+        factsSemanticallyOverlap(claim.fact, dependency.fact),
       );
       if (!supportingClaim) {
         conflicts.push(`${dependency.characterName}使用语义审计识别的信息依赖“${dependency.fact}”但没有对应 knowledgeClaim`);
@@ -1157,7 +1233,7 @@ function structuredCandidateConflicts(
       continue;
     }
     const source = character.knowledgeSources.find((fact) =>
-      (fact.fact.includes(claim.fact) || claim.fact.includes(fact.fact)) &&
+      factsSemanticallyOverlap(fact.fact, claim.fact) &&
       (!claim.sourceRevisionId || fact.sourceRevisionId === claim.sourceRevisionId),
     );
     if (!source) conflicts.push(`${claim.characterName}对“${claim.fact}”没有可追溯知识来源`);
@@ -1166,8 +1242,9 @@ function structuredCandidateConflicts(
   for (const transition of transitions) {
     const item = story.items.find((candidate) => candidate.name === transition.itemName);
     const actor = story.characters.find((character) => character.name === transition.actorName);
-    if (!item || !actor) {
-      conflicts.push(`物品转换引用未知物品或角色：${transition.itemName}/${transition.actorName}`);
+    if (!item) continue;
+    if (!actor) {
+      conflicts.push(`已有物品 ${transition.itemName} 的转换引用未知角色 ${transition.actorName}`);
       continue;
     }
     if (item.status !== transition.fromStatus) conflicts.push(`${item.name}起始状态应为 ${item.status}，不是 ${transition.fromStatus}`);
@@ -1389,7 +1466,7 @@ export function planNextChapter(
     },
   ];
   const localPatterns = isTerminalChapter ? terminalPatterns : continuingPatterns;
-  const patterns = externalDrafts && externalDrafts.length >= 3
+  const patterns = externalDrafts && externalDrafts.length >= 1
     ? externalDrafts.slice(0, 5)
     : localPatterns;
   const candidates = patterns.map<NarrativeCandidate>((pattern, index) => {
@@ -1485,7 +1562,10 @@ export function planNextChapter(
     };
   });
   const viable = candidates.filter((candidate) => candidate.score > 0).sort((a, b) => b.score - a.score);
-  if (!viable.length) throw new Error("所有剧情候选均违反硬正史，已阻止正文发布。");
+  if (!viable.length) {
+    const reasonSummary = Array.from(new Set(candidates.flatMap((candidate) => candidate.reasons))).slice(0, 6);
+    throw new Error(`所有剧情候选均违反硬正史，已阻止正文发布：${reasonSummary.join("；")}。`);
+  }
   const selected = viable[(story.canonVersion + seed) % Math.min(3, viable.length)];
   selected.status = "selected";
   selected.reasons.push("综合因果、偏好、新颖度、伏笔潜力与修史成本后入选");
@@ -1508,6 +1588,16 @@ export function planNextChapter(
 
 export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
   const latest = story.chapters.at(-1);
+  const nextChapterNumber = story.chapters.length + 1;
+  const priorPersistentFacts = selectPriorPersistentContinuityFacts(story, nextChapterNumber);
+  const priorPersistentStateDirective = priorPersistentFacts.length > 0
+    ? `连续性硬约束（仅作写作指令，禁止原样写入正文）：前一场景已经确认且不可降级的状态包括：${priorPersistentFacts.slice(0, 6).map((fact, index) => `状态${index + 1}=${fact}`).join("；")}。正文必须明确点名并由主角实际调用、使用或确认至少一项具体旧状态；不得只改写成“至尊权限”“某种力量”等泛称，也不得把旧奖励写成首次获得。`
+    : "";
+  const systemInvincibleActionChain = isSystemInvincibleExperience(story.readingExperience.sourceWords)
+    ? nextChapterNumber === story.readingExperience.effectiveFromChapter + 1
+      ? "续篇双体验硬动作链：正文必须让主角沿用前一场景已经获得的系统权限或永久能力，主动打开面板、接受提示、签到、领取新奖励或调用旧状态中的至少一项；清楚写出系统反馈以及奖励、权限或状态的持续升级；随后由主角本人把这项既有或升级后的能力用于当前冲突并压倒性获胜；最后写出身份、资源、势力态度或现场秩序的明确变化。四步都必须在人物视角内实际发生，不能只用旁白概括，也不要提后台信号名。"
+      : "系统与无敌硬动作链：主角必须实际操作系统或调用既有系统能力，获得可持续的反馈或结果，并由主角本人以压倒性胜利改变现实状态；不能只提到系统名称。"
+    : "";
   const hardRules = story.rules
     .filter((rule) => rule.hardness === "hard")
     .map((rule) => rule.description)
@@ -1539,6 +1629,8 @@ export function buildChapterPrompt(story: Story, plan: GenerationPlan): string {
     `伏笔状态：${clueState || "无"}。物品账本：${itemState || "无"}。篇幅目标：${plan.targetCharacters} 个中文字符（含标点，不计空白），必须在 ${plan.minCharacters}—${plan.maxCharacters} 字之间；写成 ${plan.targetParagraphs} 个完整段落，允许误差不超过 1 段。`,
     `硬规则：${hardRules || "无"}。读者硬约束：${hardPreferences || "无"}。近期软偏好：${softPreferences || "无"}。`,
     formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1),
+    priorPersistentStateDirective,
+    systemInvincibleActionChain,
     `固定预算相关记忆：\n${plan.memories.map((memory) => `[${memory.sourceId}|${memory.confidence.toFixed(2)}] ${memory.text}`).join("\n")}`,
     `分支会话摘要（来源消息 ${plan.conversationContext.sourceMessageIds.join(", ") || "无"}）：${plan.conversationContext.summary || "无"}`,
     `相关历史消息（按当前事件检索）：\n${plan.conversationContext.relevantMessages.join("\n") || "无"}`,
@@ -1761,6 +1853,12 @@ export function generateLocalChapter(story: Story, plan: GenerationPlan): Genera
   };
 }
 
+export function chapterParagraphCountIsAllowed(actual: number, target: number): boolean {
+  const minimum = Math.max(4, Math.ceil(target * 0.5));
+  const maximum = Math.ceil(target * 1.5);
+  return Number.isInteger(actual) && actual >= minimum && actual <= maximum;
+}
+
 export function validateGeneratedChapter(
   story: Story,
   generated: GeneratedChapter,
@@ -1770,8 +1868,10 @@ export function validateGeneratedChapter(
   if (!generated.title.trim() || generated.paragraphs.length < 4) {
     throw new Error("章节未通过完整性校验，已阻止发布。");
   }
-  if (Math.abs(generated.paragraphs.length - plan.targetParagraphs) > 1) {
-    throw new Error(`章节长度为 ${generated.paragraphs.length} 段，偏离目标 ${plan.targetParagraphs} 段，已阻止发布。`);
+  if (!chapterParagraphCountIsAllowed(generated.paragraphs.length, plan.targetParagraphs)) {
+    const minimumParagraphs = Math.max(4, Math.ceil(plan.targetParagraphs * 0.5));
+    const maximumParagraphs = Math.ceil(plan.targetParagraphs * 1.5);
+    throw new Error(`章节长度为 ${generated.paragraphs.length} 段，合理范围为 ${minimumParagraphs}—${maximumParagraphs} 段，已阻止发布。`);
   }
   const content = generated.paragraphs.join("\n");
   assertImmersiveNarration(`${generated.title}\n${content}`);
@@ -1785,18 +1885,27 @@ export function validateGeneratedChapter(
     const validationContext: ReadingExperienceValidationContext = {
       protagonistNames: [lead?.name ?? "主角"],
       chapterNumber: nextChapterNumber,
-      priorPersistentFacts: lead?.knowledgeSources
-        .filter((fact) => fact.sourceChapter < nextChapterNumber)
-        .map((fact) => fact.fact) ?? [],
+      priorPersistentFacts: selectPriorPersistentContinuityFacts(story, nextChapterNumber),
     };
     const requiresEvidence = generated.origin !== "local" ||
       story.readingExperience.provenance === "model" ||
       isSystemInvincibleExperience(story.readingExperience.sourceWords);
     if (requiresEvidence) {
-      assertReadingExperienceEvidence(
+      const groundedExperienceEvidence = groundReadingExperienceEvidence(
         story.readingExperience,
         content,
         extracted?.experienceEvidence ?? generated.experienceEvidence,
+        validationContext,
+      );
+      if (extracted) {
+        extracted.experienceEvidence = groundedExperienceEvidence;
+      } else {
+        generated.experienceEvidence = groundedExperienceEvidence;
+      }
+      assertReadingExperienceEvidence(
+        story.readingExperience,
+        content,
+        groundedExperienceEvidence,
         validationContext,
       );
     } else {

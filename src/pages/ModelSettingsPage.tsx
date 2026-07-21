@@ -179,7 +179,7 @@ export function ModelSettingsPage() {
                   <span className={capabilities?.streaming ? "supported" : ""}><Zap size={14} /> 流式</span>
                   <span className={capabilities?.jsonSchema ? "supported" : ""}><Activity size={14} /> Schema</span>
                   <span className={capabilities?.toolCalling ? "supported" : ""}><ServerCog size={14} /> Tool</span>
-                  <span className={capabilities?.embedding ? "supported" : ""}><CloudCog size={14} /> Embedding</span>
+                  <span className={capabilities?.embedding ? "supported" : ""}><CloudCog size={14} /> {capabilities?.embeddingApi === "embeddings_multimodal" ? "多模态 Embedding" : "Embedding"}</span>
                   <small>{capabilities ? `${capabilities.completionApi === "responses" ? "Responses API" : "Chat Completions"} · ${capabilities.latencyMs}ms · ${capabilities.maxContextTokens ? `${Math.round(capabilities.maxContextTokens / 1000)}K 上下文` : "上下文上限未知"} · ${capabilities.promptCache ? "缓存命中" : "未确认缓存"} · ${formatDateTime(capabilities.testedAt)}` : "尚无能力快照"}</small>
                 </div>
                 <div className="connection-row__actions">

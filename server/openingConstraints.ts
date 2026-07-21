@@ -1,4 +1,4 @@
-export const OPENING_CHAPTER_MIN_CHARACTERS = 2_400;
+export const OPENING_CHAPTER_MIN_CHARACTERS = 1_800;
 export const OPENING_CHAPTER_MAX_CHARACTERS = 6_000;
 
 export function openingChapterCharacterCount(content: string): number {

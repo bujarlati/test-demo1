@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assertModelCallTokenBudget,
+  CHAPTER_EXTRACTION_ADMISSION_RESERVE,
+  CONTINUATION_JOB_TOKEN_BUDGET,
   estimateModelCallTokenBudget,
   OPENING_JOB_TOKEN_BUDGET,
 } from "../server/generationBudget";
@@ -14,6 +16,17 @@ test("opening budget covers the measured reasoning planner plus one full draft r
   assert.ok(
     OPENING_JOB_TOKEN_BUDGET >= measuredPlannerTokens + twoReasoningWriterAllowances + repairAndReviewAllowance,
     `opening budget ${OPENING_JOB_TOKEN_BUDGET} cannot cover the observed reasoning-heavy pipeline`,
+  );
+});
+
+test("continuation budget admits measured planning, conservative writer input, full draft, and extraction", () => {
+  const measuredPlannerAndAuditTokens = 4_750;
+  const conservativeWriterInputTokens = 13_062;
+  const fullWriterOutputTokens = 6_500;
+
+  assert.ok(
+    CONTINUATION_JOB_TOKEN_BUDGET >= measuredPlannerAndAuditTokens + conservativeWriterInputTokens + fullWriterOutputTokens + CHAPTER_EXTRACTION_ADMISSION_RESERVE,
+    `continuation budget ${CONTINUATION_JOB_TOKEN_BUDGET} cannot admit the measured Ark pipeline`,
   );
 });
 

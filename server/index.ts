@@ -5,6 +5,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { z } from "zod";
 import type { ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
 import { isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
+import { recoverableGenerationJobs } from "../src/jobRecovery";
 import { audit, authenticate, login, publicUser, requireAdmin, type AuthLocals } from "./auth";
 import {
   assertSafeEndpoint,
@@ -26,7 +27,7 @@ import {
   type ExtractedChapterState,
 } from "./narrativeEngine";
 import { handleReaderMessage, rollbackRetcon } from "./retconService";
-import { createStoreMutationGate, loadStore, saveStore } from "./storage";
+import { createStoreMutationGate, loadStore, saveStore, shouldAbandonQueuedRequest } from "./storage";
 import {
   commitNextChapter,
   finalizeStoryIfTargetReached,
@@ -45,6 +46,7 @@ import { accumulateModelUsage, recordFailedJobUsage } from "./modelUsage";
 import { deleteSecrets, storeSecret } from "./vault";
 import { assertSafetyAllowed, recordSafetyDecision, safetyCategories } from "./safetyService";
 import { appendStoryCoreEvent, createStoryConstraint, describeReaderStoryEvent, projectStoryWorldState } from "./storyCore";
+import { aiTraceEnabled, configuredAiTracePath, initializeAiTrace } from "./aiTrace";
 
 const app = express();
 const store = await loadStore();
@@ -68,7 +70,7 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const storyCoreWriteWindows = new Map<string, { count: number; resetAt: number }>();
 const STORY_CORE_WRITES_PER_MINUTE = 60;
 const USER_DAILY_TOKEN_BUDGET = 1_500_000;
-const STORY_DAILY_TOKEN_BUDGET = 120_000;
+const STORY_DAILY_TOKEN_BUDGET = 500_000;
 const acquireStoreMutation = createStoreMutationGate();
 
 app.disable("x-powered-by");
@@ -79,7 +81,7 @@ app.use(async (request, response, next) => {
     return;
   }
   const release = await acquireStoreMutation();
-  if (request.destroyed || response.writableEnded) {
+  if (shouldAbandonQueuedRequest(request, response)) {
     release();
     return;
   }
@@ -361,7 +363,7 @@ const appendEventSchema = z.object({
 }).strict();
 
 app.get("/api/health", (_request, response) => {
-  response.json({ ok: true, service: "xumo-api" });
+  response.json({ ok: true, service: "xumo-api", aiTraceEnabled: aiTraceEnabled() });
 });
 
 app.post("/api/auth/login", async (request, response) => {
@@ -402,18 +404,19 @@ app.post("/api/auth/logout", async (request, response) => {
 
 app.get("/api/bootstrap", (_request, response) => {
   const user = currentUser(response);
+  const userJobs = store.jobs.filter((job) => job.ownerId === user.id);
+  const stories = store.stories
+    .filter((story) => story.ownerId === user.id && story.status !== "archived")
+    .map(summarizeStory)
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  const availableStoryIds = new Set(stories.map((story) => story.id));
   response.json({
     user: publicUser(user),
-    stories: store.stories
-      .filter((story) => story.ownerId === user.id && story.status !== "archived")
-      .map(summarizeStory)
-      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    stories,
     modelConnections: listGenerationModelOptions(store, user),
     activeStoryId: user.activeStoryId,
-    pendingJobs: store.jobs.filter((job) => job.ownerId === user.id && job.status === "running"),
-    recoverableJobs: store.jobs.filter(
-      (job) => job.ownerId === user.id && job.status === "failed" && job.filterSummary?.includes("可以安全重试"),
-    ).slice(0, 3),
+    pendingJobs: userJobs.filter((job) => job.status === "running"),
+    recoverableJobs: recoverableGenerationJobs(userJobs, availableStoryIds).slice(0, 3),
   });
 });
 
@@ -815,15 +818,20 @@ async function generateChapter(
       for (let qualityAttempt = 1; qualityAttempt <= maxQualityAttempts; qualityAttempt += 1) {
         generated = undefined;
         extracted = undefined;
+        const rewriteTargetMin = Math.max(plan.minCharacters + 200, plan.targetCharacters - 100);
+        const rewriteTargetMax = Math.min(plan.maxCharacters - 100, plan.targetCharacters + 300);
         const prompt = qualityAttempt === 1
           ? basePrompt
-          : `${basePrompt}\n上一次正文没有同时通过双阅读体验证据与沉浸感检查，请彻底重写，不要解释，也不要在正文提到检查过程。失败原因：${qualityFailure instanceof Error ? qualityFailure.message : "质量证据不足"}`;
+          : `${basePrompt}\n请另起思路生成一份全新成稿，只呈现人物在故事世界中当下可感知的行动、对话与结果，不要解释或复述任何写作要求。成稿长度请稳定落在 ${rewriteTargetMin}—${rewriteTargetMax} 字，并用具体动作分别兑现两个阅读体验。`;
         const writerInputBudget = estimateChapterWriterInputTokenBudget(
           prompt,
           Boolean(effectiveConnection.capabilities?.streaming),
         );
+        const writerOutputLimit = body.chapterLength === "compact"
+          ? 4_500
+          : body.chapterLength === "standard" ? 5_800 : 6_500;
         const writerTokenBudget = Math.min(
-          6_500,
+          writerOutputLimit,
           Math.floor(JOB_TOKEN_BUDGET - usedTokens - writerInputBudget - CHAPTER_EXTRACTION_ADMISSION_RESERVE),
         );
         if (!isManagedLocal && writerTokenBudget < 2_000) {
@@ -875,6 +883,7 @@ async function generateChapter(
             story.readingExperience,
             undefined,
             JOB_TOKEN_BUDGET - usedTokens,
+            story.chapters.length + 1,
           );
           usedTokens += extracted.usageTokens ?? 0;
           usageEstimated ||= extracted.usageEstimated ?? true;
@@ -1530,6 +1539,7 @@ app.post("/api/model-connections/:connectionId/test", requireAdmin, async (reque
       streaming: connection.capabilities.streaming,
       jsonSchema: connection.capabilities.jsonSchema,
       embedding: connection.capabilities.embedding,
+      embeddingApi: connection.capabilities.embeddingApi ?? "none",
     });
     await persist();
     response.json(connection);
@@ -1599,4 +1609,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 
 app.listen(port, "127.0.0.1", () => {
   console.log(`Xumo API listening on http://127.0.0.1:${port}`);
+  if (aiTraceEnabled()) {
+    void initializeAiTrace();
+    console.log(`[AI-TRACE] 完整模型问答将写入 ${configuredAiTracePath()}`);
+  }
 });
