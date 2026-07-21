@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync } from "node:crypto";
+import { createHash, randomBytes, scryptSync } from "node:crypto";
 import type {
   AppStore,
   Chapter,
@@ -12,8 +12,10 @@ import { createReadingExperienceContract } from "./readingExperience";
 const now = "2026-07-14T10:12:00+08:00";
 const demoOwnerId = "user_demo";
 
-function passwordRecord(password: string) {
-  const salt = randomBytes(16).toString("hex");
+function passwordRecord(password: string, identity: string) {
+  // Seed-account salts only need to be unique, not secret. Deriving them avoids
+  // random-number generation during hosted worker module initialization.
+  const salt = createHash("sha256").update(`xumo-seed:${identity}:${password}`).digest("hex").slice(0, 32);
   return {
     passwordSalt: salt,
     passwordHash: scryptSync(password, salt, 64).toString("hex"),
@@ -560,7 +562,7 @@ export function createSeedStore(): AppStore {
         role: "admin",
         activeStoryId: blackTide.id,
         defaultConnectionId: "conn_platform",
-        ...passwordRecord(adminPassword),
+        ...passwordRecord(adminPassword, "admin@xumo.local"),
       },
       {
         id: "user_reader",
@@ -570,7 +572,7 @@ export function createSeedStore(): AppStore {
         role: "reader",
         activeStoryId: null,
         defaultConnectionId: "conn_platform",
-        ...passwordRecord(readerPassword),
+        ...passwordRecord(readerPassword, "reader@xumo.local"),
       },
     ],
     sessions: [],
