@@ -47,6 +47,25 @@ import { assertSafetyAllowed, recordSafetyDecision, safetyCategories } from "./s
 import { appendStoryCoreEvent, createStoryConstraint, describeReaderStoryEvent, projectStoryWorldState } from "./storyCore";
 import { aiTraceEnabled, configuredAiTracePath, initializeAiTrace } from "./aiTrace";
 
+interface HostedStaticAsset {
+  body: string;
+  encoding: "utf8" | "base64";
+  contentType: string;
+}
+
+declare const __SITES_STATIC_ASSETS__: Readonly<Record<string, HostedStaticAsset>> | undefined;
+
+const hostedStaticAssets = typeof __SITES_STATIC_ASSETS__ === "undefined"
+  ? undefined
+  : __SITES_STATIC_ASSETS__;
+
+function sendHostedStaticAsset(assetPath: string, response: Response): boolean {
+  const asset = hostedStaticAssets?.[assetPath];
+  if (!asset) return false;
+  response.type(asset.contentType).send(asset.encoding === "base64" ? Buffer.from(asset.body, "base64") : asset.body);
+  return true;
+}
+
 const app = express();
 const store = await loadStore();
 const interruptedJobs = store.jobs.filter((job) => job.status === "running");
@@ -1583,13 +1602,21 @@ app.get("/api/ops", requireAdmin, (_request, response) => {
 
 if (process.env.NODE_ENV === "production") {
   const distDirectory = process.env.XUMO_STATIC_DIRECTORY?.trim() || path.join(projectRoot, "dist");
+  if (hostedStaticAssets) {
+    app.use((request, response, next) => {
+      if (request.method === "GET" && sendHostedStaticAsset(request.path === "/" ? "/index.html" : request.path, response)) return;
+      next();
+    });
+  }
   app.use(express.static(distDirectory));
   app.use((request, response, next) => {
     if (request.method !== "GET" || request.path.startsWith("/api/")) {
       next();
       return;
     }
-    response.sendFile(path.join(distDirectory, "index.html"));
+    if (!sendHostedStaticAsset("/index.html", response)) {
+      response.sendFile(path.join(distDirectory, "index.html"));
+    }
   });
 }
 
