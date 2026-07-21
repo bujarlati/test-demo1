@@ -1607,8 +1607,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
   response.status(status).json({ message, ...(safetyDecisionId ? { safetyDecisionId } : {}) });
 });
 
-app.listen(port, "127.0.0.1", () => {
-  console.log(`Xumo API listening on http://127.0.0.1:${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Xumo API listening on http://0.0.0.0:${port}`);
   if (aiTraceEnabled()) {
     void initializeAiTrace();
     console.log(`[AI-TRACE] 完整模型问答将写入 ${configuredAiTracePath()}`);
