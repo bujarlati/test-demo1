@@ -8,8 +8,12 @@ await build({
   platform: "node",
   format: "esm",
   target: "node22",
+  external: ["cloudflare:node"],
   banner: {
-    js: 'import { createRequire } from "node:module"; const require = createRequire(process.cwd() + "/package.json");',
+    js: 'import { httpServerHandler } from "cloudflare:node"; import { createRequire } from "node:module"; const require = createRequire(process.cwd() + "/package.json");',
+  },
+  footer: {
+    js: 'export default httpServerHandler({ port: Number(process.env.PORT ?? 8787) });',
   },
 });
 
