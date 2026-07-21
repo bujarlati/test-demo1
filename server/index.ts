@@ -26,7 +26,7 @@ import {
   type ExtractedChapterState,
 } from "./narrativeEngine";
 import { handleReaderMessage, rollbackRetcon } from "./retconService";
-import { createStoreMutationGate, loadStore, saveStore, shouldAbandonQueuedRequest } from "./storage";
+import { createStoreMutationGate, loadStore, saveStore, shouldAbandonQueuedRequest, usesPersistentStorage } from "./storage";
 import {
   commitNextChapter,
   finalizeStoryIfTargetReached,
@@ -361,7 +361,12 @@ const appendEventSchema = z.object({
 }).strict();
 
 app.get("/api/health", (_request, response) => {
-  response.json({ ok: true, service: "xumo-api", aiTraceEnabled: aiTraceEnabled() });
+  response.json({
+    ok: true,
+    service: "xumo-api",
+    aiTraceEnabled: aiTraceEnabled(),
+    storage: usesPersistentStorage() ? "filesystem" : "memory",
+  });
 });
 
 app.post("/api/auth/login", async (request, response) => {

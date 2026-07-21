@@ -8,6 +8,17 @@ import { createLegacyExperienceContract } from "./readingExperience";
 export const dataDirectory = process.env.XUMO_DATA_DIRECTORY?.trim()
   || (process.env.NODE_ENV === "production" ? "/tmp/xumo-data" : path.join(process.cwd(), "server", "data"));
 const storePath = path.join(dataDirectory, "store.json");
+let persistentStorageAvailable = process.env.XUMO_STORAGE_MODE?.trim().toLowerCase() !== "memory";
+
+export function usesPersistentStorage(): boolean {
+  return persistentStorageAvailable;
+}
+
+function isUnavailableFilesystem(error: unknown): boolean {
+  const code = error instanceof Error && "code" in error ? String(error.code) : "";
+  return ["EACCES", "EPERM", "EROFS", "ENOSYS"].includes(code)
+    || (error instanceof Error && /operation not permitted|read-only file system/i.test(error.message));
+}
 
 export function createStoreSaveQueue(writeSnapshot: (snapshot: string) => Promise<void>) {
   let queue = Promise.resolve();
@@ -56,6 +67,7 @@ export function shouldAbandonQueuedRequest(
 }
 
 const enqueueStoreSave = createStoreSaveQueue(async (snapshot) => {
+  if (!persistentStorageAvailable) return;
   await mkdir(dataDirectory, { recursive: true });
   const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporaryPath, snapshot, "utf8");
@@ -193,11 +205,16 @@ function normalizeStore(store: AppStore): AppStore {
 }
 
 export async function loadStore(): Promise<AppStore> {
-  await mkdir(dataDirectory, { recursive: true });
+  if (!persistentStorageAvailable) return createSeedStore();
   try {
+    await mkdir(dataDirectory, { recursive: true });
     const contents = await readFile(storePath, "utf8");
     return normalizeStore(JSON.parse(contents) as AppStore);
   } catch (error) {
+    if (isUnavailableFilesystem(error)) {
+      persistentStorageAvailable = false;
+      return createSeedStore();
+    }
     const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
     if (!missing) {
       throw error;

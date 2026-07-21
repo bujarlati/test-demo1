@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { dataDirectory } from "./storage";
+import { dataDirectory, usesPersistentStorage } from "./storage";
 
 interface SecretRecord {
   iv: string;
@@ -15,6 +15,7 @@ const secretFile = path.join(dataDirectory, "secrets.json");
 const developmentKeyFile = path.join(dataDirectory, ".master-key");
 let masterKeyPromise: Promise<Buffer> | null = null;
 let secretSaveQueue = Promise.resolve();
+let inMemorySecrets: SecretStore = {};
 
 function parseEnvironmentKey(value: string): Buffer {
   const key = /^[0-9a-f]{64}$/i.test(value)
@@ -55,6 +56,7 @@ async function loadMasterKey(): Promise<Buffer> {
 }
 
 async function readSecrets(): Promise<SecretStore> {
+  if (!usesPersistentStorage()) return structuredClone(inMemorySecrets);
   try {
     return JSON.parse(await readFile(secretFile, "utf8")) as SecretStore;
   } catch (error) {
@@ -64,6 +66,16 @@ async function readSecrets(): Promise<SecretStore> {
     }
     throw error;
   }
+}
+
+async function saveSecrets(secrets: SecretStore): Promise<void> {
+  if (!usesPersistentStorage()) {
+    inMemorySecrets = structuredClone(secrets);
+    return;
+  }
+  const temporaryPath = `${secretFile}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify(secrets, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(temporaryPath, secretFile);
 }
 
 export async function storeSecret(id: string, value: string): Promise<{ secretRef: string; version: number }> {
@@ -85,9 +97,7 @@ export async function storeSecret(id: string, value: string): Promise<{ secretRe
       .map(Number);
     version = Math.max(secrets[id] ? 1 : 0, ...versions, 0) + 1;
     secrets[`${id}:v${version}`] = record;
-    const temporaryPath = `${secretFile}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(secrets, null, 2), { encoding: "utf8", mode: 0o600 });
-    await rename(temporaryPath, secretFile);
+    await saveSecrets(secrets);
   });
   await secretSaveQueue;
   return { secretRef: `vault://model-connections/${id}/versions/${version}`, version };
@@ -116,9 +126,7 @@ export async function deleteSecrets(id: string) {
     for (const key of Object.keys(secrets)) {
       if (key === id || key.startsWith(`${id}:v`)) delete secrets[key];
     }
-    const temporaryPath = `${secretFile}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(secrets, null, 2), { encoding: "utf8", mode: 0o600 });
-    await rename(temporaryPath, secretFile);
+    await saveSecrets(secrets);
   });
   await secretSaveQueue;
 }
