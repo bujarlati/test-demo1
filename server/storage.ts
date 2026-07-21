@@ -5,7 +5,8 @@ import { createSeedStore } from "./seed";
 import { captureCanonState } from "./canonState";
 import { createLegacyExperienceContract } from "./readingExperience";
 
-export const dataDirectory = path.join(process.cwd(), "server", "data");
+export const dataDirectory = process.env.XUMO_DATA_DIRECTORY?.trim()
+  || (process.env.NODE_ENV === "production" ? "/tmp/xumo-data" : path.join(process.cwd(), "server", "data"));
 const storePath = path.join(dataDirectory, "store.json");
 
 export function createStoreSaveQueue(writeSnapshot: (snapshot: string) => Promise<void>) {

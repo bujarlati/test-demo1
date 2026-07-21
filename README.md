@@ -54,6 +54,8 @@ pnpm start
 
 生产环境首次创建数据时必须提供 `BOOTSTRAP_ADMIN_PASSWORD`，模型密钥功能必须提供 `APP_ENCRYPTION_KEY`，不会创建公开默认密码或本地临时主密钥。若也要启用演示读者账号，可另外设置 `BOOTSTRAP_READER_PASSWORD`；未设置时该账号使用随机不可猜测密码。
 
+在没有持久卷的站点运行时，服务会把可变数据写入 `/tmp/xumo-data`。这适合公开演示，但实例重启或重新部署会重置故事、会话和后来保存的模型连接；正式长期运行应通过 `XUMO_DATA_DIRECTORY` 挂载持久目录，或把存储层替换为托管数据库与密钥服务。
+
 ## 数据与密钥
 
 演示数据首次启动时由 `server/seed.ts` 生成。运行期故事、会话与 Revision 写入 `server/data/store.json`；模型 Key 使用 AES-256-GCM 加密后写入独立的 `server/data/secrets.json`。这些运行期文件均已忽略，不会提交到 Git。
