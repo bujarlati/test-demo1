@@ -1,4 +1,5 @@
-import { ArrowRight, BookOpenText, Clock3, Plus, Sparkles } from "lucide-react";
+import { ArrowRight, BookOpenText, Clock3, LoaderCircle, Plus, Sparkles } from "lucide-react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { BookCover } from "../components/BookCover";
 import { ErrorState, LoadingState } from "../components/States";
@@ -6,14 +7,22 @@ import { useApp } from "../context/AppContext";
 import { formatRelativeDate } from "../utils";
 
 export function LibraryPage() {
-  const { data, loading, error, refresh } = useApp();
+  const { data, loading, error, refresh, loadMoreStories } = useApp();
+  const [loadingMore, setLoadingMore] = useState(false);
 
   if (loading) return <LoadingState label="正在打开你的私人书架…" />;
   if (error || !data) return <ErrorState message={error ?? "书架加载失败。"} onRetry={() => void refresh()} />;
 
   const activeStory = data.stories.find((story) => story.id === data.activeStoryId) ?? data.stories[0];
   const otherStories = data.stories.filter((story) => story.id !== activeStory?.id);
-  const chapterTotal = data.stories.reduce((total, story) => total + story.chapterCount, 0);
+  const loadMore = async () => {
+    setLoadingMore(true);
+    try {
+      await loadMoreStories();
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   return (
     <div className="page page--library">
@@ -84,8 +93,8 @@ export function LibraryPage() {
             <h2 id="all-stories-title">你的其他故事</h2>
           </div>
           <div className="library-stats">
-            <span><strong>{data.stories.length}</strong> 本故事</span>
-            <span><strong>{chapterTotal}</strong> 个章节</span>
+            <span><strong>{data.storyPage.totalStories}</strong> 本故事</span>
+            <span><strong>{data.storyPage.totalChapters}</strong> 个章节</span>
           </div>
         </div>
 
@@ -111,6 +120,12 @@ export function LibraryPage() {
             <p>题材是唯一必选项，其余都可以交给 AI。</p>
           </Link>
         </div>
+        {data.storyPage.nextCursor && (
+          <button className="button button--secondary library-load-more" type="button" disabled={loadingMore} onClick={() => void loadMore()}>
+            {loadingMore && <LoaderCircle className="spin" size={16} />}
+            {loadingMore ? "正在取下一页" : "加载更多故事"}
+          </button>
+        )}
       </section>
     </div>
   );

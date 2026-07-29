@@ -12,6 +12,7 @@ import {
   applyPlannedItemTransitions,
   assertStoryStateIntegrity,
   eventFromChapter,
+  classifyReadingExperienceDelivery,
   endingContractSatisfied,
   generateLocalChapter,
   type GeneratedChapter,
@@ -21,7 +22,12 @@ import {
 } from "./narrativeEngine";
 import { captureCanonState, deriveStateEffects } from "./canonState";
 import { narrativeProfileForGenre, sceneKitForGenre } from "./genreProfiles";
-import { createReadingExperienceContract, isSystemInvincibleExperience, parseReadingExperienceWords } from "./readingExperience";
+import {
+  createReadingExperienceContract,
+  isSystemInvincibleExperience,
+  parseReadingExperienceWords,
+  updateReadingExperienceDeliveryLedger,
+} from "./readingExperience";
 import { assertStoryHardConstraints } from "./storyCore";
 
 export function summarizeStory(story: Story): StorySummary {
@@ -544,6 +550,17 @@ export function createStory(input: CreateStoryInput, ownerId: string): Story {
     retcons: [],
     modelConnectionId: null,
   };
+  const initialExperienceDelivery = classifyReadingExperienceDelivery(
+    readingExperience,
+    blueprint.paragraphs.join("\n"),
+    { protagonistNames: [blueprint.lead], chapterNumber: 1 },
+  );
+  story.readingExperienceDeliveryLedger = updateReadingExperienceDeliveryLedger(
+    readingExperience,
+    undefined,
+    1,
+    initialExperienceDelivery,
+  );
   const initialState = captureCanonState(story);
   story.branches[0].baseStateSnapshot = structuredClone(initialState);
   story.branches[0].stateSnapshot = initialState;
@@ -559,6 +576,8 @@ export function commitNextChapter(
   const result = generated ?? generateLocalChapter(story, plan);
   validateGeneratedChapter(story, result, plan, extracted);
   const number = (story.chapters.at(-1)?.number ?? 0) + 1;
+  const experienceEvidence = extracted?.experienceEvidence ?? result.experienceEvidence;
+  const experienceDelivery = extracted?.experienceDelivery ?? result.experienceDelivery ?? [];
   const createdAt = new Date().toISOString();
   const chapterId = `chapter_${story.id}_${number}`;
   const revisionId = `rev_${story.id}_${number}_1`;
@@ -579,12 +598,22 @@ export function commitNextChapter(
         promptVersion: "story-v8",
         branchId: story.activeBranchId,
         endingResolution: result.endingResolution ?? extracted?.endingResolution,
+        experienceEvidence: experienceEvidence?.map((evidence) => ({ ...evidence, signalIds: [...evidence.signalIds] })),
+        experienceDelivery: experienceDelivery.length
+          ? experienceDelivery.map((observation) => ({ ...observation }))
+          : undefined,
       },
     ],
     estimatedMinutes: Math.max(5, Math.round(result.paragraphs.join("").length / 160)),
   };
   story.chapters.push(nextChapter);
   const activeBranchBeforeCommit = story.branches.find((item) => item.id === story.activeBranchId);
+  story.readingExperienceDeliveryLedger = updateReadingExperienceDeliveryLedger(
+    story.readingExperience,
+    story.readingExperienceDeliveryLedger,
+    number,
+    experienceDelivery,
+  );
   if (activeBranchBeforeCommit) activeBranchBeforeCommit.chapterRevisionIds[chapterId] = revisionId;
   const stateBefore = captureCanonState(story);
   const event = eventFromChapter(story, number, revisionId, plan, extracted?.events[0], result);

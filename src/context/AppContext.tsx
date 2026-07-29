@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { api, ApiError, authStore } from "../api";
-import type { BootstrapPayload } from "../types";
+import type { BootstrapPayload, OpeningJobStatusPayload } from "../types";
 
 interface AppContextValue {
   data: BootstrapPayload | null;
@@ -16,8 +16,11 @@ interface AppContextValue {
   error: string | null;
   authRequired: boolean;
   login: (email: string, password: string) => Promise<void>;
+  register: (name: string, email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
+  reconcileOpeningJobStatus: (status: OpeningJobStatusPayload) => void;
+  loadMoreStories: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -60,6 +63,50 @@ export function AppProvider({ children }: { children: ReactNode }) {
     await refresh();
   }, [refresh]);
 
+  const register = useCallback(async (name: string, email: string, password: string) => {
+    const result = await api.register(name, email, password);
+    authStore.set(result.token);
+    setAuthRequired(false);
+    setLoading(true);
+    await refresh();
+  }, [refresh]);
+
+  const loadMoreStories = useCallback(async () => {
+    const cursor = data?.storyPage.nextCursor;
+    if (!cursor) return;
+    const page = await api.stories(cursor);
+    setData((current) => current ? {
+      ...current,
+      stories: [
+        ...current.stories,
+        ...page.stories.filter((story) => !current.stories.some((existing) => existing.id === story.id)),
+      ],
+      storyPage: {
+        nextCursor: page.nextCursor,
+        totalStories: page.totalStories,
+        totalChapters: page.totalChapters,
+      },
+    } : current);
+  }, [data?.storyPage.nextCursor]);
+
+  const reconcileOpeningJobStatus = useCallback((status: OpeningJobStatusPayload) => {
+    setData((current) => {
+      if (!current) return current;
+      if (status.status === "completed" || status.status === "failed") {
+        return {
+          ...current,
+          pendingJobs: current.pendingJobs.filter((job) => job.id !== status.jobId),
+        };
+      }
+      return {
+        ...current,
+        pendingJobs: current.pendingJobs.map((job) => job.id === status.jobId
+          ? { ...job, status: status.status }
+          : job),
+      };
+    });
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await api.logout();
@@ -75,8 +122,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   const value = useMemo(
-    () => ({ data, loading, error, authRequired, login, logout, refresh }),
-    [authRequired, data, error, loading, login, logout, refresh],
+    () => ({
+      data,
+      loading,
+      error,
+      authRequired,
+      login,
+      register,
+      logout,
+      refresh,
+      reconcileOpeningJobStatus,
+      loadMoreStories,
+    }),
+    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, refresh, register],
   );
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

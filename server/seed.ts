@@ -665,6 +665,7 @@ export function createSeedStore(): AppStore {
         createdAt: "2026-07-13T17:05:00+08:00",
       },
     ],
+      generationFailures: [],
       auditEvents: [],
       safetyDecisions: [],
       contentReports: [],

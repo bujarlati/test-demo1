@@ -1,4 +1,7 @@
 import type {
+  ReadingExperienceAxisDeliveryPolicy,
+  ReadingExperienceDeliveryLedgerEntry,
+  ReadingExperienceDeliveryObservation,
   ReadingExperienceAxisContract,
   ReadingExperienceAxisId,
   ReadingExperienceContract,
@@ -12,6 +15,7 @@ interface AxisDefinition {
   signals: [string, string, ...string[]];
   promise: string;
   forbidden: string[];
+  delivery?: Omit<ReadingExperienceAxisDeliveryPolicy, "axisId">;
 }
 
 function definition(
@@ -20,8 +24,9 @@ function definition(
   signals: [string, string, ...string[]],
   promise: string,
   forbidden: string[] = [],
+  delivery?: Omit<ReadingExperienceAxisDeliveryPolicy, "axisId">,
 ): AxisDefinition {
-  return { interpretation, kind, signals, promise, forbidden };
+  return { interpretation, kind, signals, promise, forbidden, delivery };
 }
 
 const curatedDefinitions: Record<string, AxisDefinition> = {
@@ -37,15 +42,16 @@ const curatedDefinitions: Record<string, AxisDefinition> = {
     ["把系统写成比喻或旁白形容", "默认故障、拒绝结算、奖励撤回或长期权限不足", "把系统藏到数章后才揭晓"],
   ),
   无敌: definition(
-    "主角在正面对抗中始终拥有压倒性优势，悬念来自胜利如何改变世界，而不是能否获胜",
+    "主角在关键正面对抗的最终结果中保持不败，过程可以势均力敌，主旋律来自压倒性胜利如何改变世界",
     "conflict_outcome",
     [
       "第一场有意义的对抗由主角压倒性获胜",
       "对手、旁观者或既有秩序对力量差距作出实际反应",
       "胜利带来资源、身份、声望或局势的清晰变化",
     ],
-    "主角全程不败、不五五开、不靠他人救场，也不通过封印、失忆或强行削弱拖延爽点",
-    ["隐藏实力拖延兑现", "让同级敌人长期五五开", "靠临时救援保住主角", "以封印或失忆收回能力"],
+    "主角不能形成已经落地的最终失败；压倒性胜利作为跨章主旋律持续回归",
+    ["靠临时救援保住主角", "以封印或失忆收回能力"],
+    { mode: "soft_window", targetWindowChapters: 3, targetMaxOpenConflictChapters: 1 },
   ),
   冷冽: definition("叙述判断清晰利落，环境与关系保持锋利距离", "voice", ["句式克制而有明确动作结果", "人物关系通过边界、拒绝或代价体现距离"], "每章至少有一次冷静果断的决定"),
   克制: definition("情绪通过动作、停顿和选择显露，不由旁白替人物宣布", "voice", ["关键情绪落在可观察动作上", "高潮避免连续口号和解释性煽情"], "情绪强烈时仍保持人物行为可信"),
@@ -115,6 +121,48 @@ export function isSystemInvincibleExperience(sourceWords: readonly string[]): bo
   return sourceWords.includes("系统") && sourceWords.includes("无敌");
 }
 
+function defaultAxisDeliveryPolicy(axisId: ReadingExperienceAxisId): ReadingExperienceAxisDeliveryPolicy {
+  return {
+    axisId,
+    mode: "hard_every_chapter",
+    targetWindowChapters: 1,
+    targetMaxOpenConflictChapters: 0,
+  };
+}
+
+function compiledAxisDeliveryPolicy(
+  axis: Pick<ReadingExperienceAxisContract, "id" | "word">,
+): ReadingExperienceAxisDeliveryPolicy {
+  const configured = curatedDefinitions[axis.word]?.delivery;
+  return configured
+    ? { axisId: axis.id, ...configured }
+    : defaultAxisDeliveryPolicy(axis.id);
+}
+
+export function readingExperienceAxisDeliveryPolicy(
+  contract: ReadingExperienceContract,
+  axisId: ReadingExperienceAxisId,
+): ReadingExperienceAxisDeliveryPolicy {
+  const stored = contract.delivery?.axisPolicies?.find((policy) => policy.axisId === axisId);
+  if (
+    stored &&
+    (stored.mode === "hard_every_chapter" || stored.mode === "soft_window") &&
+    Number.isInteger(stored.targetWindowChapters) && stored.targetWindowChapters > 0 &&
+    Number.isInteger(stored.targetMaxOpenConflictChapters) && stored.targetMaxOpenConflictChapters >= 0
+  ) {
+    return { ...stored };
+  }
+  const axis = contract.axes.find((candidate) => candidate.id === axisId);
+  return axis ? compiledAxisDeliveryPolicy(axis) : defaultAxisDeliveryPolicy(axisId);
+}
+
+export function readingExperienceAxisUsesSoftWindow(
+  contract: ReadingExperienceContract,
+  axisId: ReadingExperienceAxisId,
+): boolean {
+  return readingExperienceAxisDeliveryPolicy(contract, axisId).mode === "soft_window";
+}
+
 function buildAxis(word: string, id: ReadingExperienceAxisId): ReadingExperienceAxisContract {
   const known = curatedDefinitions[word];
   const definition = known ?? {
@@ -148,7 +196,11 @@ function buildAxis(word: string, id: ReadingExperienceAxisId): ReadingExperience
 
 function buildOpeningRequirements(
   axes: ReadingExperienceContract["axes"],
+  policies: ReadingExperienceAxisDeliveryPolicy[] = axes.map(compiledAxisDeliveryPolicy),
 ): ReadingExperienceContract["openingRequirements"] {
+  const hardAxes = axes.filter((axis) =>
+    policies.find((policy) => policy.axisId === axis.id)?.mode !== "soft_window",
+  );
   const firstChapterSignals = (axis: ReadingExperienceAxisContract) => {
     const modelSignal = axis.observableSignals.find((signal) => signal.id.includes("_model_signal_"));
     const baselineSignal = axis.observableSignals.find((signal) => !signal.id.includes("_model_signal_"));
@@ -159,13 +211,13 @@ function buildOpeningRequirements(
   return [
     {
       chapterOffset: 0,
-      requiredSignalIds: axes.flatMap(firstChapterSignals),
-      mustHappen: axes.map((axis) => `第一章必须直接兑现“${axis.word}”：${axis.hardPromises[0].description}`),
+      requiredSignalIds: hardAxes.flatMap(firstChapterSignals),
+      mustHappen: hardAxes.map((axis) => `第一章必须直接兑现“${axis.word}”：${axis.hardPromises[0].description}`),
     },
     {
       chapterOffset: 1,
-      requiredSignalIds: axes.map((axis) => axis.observableSignals.at(-1)!.id),
-      mustHappen: axes.map((axis) => `第二章延续并升级“${axis.word}”已经造成的状态变化`),
+      requiredSignalIds: hardAxes.map((axis) => axis.observableSignals.at(-1)!.id),
+      mustHappen: hardAxes.map((axis) => `第二章延续并升级“${axis.word}”已经造成的状态变化`),
     },
   ];
 }
@@ -183,16 +235,17 @@ export function createReadingExperienceContract(options: {
     buildAxis(sourceWords[0], "primary"),
     buildAxis(sourceWords[1], "secondary"),
   ];
+  const axisPolicies = axes.map(compiledAxisDeliveryPolicy);
   const known = sourceWords.every((word) => Boolean(curatedDefinitions[word]));
   return {
     schemaVersion: 1,
     sourceTone: options.tone?.trim() || sourceWords.join(" · "),
     sourceWords,
     axes,
-    synthesis: `“${sourceWords[0]}”与“${sourceWords[1]}”必须在同一条行动因果中同时成立，不能只兑现其中一个。`,
+    synthesis: `“${sourceWords[0]}”与“${sourceWords[1]}”作为全书长期方向共同存在，并按各自交付节奏兑现。`,
     globalHardPromises: [{
       id: "experience_both_axes",
-      description: "开篇两章和此后正文都必须以可观察事件兑现两个体验轴",
+      description: "整部故事持续保留两个体验轴，软窗口体验允许阶段性留白但不能被最终结果推翻",
       scope: "whole_story",
     }],
     forbiddenCliches: [
@@ -201,12 +254,242 @@ export function createReadingExperienceContract(options: {
       "第一章只做异常调查、逐项记录和谨慎验证",
       "用上一章、下一章、章节、角色弧或读者等作者侧概念叙述",
     ],
-    openingRequirements: buildOpeningRequirements(axes),
-    delivery: { minSignalsPerAxisPerChapter: 1, maxSilentChapters: 0, combinedSignalEveryChapters: 1 },
+    openingRequirements: buildOpeningRequirements(axes, axisPolicies),
+    delivery: { minSignalsPerAxisPerChapter: 1, maxSilentChapters: 0, combinedSignalEveryChapters: 1, axisPolicies },
     effectiveFromChapter: options.effectiveFromChapter ?? 1,
     provenance: options.provenance ?? (known ? "curated" : "fallback"),
     createdAt,
   };
+}
+
+export function normalizeReadingExperienceContract(
+  contract: ReadingExperienceContract,
+): ReadingExperienceContract {
+  const axisPolicies = contract.axes.map((axis) => {
+    const configured = curatedDefinitions[axis.word]?.delivery;
+    return configured
+      ? { axisId: axis.id, ...configured }
+      : readingExperienceAxisDeliveryPolicy(contract, axis.id);
+  });
+  const policyByAxis = new Map(axisPolicies.map((policy) => [policy.axisId, policy]));
+  const axes = contract.axes.map((axis) => {
+    const policy = policyByAxis.get(axis.id);
+    if (policy?.mode !== "soft_window") return { ...axis };
+    const curated = curatedDefinitions[axis.word];
+    return {
+      ...axis,
+      hardPromises: [{
+        id: axis.hardPromises[0]?.id ?? `${axis.id}_${axis.word}_promise_1`,
+        description: curated?.promise ?? "该体验不能被已经落地的最终结果推翻",
+        scope: "every_chapter" as const,
+      }],
+      forbiddenShortcuts: axis.forbiddenShortcuts.filter((shortcut) =>
+        !/(?:五五开|势均力敌|不分胜负)/.test(shortcut),
+      ),
+    };
+  }) as ReadingExperienceContract["axes"];
+  const hasSoftWindow = axisPolicies.some((policy) => policy.mode === "soft_window");
+  return {
+    ...contract,
+    axes,
+    synthesis: hasSoftWindow
+      ? `“${axes[0].word}”与“${axes[1].word}”作为全书长期方向共同存在，并按各自交付节奏兑现。`
+      : contract.synthesis,
+    globalHardPromises: hasSoftWindow
+      ? [{
+          id: "experience_both_axes",
+          description: "整部故事持续保留两个体验轴，软窗口体验允许阶段性留白但不能被最终结果推翻",
+          scope: "whole_story",
+        }]
+      : contract.globalHardPromises,
+    openingRequirements: buildOpeningRequirements(axes, axisPolicies),
+    delivery: {
+      minSignalsPerAxisPerChapter: contract.delivery?.minSignalsPerAxisPerChapter ?? 1,
+      maxSilentChapters: contract.delivery?.maxSilentChapters ?? 0,
+      combinedSignalEveryChapters: contract.delivery?.combinedSignalEveryChapters ?? 1,
+      axisPolicies,
+    },
+  };
+}
+export interface ReadingExperienceCadenceState {
+  axisId: ReadingExperienceAxisId;
+  word: string;
+  status: "normal" | "due" | "debt";
+  silentChapters: number;
+  targetWindowChapters: number;
+  openConflictChapters: number;
+  debtOpen: boolean;
+}
+
+function softWindowAxes(contract: ReadingExperienceContract) {
+  return contract.axes.filter((axis) => readingExperienceAxisUsesSoftWindow(contract, axis.id));
+}
+
+export function normalizeReadingExperienceDeliveryLedger(
+  contract: ReadingExperienceContract,
+  ledger: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  currentChapterNumber: number,
+): ReadingExperienceDeliveryLedgerEntry[] {
+  const baselineChapter = Math.max(0, Math.floor(currentChapterNumber));
+  return softWindowAxes(contract).map((axis) => {
+    const stored = ledger?.find((entry) => entry.axisId === axis.id);
+    const storedLastEvaluated = stored && Number.isInteger(stored.lastEvaluatedChapter)
+      ? Math.max(0, stored.lastEvaluatedChapter)
+      : baselineChapter;
+    const lastEvaluatedChapter = Math.max(storedLastEvaluated, baselineChapter);
+    const lastDeliveredChapter = stored && Number.isInteger(stored.lastDeliveredChapter) &&
+      stored.lastDeliveredChapter! >= 0 &&
+      stored.lastDeliveredChapter! <= lastEvaluatedChapter
+      ? stored.lastDeliveredChapter
+      : undefined;
+    const openConflictSinceChapter = stored && Number.isInteger(stored.openConflictSinceChapter) &&
+      stored.openConflictSinceChapter! >= 0 &&
+      stored.openConflictSinceChapter! <= lastEvaluatedChapter
+      ? stored.openConflictSinceChapter
+      : undefined;
+    return {
+      axisId: axis.id,
+      lastEvaluatedChapter,
+      ...(lastDeliveredChapter === undefined ? {} : { lastDeliveredChapter }),
+      silentChapters: stored && Number.isInteger(stored.silentChapters)
+        ? Math.max(0, stored.silentChapters)
+        : 0,
+      debtOpen: Boolean(stored?.debtOpen),
+      ...(openConflictSinceChapter === undefined ? {} : { openConflictSinceChapter }),
+    };
+  });
+}
+
+export function updateReadingExperienceDeliveryLedger(
+  contract: ReadingExperienceContract,
+  ledger: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  chapterNumber: number,
+  observations: ReadingExperienceDeliveryObservation[] | undefined,
+): ReadingExperienceDeliveryLedgerEntry[] {
+  const safeChapterNumber = Math.max(1, Math.floor(chapterNumber));
+  const normalized = normalizeReadingExperienceDeliveryLedger(contract, ledger, safeChapterNumber - 1);
+  return normalized.map((entry) => {
+    if (entry.lastEvaluatedChapter >= safeChapterNumber) return { ...entry };
+    const policy = readingExperienceAxisDeliveryPolicy(contract, entry.axisId);
+    const observation = observations?.find((candidate) => candidate.axisId === entry.axisId);
+    const state = observation?.state ?? "no_conflict";
+    if (state === "dominant_victory") {
+      return {
+        axisId: entry.axisId,
+        lastEvaluatedChapter: safeChapterNumber,
+        lastDeliveredChapter: safeChapterNumber,
+        silentChapters: 0,
+        debtOpen: false,
+      };
+    }
+
+    const silentChapters = entry.silentChapters + (safeChapterNumber - entry.lastEvaluatedChapter);
+    const openConflictSinceChapter = state === "open_parity"
+      ? entry.openConflictSinceChapter ?? safeChapterNumber
+      : entry.openConflictSinceChapter;
+    return {
+      ...entry,
+      lastEvaluatedChapter: safeChapterNumber,
+      silentChapters,
+      debtOpen: silentChapters >= policy.targetWindowChapters,
+      ...(openConflictSinceChapter === undefined ? {} : { openConflictSinceChapter }),
+    };
+  });
+}
+export type ReadingExperienceCadenceAuditCode =
+  | "experience_cadence_silent"
+  | "experience_debt_opened"
+  | "open_conflict_carried";
+
+export interface ReadingExperienceCadenceAuditEvent {
+  code: ReadingExperienceCadenceAuditCode;
+  axisId: ReadingExperienceAxisId;
+  state: ReadingExperienceDeliveryObservation["state"];
+  silentChapters: number;
+  debtOpen: boolean;
+  lastDeliveredChapter?: number;
+}
+
+export function readingExperienceCadenceAuditEvents(
+  contract: ReadingExperienceContract,
+  before: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  after: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  observations: ReadingExperienceDeliveryObservation[] | undefined,
+): ReadingExperienceCadenceAuditEvent[] {
+  const priorByAxis = new Map((before ?? []).map((entry) => [entry.axisId, entry]));
+  const afterByAxis = new Map((after ?? []).map((entry) => [entry.axisId, entry]));
+  const events: ReadingExperienceCadenceAuditEvent[] = [];
+  for (const axis of softWindowAxes(contract)) {
+    const entry = afterByAxis.get(axis.id);
+    if (!entry) continue;
+    const state = observations?.find((observation) => observation.axisId === axis.id)?.state ?? "no_conflict";
+    const eventBase = {
+      axisId: axis.id,
+      state,
+      silentChapters: entry.silentChapters,
+      debtOpen: entry.debtOpen,
+      ...(entry.lastDeliveredChapter === undefined ? {} : { lastDeliveredChapter: entry.lastDeliveredChapter }),
+    };
+    if (state === "open_parity") {
+      events.push({ code: "open_conflict_carried", ...eventBase });
+    } else if (state === "no_conflict") {
+      events.push({ code: "experience_cadence_silent", ...eventBase });
+    }
+    if (!priorByAxis.get(axis.id)?.debtOpen && entry.debtOpen) {
+      events.push({ code: "experience_debt_opened", ...eventBase });
+    }
+  }
+  return events;
+}
+
+
+export function readingExperienceCadenceState(
+  contract: ReadingExperienceContract,
+  ledger: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  nextChapterNumber: number,
+): ReadingExperienceCadenceState[] {
+  const safeNextChapter = Math.max(1, Math.floor(nextChapterNumber));
+  const normalized = normalizeReadingExperienceDeliveryLedger(contract, ledger, safeNextChapter - 1);
+  return normalized.map((entry) => {
+    const axis = contract.axes.find((candidate) => candidate.id === entry.axisId)!;
+    const policy = readingExperienceAxisDeliveryPolicy(contract, entry.axisId);
+    const openConflictChapters = entry.openConflictSinceChapter === undefined
+      ? 0
+      : Math.max(0, safeNextChapter - entry.openConflictSinceChapter);
+    const due = entry.silentChapters >= Math.max(0, policy.targetWindowChapters - 1) ||
+      (entry.openConflictSinceChapter !== undefined &&
+        openConflictChapters >= policy.targetMaxOpenConflictChapters);
+    return {
+      axisId: entry.axisId,
+      word: axis.word,
+      status: entry.debtOpen ? "debt" : due ? "due" : "normal",
+      silentChapters: entry.silentChapters,
+      targetWindowChapters: policy.targetWindowChapters,
+      openConflictChapters,
+      debtOpen: entry.debtOpen,
+    };
+  });
+}
+
+export function formatReadingExperienceCadenceForPrompt(
+  contract: ReadingExperienceContract,
+  ledger: ReadingExperienceDeliveryLedgerEntry[] | undefined,
+  nextChapterNumber: number,
+): string {
+  const states = readingExperienceCadenceState(contract, ledger, nextChapterNumber);
+  if (states.length === 0) return "";
+  return states.map((state) => {
+    if (state.status === "debt") {
+      return `“${state.word}”体验债务已打开：已经连续 ${state.silentChapters} 章没有压倒性胜利。本章规划应优先安排主角完成决定性胜利并改变现实状态；这是强规划优先级，仍不是发布门禁，不能仅因本章未胜而拒绝或重写正文。`;
+    }
+    if (state.status === "due") {
+      const parity = state.openConflictChapters > 0
+        ? `，且未决对抗已延续 ${state.openConflictChapters} 章`
+        : "";
+      return `“${state.word}”进入优先兑现期：已经连续 ${state.silentChapters} 章没有压倒性胜利${parity}。本章候选优先通过系统任务、能力兑现或局势反转形成决定性胜利；这是软性节奏目标，不是逐章校验条件。`;
+    }
+    return `“${state.word}”处于正常节奏：目标约每 ${state.targetWindowChapters} 章出现一次压倒性胜利；本章可铺垫、暂时五五开或保持冲突未决。`;
+  }).join("\n");
 }
 
 export function createLegacyExperienceContract(options: {
@@ -447,21 +730,24 @@ export function refineReadingExperienceContract(
       ])).slice(0, 8),
     };
   }) as ReadingExperienceContract["axes"];
-  return {
+  return normalizeReadingExperienceContract({
     ...base,
     axes,
     synthesis: `“${axes[0].word}”和“${axes[1].word}”必须由同一条人物行动与冲突结果共同兑现。`,
     openingRequirements: buildOpeningRequirements(axes),
     provenance: "model",
-  };
+  });
 }
 
 export function formatReadingExperienceForPrompt(contract: ReadingExperienceContract, chapterNumber: number): string {
-  const openingOffset = chapterNumber - contract.effectiveFromChapter;
-  const opening = contract.openingRequirements.find((requirement) => requirement.chapterOffset === openingOffset);
+  const normalized = normalizeReadingExperienceContract(contract);
+  const openingOffset = chapterNumber - normalized.effectiveFromChapter;
+  const opening = normalized.openingRequirements.find((requirement) => requirement.chapterOffset === openingOffset);
+  const hardAxes = normalized.axes.filter((axis) => !readingExperienceAxisUsesSoftWindow(normalized, axis.id));
   return [
-    `阅读体验硬契约：${contract.synthesis}`,
-    ...contract.axes.map((axis) => {
+    `阅读体验总方向：${normalized.synthesis}`,
+    ...normalized.axes.map((axis) => {
+      const policy = readingExperienceAxisDeliveryPolicy(normalized, axis.id);
       const formattedSignals = axis.observableSignals.map((signal) => {
         const evidenceAnchors = signal.evidenceAnchors?.length
           ? signal.evidenceAnchors
@@ -473,15 +759,21 @@ export function formatReadingExperienceForPrompt(contract: ReadingExperienceCont
       return [
         `体验轴“${axis.word}”：${axis.interpretation}`,
         `可观察信号：${formattedSignals.join("；")}`,
-        `硬承诺：${axis.hardPromises.map((promise) => promise.description).join("；")}`,
+        policy.mode === "soft_window"
+          ? `主旋律节奏目标：约每 ${policy.targetWindowChapters} 章出现一次压倒性胜利；本章允许铺垫、暂时五五开或冲突未决，只要不形成主角已经落地的最终失败。缺少本章胜利不会触发拒绝或重写。`
+          : `硬承诺：${axis.hardPromises.map((promise) => promise.description).join("；")}`,
         axis.observableSignals.some((signal) => signal.id.includes("_model_signal_"))
           ? `语义证据：正文不必出现“${axis.word}”这个词，也不要求逐字复制参考短语；须用人物、动作、对象、结果或感官变化自然兑现信号，由审稿模型按大意判断，并从正文逐字引用证据。禁止贴标签或拼到景物描写上。`
           : "",
         `禁止捷径：${axis.forbiddenShortcuts.join("；") || "无"}`,
       ].join("\n");
     }),
-    opening ? `本章开篇兑现要求：${opening.mustHappen.join("；")}；必须覆盖信号 ${opening.requiredSignalIds.join("、")}` : "本章要求：两个体验轴各至少出现一个可观察信号。",
-    `通用禁忌：${contract.forbiddenCliches.join("；")}`,
+    opening && opening.requiredSignalIds.length
+      ? `本章开篇硬性兑现要求：${opening.mustHappen.join("；")}；必须覆盖信号 ${opening.requiredSignalIds.join("、")}`
+      : hardAxes.length
+        ? `本章硬性要求：${hardAxes.map((axis) => `“${axis.word}”至少出现一个可观察信号`).join("；")}。软窗口体验按跨章节奏推进。`
+        : "本章体验轴均按跨章节奏推进，不要求逐章同时兑现。",
+    `通用禁忌：${normalized.forbiddenCliches.join("；")}`,
     `这些是后台约束。${IMMERSIVE_NARRATION_PROMPT}`,
   ].join("\n");
 }

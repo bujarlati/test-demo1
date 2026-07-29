@@ -4,15 +4,15 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
-import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, OpenAIEmbeddingApi, ReadingExperienceContract, ReadingExperienceEvidence, Story } from "../src/types";
+import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, OpenAIEmbeddingApi, ReadingExperienceContract, ReadingExperienceDeliveryObservation, ReadingExperienceEvidence, Story } from "../src/types";
 import {
-  assertImmersiveNarration,
   assertPersistentExperienceFacts,
   assertReadingExperienceContent,
   assertReadingExperienceEvidence,
   assertReadingExperienceNegativeInvariants,
   contentContainsSourceQuote,
   groundReadingExperienceEvidence,
+  normalizeChapterEditorialIssues,
   storyArcPhase,
   type CandidateDraft,
   type ExtractedChapterState,
@@ -22,13 +22,27 @@ import {
 import type { GeneratedStoryOpening, OpeningGenerationContext } from "./openingService";
 import {
   formatReadingExperienceForPrompt,
+  formatReadingExperienceCadenceForPrompt,
+  readingExperienceAxisUsesSoftWindow,
   refineReadingExperienceContract,
   type ModelExperienceAxisDraft,
 } from "./readingExperience";
-import { IMMERSIVE_NARRATION_PROMPT, normalizeChapterTitle } from "./narrationPolicy";
 import {
-  OPENING_CHAPTER_MAX_CHARACTERS,
+  assertOpeningNarrationStructure,
+  detectNarrationCandidates,
+  IMMERSIVE_NARRATION_PROMPT,
+  narrationArtifactHash,
+  normalizeChapterTitle,
+  type NarrationCandidate,
+} from "./narrationPolicy";
+import {
+  narrationReviewerInstruction,
+  resolveNarrationAssessments,
+  type NarrationReviewResolution,
+} from "./narrationReview";
+import {
   OPENING_CHAPTER_MIN_CHARACTERS,
+  OPENING_CHAPTER_TARGET_CHARACTERS,
   openingChapterCharacterCount,
   openingChapterLengthIsAllowed,
 } from "./openingConstraints";
@@ -50,7 +64,7 @@ const GENERATION_STAGE_TIMEOUT_MS = {
   writer: 300_000,
   reviewer: 120_000,
 } as const;
-const chapterWriterInstruction = `你是原创中文长篇连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。必须同时满足用户提示中的中文字符区间与目标段落数；每段包含完整场景动作、感官细节或人物反应，不能用短句凑段。${IMMERSIVE_NARRATION_PROMPT}`;
+const chapterWriterInstruction = `你是原创中文长篇连载小说作家。只返回 JSON：{\"title\":\"章节名\",\"paragraphs\":[\"段落\"]}。用户提示中的目标字数与目标段落数是写作建议，可以为了完整表达自然超出；只把明确标出的最低字数当作长度门槛，不要为了贴合建议值删减必要情节。每段包含完整场景动作、感官细节或人物反应，不能用短句凑段。${IMMERSIVE_NARRATION_PROMPT}`;
 
 function chapterWriterSystemPrompt(streaming: boolean) {
   return `${chapterWriterInstruction}${streaming ? "先给 title，再按顺序给 paragraphs；不要在 JSON 外输出文字。" : "用人物行动和冲突结果兑现体验，保持沉浸。"}`;
@@ -653,6 +667,7 @@ export interface CompleteJsonDependencies {
   secretReader?: typeof readSecret;
   modelFetcher?: CompletionModelFetcher;
   retryDelay?: (milliseconds: number) => Promise<void>;
+  overallTimeoutMs?: number;
   remainingTokens?: number;
   stage?: string;
   now?: () => number;
@@ -667,7 +682,7 @@ export type JsonModelCompleter = <T>(
   prompt: string,
   timeout?: number,
   maxTokens?: number,
-  dependencies?: Pick<CompleteJsonDependencies, "remainingTokens" | "stage" | "validateJson">,
+  dependencies?: Pick<CompleteJsonDependencies, "overallTimeoutMs" | "remainingTokens" | "stage" | "validateJson">,
 ) => Promise<{ value: T; usageTokens: number; usageEstimated: boolean }>;
 
 function estimatedCompletionFailureTokens(system: string, prompt: string, maxTokens: number): number {
@@ -886,9 +901,11 @@ export async function completeJson<T>(
     return body;
   };
   const maximumAttempts = 3;
-  const logicalOverallTimeout = streamStructuredResponse
-    ? streamedCompletionOverallTimeout(timeout, maxTokens)
-    : timeout;
+  const logicalOverallTimeout = dependencies.overallTimeoutMs === undefined
+    ? streamStructuredResponse
+      ? streamedCompletionOverallTimeout(timeout, maxTokens)
+      : timeout
+    : Math.max(timeout, dependencies.overallTimeoutMs);
   const deadlineAt = now() + logicalOverallTimeout;
   const retryTokenBudget = dependencies.remainingTokens ?? Number.POSITIVE_INFINITY;
   const retryStage = dependencies.stage ?? `模型 ${model}`;
@@ -1170,6 +1187,8 @@ export async function completeJson<T>(
   );
 }
 
+const OPENING_PLANNER_OVERALL_TIMEOUT_MS = 600_000;
+
 export interface OpeningCompletionRequest {
   connection: ModelConnection;
   model: string;
@@ -1177,6 +1196,7 @@ export interface OpeningCompletionRequest {
   prompt: string;
   timeout: number;
   maxTokens: number;
+  overallTimeoutMs?: number;
   remainingTokens: number;
   stage: string;
   validateJson?: (value: unknown) => string[];
@@ -1186,6 +1206,16 @@ export type OpeningModelCompleter = (
   request: OpeningCompletionRequest,
 ) => Promise<{ value: unknown; usageTokens: number; usageEstimated: boolean }>;
 
+export interface OpeningGenerationFailure {
+  stage: string;
+  attempt: number;
+  error: unknown;
+}
+
+export type OpeningFailureObserver = (
+  failure: OpeningGenerationFailure,
+) => void | Promise<void>;
+
 const defaultOpeningCompleter: OpeningModelCompleter = async (request) => completeJson<unknown>(
   request.connection,
   request.model,
@@ -1194,13 +1224,14 @@ const defaultOpeningCompleter: OpeningModelCompleter = async (request) => comple
   request.timeout,
   request.maxTokens,
   {
+    overallTimeoutMs: request.overallTimeoutMs,
     remainingTokens: request.remainingTokens,
     stage: request.stage,
     validateJson: request.validateJson,
   },
 );
 
-interface OpeningPlanPayload {
+export interface OpeningPlanPayload {
   title?: string;
   subtitle?: string;
   leadName?: string;
@@ -1219,6 +1250,125 @@ interface OpeningWriterPayload {
 interface OpeningReviewPayload {
   experienceEvidence?: ReadingExperienceEvidence[];
   event?: GeneratedStoryOpening["event"];
+  narrationAssessments?: unknown;
+}
+export interface NarrationPermit {
+  version: 1;
+  contentHash: string;
+  candidateIds: string[];
+  decision: "semantic_allow" | "user_keep";
+  attempt: number;
+}
+
+export interface OpeningNarrationReviewTrace {
+  contentHash: string;
+  candidates: NarrationCandidate[];
+  resolution: NarrationReviewResolution;
+  attempt: number;
+  rewriteCount: number;
+}
+
+export function openingNarrationReviewsFromError(
+  error: unknown,
+): OpeningNarrationReviewTrace[] {
+  if (!error || typeof error !== "object" || !("openingNarrationReviews" in error)) return [];
+  const reviews = (error as { openingNarrationReviews?: unknown }).openingNarrationReviews;
+  return Array.isArray(reviews)
+    ? structuredClone(reviews as OpeningNarrationReviewTrace[])
+    : [];
+}
+
+function attachOpeningNarrationReviews(
+  error: unknown,
+  reviews: readonly OpeningNarrationReviewTrace[],
+): unknown {
+  if (error && typeof error === "object") {
+    Object.assign(error, { openingNarrationReviews: structuredClone(reviews) });
+  }
+  return error;
+}
+
+export interface PendingNarrationReviewDraft {
+  contentHash: string;
+  candidates: NarrationCandidate[];
+  allCandidateIds: string[];
+  resolution: NarrationReviewResolution;
+  attempt: number;
+  rewriteCount: number;
+  baseReviewStatus: "valid" | "unavailable";
+}
+
+export interface OpeningDraftCheckpoint {
+  title: string;
+  paragraphs: string[];
+  writerUsageTokens: number;
+  writerUsageEstimated: boolean;
+}
+
+export interface OpeningGenerationCheckpoint {
+  version: 1;
+  context: OpeningGenerationContext;
+  plan: Required<OpeningPlanPayload>;
+  connectionBinding: {
+    id: string;
+    updatedAt: string;
+    routes: ModelConnection["routes"];
+  };
+  attempt: number;
+  rewriteCount: number;
+  reviewerResumeCount: number;
+  accumulatedTokens: number;
+  usageEstimated: boolean;
+  tokenBudget: number;
+  draft: OpeningDraftCheckpoint;
+  generated: GeneratedStoryOpening | null;
+  reviewTrace?: OpeningNarrationReviewTrace[];
+  review: PendingNarrationReviewDraft;
+}
+
+export type OpeningGenerationOutcome =
+  | {
+      status: "completed";
+      generated: GeneratedStoryOpening;
+      narrationPermit: NarrationPermit;
+      narrationReviews?: OpeningNarrationReviewTrace[];
+    }
+  | {
+      status: "awaiting_user_review";
+      checkpoint: OpeningGenerationCheckpoint;
+      review: PendingNarrationReviewDraft;
+    };
+
+export type NarrationReviewAction =
+  | {
+      kind: "keep";
+      candidateIds: string[];
+      contentHash: string;
+    }
+  | {
+      kind: "rewrite";
+      source: "user" | "timeout";
+    };
+
+interface OpeningWorkflowControl {
+  pauseOnAskUser?: boolean;
+  initialUsageTokens?: number;
+  initialUsageEstimated?: boolean;
+  startingWriterAttempt?: 1 | 2;
+  initialFailureMessage?: string;
+  chapterWriterUsageOverride?: {
+    usageTokens: number;
+    usageEstimated: boolean;
+  };
+  reviewerResumeCount?: number;
+  onNarrationPermit?: (permit: NarrationPermit) => void;
+  initialNarrationReviews?: OpeningNarrationReviewTrace[];
+  onNarrationReview?: (review: OpeningNarrationReviewTrace) => void;
+}
+
+interface OpeningNarrationPauseDetails {
+  checkpoint: OpeningGenerationCheckpoint;
+  review: PendingNarrationReviewDraft;
 }
 
 const openingPlanJsonExample = JSON.stringify({
@@ -1280,11 +1430,6 @@ const openingReviewJsonExample = JSON.stringify({
     word: "第一个体验词",
     signalIds: ["契约中真实命中的信号 ID"],
     quote: "从正文逐字复制的连续原句证据",
-  }, {
-    axisId: "secondary",
-    word: "第二个体验词",
-    signalIds: ["契约中真实命中的信号 ID"],
-    quote: "另一条从正文逐字复制的连续原句证据",
   }],
   event: {
     title: "正文事件名称",
@@ -1501,8 +1646,8 @@ function hasOpeningPlanShape(value: unknown): value is Required<OpeningPlanPaylo
 function openingReviewValidationIssues(value: unknown): string[] {
   if (!isOpeningPlanRecord(value)) return ["审稿根节点必须是 JSON 对象"];
   const issues: string[] = [];
-  if (!Array.isArray(value.experienceEvidence) || value.experienceEvidence.length !== 2) {
-    issues.push("experienceEvidence 必须是严格对应两个体验轴的 2 项数组");
+  if (!Array.isArray(value.experienceEvidence) || value.experienceEvidence.length > 2) {
+    issues.push("experienceEvidence 必须是仅包含实际硬性交付轴证据的 0—2 项数组");
   } else {
     value.experienceEvidence.forEach((entry, index) => {
       if (!isOpeningPlanRecord(entry)) {
@@ -1545,7 +1690,7 @@ function openingReviewValidationIssues(value: unknown): string[] {
 }
 
 function isOpeningReviewEvidence(value: unknown): boolean {
-  return Array.isArray(value) && value.length === 2 && value.every((entry) =>
+  return Array.isArray(value) && value.length <= 2 && value.every((entry) =>
     isOpeningPlanRecord(entry) &&
     isOpeningNonEmptyString(entry.axisId) &&
     isOpeningNonEmptyString(entry.word) &&
@@ -1566,6 +1711,9 @@ function mergeOpeningReviewSchemaRepair(original: unknown, proposal: unknown): u
     experienceEvidence: isOpeningReviewEvidence(original.experienceEvidence)
       ? original.experienceEvidence
       : proposal.experienceEvidence,
+    narrationAssessments: "narrationAssessments" in original
+      ? original.narrationAssessments
+      : proposal.narrationAssessments,
     event: {
       title: chooseEventString("title"),
       cause: chooseEventString("cause"),
@@ -1589,8 +1737,8 @@ function openingWriterValidationIssues(value: unknown): string[] {
   if (!Array.isArray(value.paragraphs)) {
     issues.push("paragraphs 必须是数组");
   } else {
-    if (value.paragraphs.length < 16 || value.paragraphs.length > 20) {
-      issues.push("paragraphs 必须包含 16—20 个完整段落");
+    if (value.paragraphs.length < 4) {
+      issues.push("paragraphs 必须至少包含 4 个完整段落");
     }
     value.paragraphs.forEach((paragraph, index) => {
       if (typeof paragraph !== "string" || !paragraph.trim()) {
@@ -1601,21 +1749,146 @@ function openingWriterValidationIssues(value: unknown): string[] {
   return issues;
 }
 
+function narrationCandidateIds(candidates: readonly NarrationCandidate[]): string[] {
+  return candidates.map((candidate) => candidate.id);
+}
+
+function sameCandidateIds(actual: readonly string[], expected: readonly string[]): boolean {
+  if (actual.length !== expected.length) return false;
+  const left = [...actual].sort();
+  const right = [...expected].sort();
+  return left.every((value, index) => value === right[index]);
+}
+
+function issueNarrationPermit(
+  contentHash: string,
+  candidates: readonly NarrationCandidate[],
+  decision: NarrationPermit["decision"],
+  attempt: number,
+): NarrationPermit {
+  return {
+    version: 1,
+    contentHash,
+    candidateIds: narrationCandidateIds(candidates),
+    decision,
+    attempt,
+  };
+}
+
+function openingNarrationPauseError(
+  details: OpeningNarrationPauseDetails,
+): Error {
+  return attachModelUsage(
+    Object.assign(new Error("Opening narration review is awaiting user input."), {
+      code: "narration_review_pending",
+      openingNarrationPause: details,
+    }),
+    details.checkpoint.accumulatedTokens,
+    details.checkpoint.usageEstimated,
+  );
+}
+
+function openingNarrationPauseDetails(error: unknown): OpeningNarrationPauseDetails | null {
+  if (!error || typeof error !== "object") return null;
+  const details = (error as { openingNarrationPause?: unknown }).openingNarrationPause;
+  if (!details || typeof details !== "object") return null;
+  const candidate = details as OpeningNarrationPauseDetails;
+  return candidate.checkpoint?.version === 1 ? candidate : null;
+}
+
+function invalidOpeningCheckpoint(
+  checkpoint: OpeningGenerationCheckpoint,
+): never {
+  throw attachModelUsage(
+    Object.assign(new Error("Opening narration review checkpoint is invalid."), {
+      code: "narration_review_checkpoint_invalid",
+    }),
+    checkpoint.accumulatedTokens,
+    checkpoint.usageEstimated,
+  );
+}
+
+function assertOpeningCheckpoint(
+  checkpoint: OpeningGenerationCheckpoint,
+  connection: ModelConnection,
+): NarrationCandidate[] {
+  if (
+    checkpoint.version !== 1 ||
+    checkpoint.attempt < 1 ||
+    checkpoint.attempt > 2 ||
+    checkpoint.rewriteCount !== checkpoint.attempt - 1 ||
+    checkpoint.accumulatedTokens < 0 ||
+    checkpoint.tokenBudget <= 0 ||
+    checkpoint.connectionBinding.id !== connection.id ||
+    checkpoint.connectionBinding.updatedAt !== connection.updatedAt ||
+    checkpoint.connectionBinding.routes.planner !== connection.routes.planner ||
+    checkpoint.connectionBinding.routes.writer !== connection.routes.writer ||
+    checkpoint.connectionBinding.routes.extractor !== connection.routes.extractor ||
+    checkpoint.connectionBinding.routes.embedding !== connection.routes.embedding
+  ) {
+    invalidOpeningCheckpoint(checkpoint);
+  }
+  const contentHash = narrationArtifactHash(
+    checkpoint.draft.title,
+    checkpoint.draft.paragraphs,
+  );
+  const content = checkpoint.draft.paragraphs.join("\n");
+  const candidates = [
+    ...detectNarrationCandidates("title", checkpoint.draft.title, contentHash),
+    ...detectNarrationCandidates("body", content, contentHash),
+  ];
+  if (
+    contentHash !== checkpoint.review.contentHash ||
+    checkpoint.review.attempt !== checkpoint.attempt ||
+    checkpoint.review.rewriteCount !== checkpoint.rewriteCount ||
+    !sameCandidateIds(narrationCandidateIds(candidates), checkpoint.review.allCandidateIds) ||
+    !checkpoint.review.candidates.every((candidate) =>
+      checkpoint.review.allCandidateIds.includes(candidate.id)
+    ) ||
+    checkpoint.review.candidates.length === 0 ||
+    (checkpoint.review.baseReviewStatus === "valid" && checkpoint.generated === null) ||
+    (checkpoint.review.baseReviewStatus === "unavailable" && checkpoint.generated !== null)
+  ) {
+    invalidOpeningCheckpoint(checkpoint);
+  }
+  if (checkpoint.generated) {
+    const generatedHash = narrationArtifactHash(
+      normalizeChapterTitle(checkpoint.generated.chapter.title),
+      checkpoint.generated.chapter.paragraphs,
+    );
+    if (
+      generatedHash !== contentHash ||
+      checkpoint.generated.usageTokens !== checkpoint.accumulatedTokens
+    ) {
+      invalidOpeningCheckpoint(checkpoint);
+    }
+  }
+  return candidates;
+}
 export async function generateStoryOpeningWithConnection(
   context: OpeningGenerationContext,
   connection: ModelConnection,
   complete: OpeningModelCompleter = defaultOpeningCompleter,
   tokenBudget = OPENING_JOB_TOKEN_BUDGET,
+  failureObserver?: OpeningFailureObserver,
+  workflowControl: OpeningWorkflowControl = {},
 ): Promise<GeneratedStoryOpening> {
+  const observeFailure = async (failure: OpeningGenerationFailure) => {
+    try {
+      await failureObserver?.(failure);
+    } catch (error) {
+      console.error(`[FAILURE-OBSERVATION] 记录开篇失败观测失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const plannerRequest: OpeningCompletionRequest = {
     connection,
     model: connection.routes.planner,
     system: [
       "你是原创中文网文总规划师，只返回 JSON。",
       "把用户给出的两个阅读体验词解释为人物行动、机制、冲突结果、世界反应和语言节奏上的可观察承诺；不得把词语直接贴到景物描写上。",
-      "开篇必须先发生具体事件：前 200 字给出主角处境、触发事件和第一个行动；第一章内兑现两个体验，不得承诺以后再写。",
+      "开篇必须先发生具体事件：前 200 字给出主角处境、触发事件和第一个行动；第一章内兑现所有硬性交付体验，软窗口体验只需保持长期方向且不能被最终结果推翻。",
       "不要模仿或点名任何在世作者；使用成熟网文的目标清晰、回报及时、冲突有效和章末推动力等通用技巧。",
-      "若体验词包含“系统”，任何蓝图字段都不得把系统故障、拒绝结算、撤回奖励、冻结权限或不可使用当作代价与边界；若包含“无敌”，不得安排封印、削弱、失去力量、势均力敌、落败或他人救场。持续代价必须来自胜利后的世界、资源或关系变化，不能收回核心体验。",
+      "若体验词包含“系统”，任何蓝图字段都不得把系统故障、拒绝结算、撤回奖励、冻结权限或不可使用当作代价与边界；若包含“无敌”，不得安排已经落地的最终落败、他人救场、永久封印或能力移除，但允许暂时受压、势均力敌与冲突未决。持续代价来自力量与既有状态带来的世界、资源或关系变化，不能收回核心体验。",
       "严格按下面的 JSON 结构返回，禁止增加外层包装。storyGene、endingContract、worldBible 必须是 JSON 对象，不能写成字符串；openingBeats 必须是字符串数组，不能写成对象数组。",
       "下面各字段中的文字只说明数据形状，不是故事内容；必须根据题材、灵感和两个体验词全部改写，禁止照抄示例语句。",
       openingPlanJsonExample,
@@ -1631,6 +1904,7 @@ export async function generateStoryOpeningWithConnection(
     ].join("\n"),
     timeout: GENERATION_STAGE_TIMEOUT_MS.planner,
     maxTokens: 2_600,
+    overallTimeoutMs: OPENING_PLANNER_OVERALL_TIMEOUT_MS,
     remainingTokens: tokenBudget,
     stage: "开篇规划",
     validateJson: openingPlanValidationIssues,
@@ -1643,8 +1917,8 @@ export async function generateStoryOpeningWithConnection(
     stage: "开篇规划",
   });
   const planner = await complete(plannerRequest);
-  let accumulatedTokens = planner.usageTokens;
-  let usageEstimated = planner.usageEstimated;
+  let accumulatedTokens = (workflowControl.initialUsageTokens ?? 0) + planner.usageTokens;
+  let usageEstimated = (workflowControl.initialUsageEstimated ?? false) || planner.usageEstimated;
   let planValue = planner.value;
   let planIssues = openingPlanValidationIssues(planValue);
   let schemaPlanRepairCount = 0;
@@ -1660,7 +1934,7 @@ export async function generateStoryOpeningWithConnection(
       system: [
         "你是开篇蓝图 JSON 结构修复与硬契约校正器，只返回修复后的 JSON。",
         "保留原蓝图的书名、人物、机制、事件与体验承诺，只修复指定问题并补齐必填字段；不要写小说正文，不要解释，不要增加外层包装。",
-        "若体验词包含“系统”，删除系统故障、拒绝结算、撤回奖励、冻结权限或不可使用等削弱设定；若包含“无敌”，删除封印、削弱、失去力量、势均力敌、落败或他人救场等冲突。把代价改为胜利后的世界、资源或关系后果，绝不收回核心体验。",
+        "若体验词包含“系统”，删除系统故障、拒绝结算、撤回奖励、冻结权限或不可使用等削弱设定；若包含“无敌”，只删除已经落地的最终落败、他人救场、永久封印或能力移除，保留暂时受压、势均力敌与冲突未决。把代价改为力量与既有状态带来的世界、资源或关系后果，绝不收回核心体验。",
         "storyGene、endingContract、worldBible 必须是 JSON 对象，openingBeats 必须是字符串数组。严格采用以下结构：",
         openingPlanJsonExample,
       ].join("\n"),
@@ -1724,6 +1998,11 @@ export async function generateStoryOpeningWithConnection(
           usageEstimated,
         );
       }
+      await observeFailure({
+        stage: "开篇蓝图结构校验",
+        attempt: schemaPlanRepairCount + 1,
+        error: new Error(`规划模型输出未通过开篇蓝图 Schema 校验：${planIssues.join("；")}。`),
+      });
       planValue = await repairPlan(planIssues, "schema");
       continue;
     }
@@ -1739,6 +2018,11 @@ export async function generateStoryOpeningWithConnection(
       if (semanticPlanRepairCount >= maxSemanticPlanRepairs) {
         throw attachModelUsage(error, accumulatedTokens, usageEstimated);
       }
+      await observeFailure({
+        stage: "开篇蓝图语义校验",
+        attempt: semanticPlanRepairCount + 1,
+        error,
+      });
       planValue = await repairPlan(
         [`${semanticIssue}；仅允许修复字段：${semanticTargets.join("、")}`],
         "semantic",
@@ -1747,20 +2031,21 @@ export async function generateStoryOpeningWithConnection(
     }
   }
   const specializedOpeningInstructions: string[] = [];
+  const hardOpeningAxes = contract.axes.filter((axis) =>
+    !readingExperienceAxisUsesSoftWindow(contract, axis.id)
+  );
+  const softOpeningAxes = contract.axes.filter((axis) =>
+    readingExperienceAxisUsesSoftWindow(contract, axis.id)
+  );
   if (contract.sourceWords.includes("系统")) {
     specializedOpeningInstructions.push(
       `系统体验强制前置：第一段前 120 字内，${plan.leadName}本人必须主动触发系统或打开面板，系统必须立即反馈并结算、发放一项永久可用的奖励、权限或能力，${plan.leadName}须在第一段结束前领取或调用它。至少安排一句不超过 100 字的独立原句，在同一句中明确写出${plan.leadName}打开系统面板、系统发放永久奖励，以及${plan.leadName}点击领取或立即调用；不得把这三步拆散后只用“他”或界面提示代称。不得先写背景，且不得先写赶路、旁观、调查、回忆或长篇环境铺陈。`,
       "系统稳定性写法：不要把上方禁止捷径中的词语复制进小说；只用正面事实写系统持续在线、即时结算、奖励与权限永久生效，并通过主角反复调用后的实际结果证明。",
     );
   }
-  if (contract.sourceWords.includes("无敌")) {
+  if (softOpeningAxes.length > 0) {
     specializedOpeningInstructions.push(
-      `无敌体验强制前置：前 15% 内让${plan.leadName}亲自使用已经到手的能力，在第一场有意义的冲突中压倒性获胜；必须写出对手无力反抗以及旁观者、资源、身份或现场秩序的即时变化。至少安排一句不超过 80 字的独立原句，在同一句中明确写出${plan.leadName}的姓名、一次“一击/一招/抬手/弹指”等直接动作、被击败或镇压的具体对手，以及“无法反抗/毫无还手之力/当场认输”等决定性结果；不得只用“他”“青年”等指代${plan.leadName}。胜利句后必须在同一段或紧接的下一段写出已经发生的现实反应，使用明确主语与动作，例如“围观弟子当场低头让路”“宗门随即撤销命令”“主角身份立即确立”“现场秩序随即改写”；不能只写气氛、表情或未来计划。`,
-    );
-  }
-  if (contract.sourceWords.includes("系统") && contract.sourceWords.includes("无敌")) {
-    specializedOpeningInstructions.push(
-      `系统无敌首段固定骨架：必须把以下三句逐字放在第一段最前面，再接着扩写现场，不得在它们之前添加任何文字——“${plan.leadName}打开系统面板，系统立即发放永久生效的至尊权限奖励，${plan.leadName}点击领取并当场调用。${plan.leadName}抬手一击镇压眼前强敌，对方毫无还手之力。围观者当场低头让路，现场秩序随即改写，${plan.leadName}的身份立即确立。”`,
+      `${softOpeningAxes.map((axis) => `“${axis.word}”`).join("、")}是跨章节奏主旋律，不是第一章逐句硬指标：本章允许铺垫、暂时五五开或把冲突保持未决，但不得让${plan.leadName}形成已经落地的最终失败。若本章自然安排压倒性胜利，必须由${plan.leadName}本人完成，并写出对手、旁观者、资源、身份或现场秩序的明确现实变化；不要为了过校验强塞固定胜利句。`,
     );
   }
   const writerPrompt = [
@@ -1775,22 +2060,43 @@ export async function generateStoryOpeningWithConnection(
     `用户原始灵感（具体设定与结果必须保留）：${context.input.inspiration?.trim() || "由模型原创"}`,
     formatReadingExperienceForPrompt(contract, 1),
     ...specializedOpeningInstructions,
-    "写第一章正文，严格写 18 个完整段落，每段 100—220 个中文字符；去除空白后的正文目标总长为 2000—3600 个中文字符。不要用大量短段凑数，也不要把对话拆成不足 100 字的独立段落。首段直接进入事件；前 15% 兑现两个体验轴；本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。",
+    `写第一章正文。建议写约 ${OPENING_CHAPTER_TARGET_CHARACTERS} 个中文字符、约 18 个完整段落，每段通常 100—220 个中文字符；这些仅是写作建议，可以为完整叙事自然超出，不设最高字数。去除空白后的正文不得少于 ${OPENING_CHAPTER_MIN_CHARACTERS} 字。不要用大量短段凑数。首段直接进入事件；前 15% 兑现所有硬性交付体验轴；软窗口体验只需保持主旋律且不能被最终结果推翻，不要求第一章取胜。本章必须出现一次有分量的行动结果与世界反应。对模型细化的自定义体验轴，正文不必出现体验词本身，须直接写出对应信号约定的人物、动作、对象与结果，禁止贴标签或把词拼到天光、晨雾等景物上。`,
     `只返回 JSON：{\"title\":\"章名\",\"paragraphs\":[\"完整段落\"]}。${IMMERSIVE_NARRATION_PROMPT}`,
   ].join("\n");
   const writerSystem = "你是原创中文长篇网文作家。用现场动作、人物选择、冲突结果和具体关系写作；回报及时，因果清楚，禁止作者侧元叙事。只返回符合要求的 JSON。";
+  const traceOpeningDraftFailure = async (
+    attempt: number,
+    title: string,
+    paragraphs: string[],
+    error: unknown,
+  ) => {
+    await writeAiTrace({
+      event: "error",
+      timestamp: new Date().toISOString(),
+      callId: randomUUID(),
+      attempt,
+      stage: "开篇正文质量校验",
+      connectionId: connection.id,
+      model: connection.routes.writer,
+      prompt: `${title}\n${paragraphs.join("\n")}`,
+      parsedValue: { title, paragraphs },
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await observeFailure({ stage: "开篇正文质量校验", attempt, error });
+  };
 
-  let lastFailure: unknown;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  let lastFailure: unknown = workflowControl.initialFailureMessage
+    ? new Error(workflowControl.initialFailureMessage)
+    : undefined;
+  const narrationReviewTrace = structuredClone(workflowControl.initialNarrationReviews ?? []);
+  for (let attempt = workflowControl.startingWriterAttempt ?? 1; attempt <= 2; attempt += 1) {
     let writer: Awaited<ReturnType<OpeningModelCompleter>>;
-    const recoveryHint = lastFailure instanceof Error && /即时实际反应|即时现实反应|前 15% 没有完成/.test(lastFailure.message)
-      ? "本次重写必须把压倒性胜利及现实反应放在前 15%：胜利句后立刻在同段或下一段原样采用一种明确结果句式——围观弟子当场低头让路、宗门随即撤销命令、主角身份立即确立或现场秩序随即改写。"
-      : lastFailure instanceof Error && /系统.*(?:稳定结算|持续可用|不可操作|无反馈|无奖励)/.test(lastFailure.message)
-        ? "本次重写只用正面事实表现系统持续在线、即时结算、奖励与权限永久生效，代价只能来自胜利后的世界、资源或关系变化。"
-        : "本次重写逐项兑现失败原因，并让动作、对象、结果与现场反应出现在相邻句段中。";
+    const recoveryHint = lastFailure instanceof Error && /系统.*(?:稳定结算|持续可用|不可操作|无反馈|无奖励)/.test(lastFailure.message)
+      ? "本次重写只用正面事实表现系统持续在线、即时结算、奖励与权限永久生效，代价来自已获状态带来的世界、资源或关系变化。"
+      : "本次重写逐项兑现失败原因，并让动作、对象、结果与现场反应出现在相邻句段中；软窗口体验不要求补写本章胜利。";
     const attemptPrompt = attempt === 1
       ? writerPrompt
-      : `${writerPrompt}\n上一稿未通过沉浸感或双体验证据检查，请彻底重写，不要解释。失败原因：${lastFailure instanceof Error ? lastFailure.message : "质量证据不足"}\n${recoveryHint}`;
+      : `${writerPrompt}\n上一稿未通过沉浸感或阅读体验检查，请彻底重写，不要解释。失败原因：${lastFailure instanceof Error ? lastFailure.message : "质量证据不足"}\n${recoveryHint}`;
     const writerRequest: OpeningCompletionRequest = {
       connection,
       model: connection.routes.writer,
@@ -1819,10 +2125,10 @@ export async function generateStoryOpeningWithConnection(
     const written = writer.value as OpeningWriterPayload;
     if (
       typeof written?.title !== "string" || !written.title.trim() || !Array.isArray(written.paragraphs) ||
-      written.paragraphs.length < 16 || written.paragraphs.length > 20 ||
+      written.paragraphs.length < 4 ||
       !written.paragraphs.every((paragraph) => typeof paragraph === "string" && paragraph.trim().length > 0)
     ) {
-      lastFailure = new Error("正文模型输出未通过开篇 Schema 校验：要求 16—20 个非空完整段落。");
+      lastFailure = new Error("正文模型输出未通过开篇 Schema 校验：至少需要 4 个非空完整段落。");
       continue;
     }
     const normalizedChapterTitle = normalizeChapterTitle(written.title);
@@ -1832,6 +2138,11 @@ export async function generateStoryOpeningWithConnection(
     }
     const paragraphs = written.paragraphs.map((paragraph) => paragraph.trim());
     const content = paragraphs.join("\n");
+    const contentHash = narrationArtifactHash(normalizedChapterTitle, paragraphs);
+    const narrationCandidates = [
+      ...detectNarrationCandidates("title", normalizedChapterTitle, contentHash),
+      ...detectNarrationCandidates("body", content, contentHash),
+    ];
     const validationContext = {
       protagonistNames: [plan.leadName],
       opening: true,
@@ -1840,16 +2151,17 @@ export async function generateStoryOpeningWithConnection(
     const characterCount = openingChapterCharacterCount(content);
     if (!openingChapterLengthIsAllowed(content)) {
       lastFailure = new Error(
-        `正文字数为 ${characterCount} 字，要求 ${OPENING_CHAPTER_MIN_CHARACTERS}—${OPENING_CHAPTER_MAX_CHARACTERS} 字。`,
+        `正文字数为 ${characterCount} 字，最低要求 ${OPENING_CHAPTER_MIN_CHARACTERS} 字。`,
       );
+      await traceOpeningDraftFailure(attempt, normalizedChapterTitle, paragraphs, lastFailure);
       continue;
     }
     try {
-      assertImmersiveNarration(normalizedChapterTitle);
-      assertImmersiveNarration(content);
+      assertOpeningNarrationStructure(normalizedChapterTitle, content);
       assertReadingExperienceContent(contract, content, validationContext);
     } catch (error) {
       lastFailure = error;
+      await traceOpeningDraftFailure(attempt, normalizedChapterTitle, paragraphs, error);
       continue;
     }
     const reviewerRequest: OpeningCompletionRequest = {
@@ -1857,14 +2169,15 @@ export async function generateStoryOpeningWithConnection(
       model: connection.routes.extractor,
       system: [
         "你是独立的中文小说质量审稿与正史事件抽取器，只返回 JSON。不得替正文补事实，也不得仅因出现体验词就判定兑现。",
-        "严格返回 experienceEvidence 两项数组与 event 对象，禁止增加外层包装；quote 和 persistentFacts 必须从正文逐字复制，禁止概括、改写或补标点。",
+        "严格返回 experienceEvidence 0—2 项数组（仅包含实际硬性交付轴，每个硬轴至多一项）与 event 对象，禁止增加外层包装；quote 和 persistentFacts 必须从正文逐字复制，禁止概括、改写或补标点。",
         openingReviewJsonExample,
+        narrationReviewerInstruction(narrationCandidates),
       ].join("\n"),
       prompt: [
         `体验契约：${JSON.stringify(contract)}`,
         `正文：${normalizedChapterTitle}\n${content}`,
-        `第一章必需 signalIds：${JSON.stringify(contract.openingRequirements.find((requirement) => requirement.chapterOffset === 0)?.requiredSignalIds ?? [])}。每个体验轴的 signalIds 必须列出正文实际兑现的本轴必需 ID；不得只返回模型细化信号或只返回基础信号。`,
-        "逐轴返回正文中的连续原句证据以及命中的 signalIds；按大意判断证据是否具体兑现了所申报模型信号中的人物、动作、对象、结果或感官变化，允许正文使用同义表达、调整语序和补充细节，不要求逐字复制模型信号或 evidenceAnchors。quote 本身仍必须从正文逐字复制。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，不能把标签、人物称谓共词或无关动作冒充兑现。两个轴必须提供不同原句，不能把同一句泛化动作重复标给两轴。event.persistentFacts 返回 2—8 条正文连续原句，保存主角已经获得的能力、奖励、权限、资源、关系或世界状态，供下一章直接继承。返回 {experienceEvidence:[{axisId,word,signalIds,quote}],event:{title,cause,outcome,location,persistentFacts}}。任一轴没有真实证据时仍返回空 evidence，让本稿失败重写。",
+        `第一章硬性必需 signalIds：${JSON.stringify(contract.openingRequirements.find((requirement) => requirement.chapterOffset === 0)?.requiredSignalIds ?? [])}。硬性交付轴=${hardOpeningAxes.map((axis) => `${axis.id}:${axis.word}`).join("、") || "无"}；仅这些轴的 signalIds 必须列出正文实际兑现的本轴必需 ID。`,
+        "只为硬性交付轴返回正文中的连续原句证据以及命中的 signalIds；软窗口轴不要求本章出现正向证据，缺少胜利、铺垫、暂时五五开或冲突未决都不能据此判稿件失败。按大意判断硬轴证据是否具体兑现了人物、动作、对象、结果或感官变化；quote 必须从正文逐字复制。若硬轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；不能把标签、人物称谓共词或无关动作冒充兑现。多个硬轴必须提供不同原句。event.persistentFacts 返回 0—8 条正文连续原句，保存主角已经获得的能力、奖励、权限、资源、关系或世界状态，供下一章直接继承。返回 {experienceEvidence:[{axisId,word,signalIds,quote}],event:{title,cause,outcome,location,persistentFacts}}。任一硬性交付轴没有真实证据时返回缺少该轴的数组，让硬门禁决定是否退修；不要为软窗口轴伪造 evidence。",
       ].join("\n"),
       timeout: GENERATION_STAGE_TIMEOUT_MS.reviewer,
       maxTokens: 3_200,
@@ -1943,13 +2256,18 @@ export async function generateStoryOpeningWithConnection(
       usageEstimated ||= reviewer.usageEstimated;
       let reviewIssues = openingReviewValidationIssues(reviewer.value);
       if (reviewIssues.length > 0) {
+        await observeFailure({
+          stage: "开篇审稿结构校验",
+          attempt,
+          error: new Error(`审稿模型输出未通过 Schema 校验：${reviewIssues.join("；")}。`),
+        });
         const reviewRepairRequest: OpeningCompletionRequest = {
           connection,
           model: connection.routes.extractor,
           system: [
             "你是中文小说审稿 JSON 结构修复器，只返回修复后的 JSON。",
             "只依据给定正文和体验契约修复审稿结果；quote 与 persistentFacts 必须从正文逐字复制，不得概括、改写、补标点或虚构事实。",
-            "experienceEvidence 必须严格为两个体验轴各一项，event 必须含 title、cause、outcome、location、persistentFacts。禁止增加外层包装。",
+            `experienceEvidence 必须为 0—2 项且仅覆盖硬性交付轴（${hardOpeningAxes.map((axis) => axis.word).join("、") || "无"}），event 必须含 title、cause、outcome、location、persistentFacts。禁止增加外层包装。`,
             openingReviewJsonExample,
           ].join("\n"),
           prompt: [
@@ -1983,7 +2301,22 @@ export async function generateStoryOpeningWithConnection(
         reviewIssues = openingReviewValidationIssues(reviewer.value);
       }
       if (!hasOpeningReviewShape(reviewer.value)) {
-        throw new Error(`审稿模型没有返回两个体验轴的有效证据：${reviewIssues.join("；")}。`);
+        throw new Error(`审稿模型没有返回有效的硬性交付轴证据或事件结构：${reviewIssues.join("；")}。`);
+      }
+      const narrationResolution = resolveNarrationAssessments(
+        narrationCandidates,
+        reviewer.value.narrationAssessments,
+      );
+      if (narrationCandidates.length > 0) {
+        const narrationReview: OpeningNarrationReviewTrace = {
+          contentHash,
+          candidates: structuredClone(narrationCandidates),
+          resolution: structuredClone(narrationResolution),
+          attempt,
+          rewriteCount: attempt - 1,
+        };
+        narrationReviewTrace.push(narrationReview);
+        workflowControl.onNarrationReview?.(structuredClone(narrationReview));
       }
       const groundedExperienceEvidence = groundReadingExperienceEvidence(
         contract,
@@ -2003,7 +2336,7 @@ export async function generateStoryOpeningWithConnection(
         protagonistNames: [plan.leadName],
         chapterNumber: 1,
       });
-      return {
+      const generated: GeneratedStoryOpening = {
         title: plan.title.trim().slice(0, 80),
         subtitle: plan.subtitle.trim().slice(0, 180),
         leadName: plan.leadName.trim().slice(0, 80),
@@ -2017,8 +2350,8 @@ export async function generateStoryOpeningWithConnection(
           model: connection.routes.writer,
           origin: "model",
           experienceEvidence: groundedExperienceEvidence,
-          usageTokens: writer.usageTokens,
-          usageEstimated: writer.usageEstimated,
+          usageTokens: workflowControl.chapterWriterUsageOverride?.usageTokens ?? writer.usageTokens,
+          usageEstimated: workflowControl.chapterWriterUsageOverride?.usageEstimated ?? writer.usageEstimated,
         },
         event: { ...reviewer.value.event, persistentFacts: groundedPersistentFacts },
         plannerModel: connection.routes.planner,
@@ -2026,7 +2359,76 @@ export async function generateStoryOpeningWithConnection(
         usageTokens: accumulatedTokens,
         usageEstimated,
       };
+      const permit = issueNarrationPermit(
+        contentHash,
+        narrationCandidates,
+        "semantic_allow",
+        attempt,
+      );
+      if (narrationResolution.decision === "ask_user" && workflowControl.pauseOnAskUser) {
+        const ambiguousIds = new Set(
+          narrationResolution.assessments
+            .filter((assessment) => assessment.decision === "ask_user")
+            .map((assessment) => assessment.candidateId),
+        );
+        const ambiguousCandidates = narrationCandidates.filter((candidate) =>
+          ambiguousIds.has(candidate.id)
+        );
+        const review: PendingNarrationReviewDraft = {
+          contentHash,
+          candidates: ambiguousCandidates,
+          allCandidateIds: narrationCandidateIds(narrationCandidates),
+          resolution: narrationResolution,
+          attempt,
+          rewriteCount: attempt - 1,
+          baseReviewStatus: "valid",
+        };
+        const checkpoint: OpeningGenerationCheckpoint = {
+          version: 1,
+          context: structuredClone(context),
+          plan: structuredClone(plan),
+          connectionBinding: {
+            id: connection.id,
+            updatedAt: connection.updatedAt,
+            routes: structuredClone(connection.routes),
+          },
+          attempt,
+          rewriteCount: attempt - 1,
+          reviewerResumeCount: workflowControl.reviewerResumeCount ?? 0,
+          accumulatedTokens,
+          usageEstimated,
+          tokenBudget,
+          draft: {
+            title: normalizedChapterTitle,
+            paragraphs: [...paragraphs],
+            writerUsageTokens: workflowControl.chapterWriterUsageOverride?.usageTokens ?? writer.usageTokens,
+            writerUsageEstimated: workflowControl.chapterWriterUsageOverride?.usageEstimated ?? writer.usageEstimated,
+          },
+          generated,
+          reviewTrace: structuredClone(narrationReviewTrace),
+          review,
+        };
+        throw openingNarrationPauseError({ checkpoint, review });
+      }
+      if (narrationResolution.decision !== "allow") {
+        const error = Object.assign(
+          new Error("Opening narration review requires " + narrationResolution.decision + "."),
+          {
+            code: narrationResolution.decision === "rewrite"
+              ? "narration_rewrite_requested"
+              : "narration_review_state_unavailable",
+            narrationReviewResolution: narrationResolution,
+            narrationCandidates,
+            narrationContentHash: contentHash,
+          },
+        );
+        throw error;
+      }
+      workflowControl.onNarrationPermit?.(permit);
+      return generated;
     } catch (error) {
+      const pause = openingNarrationPauseDetails(error);
+      if (pause) throw error;
       if (reviewerValueForTrace !== undefined) {
         await writeAiTrace({
           event: "error",
@@ -2041,9 +2443,62 @@ export async function generateStoryOpeningWithConnection(
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      await observeFailure({ stage: "开篇证据与质量校验", attempt, error });
       const failedCallUsage = attachedModelUsage(error);
       accumulatedTokens += failedCallUsage.tokens;
       usageEstimated ||= failedCallUsage.estimated;
+      if (
+        workflowControl.pauseOnAskUser &&
+        narrationCandidates.length > 0 &&
+        !hasOpeningReviewShape(reviewerValueForTrace) &&
+        (workflowControl.reviewerResumeCount ?? 0) < 1
+      ) {
+        const resolution = resolveNarrationAssessments(narrationCandidates, undefined);
+        const narrationReview: OpeningNarrationReviewTrace = {
+          contentHash,
+          candidates: structuredClone(narrationCandidates),
+          resolution: structuredClone(resolution),
+          attempt,
+          rewriteCount: attempt - 1,
+        };
+        narrationReviewTrace.push(narrationReview);
+        workflowControl.onNarrationReview?.(structuredClone(narrationReview));
+        const review: PendingNarrationReviewDraft = {
+          contentHash,
+          candidates: [...narrationCandidates],
+          allCandidateIds: narrationCandidateIds(narrationCandidates),
+          resolution,
+          attempt,
+          rewriteCount: attempt - 1,
+          baseReviewStatus: "unavailable",
+        };
+        const checkpoint: OpeningGenerationCheckpoint = {
+          version: 1,
+          context: structuredClone(context),
+          plan: structuredClone(plan),
+          connectionBinding: {
+            id: connection.id,
+            updatedAt: connection.updatedAt,
+            routes: structuredClone(connection.routes),
+          },
+          attempt,
+          rewriteCount: attempt - 1,
+          reviewerResumeCount: workflowControl.reviewerResumeCount ?? 0,
+          accumulatedTokens,
+          usageEstimated,
+          tokenBudget,
+          draft: {
+            title: normalizedChapterTitle,
+            paragraphs: [...paragraphs],
+            writerUsageTokens: workflowControl.chapterWriterUsageOverride?.usageTokens ?? writer.usageTokens,
+            writerUsageEstimated: workflowControl.chapterWriterUsageOverride?.usageEstimated ?? writer.usageEstimated,
+          },
+          generated: null,
+          review,
+          reviewTrace: structuredClone(narrationReviewTrace),
+        };
+        throw openingNarrationPauseError({ checkpoint, review });
+      }
       lastFailure = error;
       if (
         error instanceof Error &&
@@ -2053,6 +2508,18 @@ export async function generateStoryOpeningWithConnection(
       }
     }
   }
+  if (
+    lastFailure instanceof Error &&
+    (lastFailure as Error & { code?: string }).code === "narration_rewrite_requested"
+  ) {
+    throw attachModelUsage(
+      Object.assign(new Error("Opening narration rewrite allowance is exhausted."), {
+        code: "narration_rewrite_exhausted",
+      }),
+      accumulatedTokens,
+      usageEstimated,
+    );
+  }
   throw attachModelUsage(
     new Error(`第一章连续两次未通过阅读体验与沉浸感质量门禁：${lastFailure instanceof Error ? lastFailure.message : "未知错误"}`),
     accumulatedTokens,
@@ -2060,6 +2527,169 @@ export async function generateStoryOpeningWithConnection(
   );
 }
 
+export async function beginStoryOpeningGeneration(
+  context: OpeningGenerationContext,
+  connection: ModelConnection,
+  complete: OpeningModelCompleter = defaultOpeningCompleter,
+  tokenBudget = OPENING_JOB_TOKEN_BUDGET,
+  failureObserver?: OpeningFailureObserver,
+): Promise<OpeningGenerationOutcome> {
+  let narrationPermit: NarrationPermit | undefined;
+  const narrationReviews: OpeningNarrationReviewTrace[] = [];
+  try {
+    const generated = await generateStoryOpeningWithConnection(
+      context,
+      connection,
+      complete,
+      tokenBudget,
+      failureObserver,
+      {
+        pauseOnAskUser: true,
+        onNarrationPermit: (permit) => {
+          narrationPermit = permit;
+        },
+        onNarrationReview: (review) => {
+          narrationReviews.push(review);
+        },
+      },
+    );
+    if (!narrationPermit) {
+      throw Object.assign(new Error("Opening narration permit was not issued."), {
+        code: "narration_review_state_unavailable",
+      });
+    }
+    return { status: "completed", generated, narrationPermit, narrationReviews };
+  } catch (error) {
+    const pause = openingNarrationPauseDetails(error);
+    if (pause) {
+      return {
+        status: "awaiting_user_review",
+        checkpoint: pause.checkpoint,
+        review: pause.review,
+      };
+    }
+    throw attachOpeningNarrationReviews(error, narrationReviews);
+  }
+}
+
+export async function resumeStoryOpeningGeneration(
+  checkpoint: OpeningGenerationCheckpoint,
+  action: NarrationReviewAction,
+  connection: ModelConnection,
+  complete: OpeningModelCompleter = defaultOpeningCompleter,
+  failureObserver?: OpeningFailureObserver,
+): Promise<OpeningGenerationOutcome> {
+  const allCandidates = assertOpeningCheckpoint(checkpoint, connection);
+  if (action.kind === "keep") {
+    if (
+      action.contentHash !== checkpoint.review.contentHash ||
+      !sameCandidateIds(
+        action.candidateIds,
+        checkpoint.review.candidates.map((candidate) => candidate.id),
+      )
+    ) {
+      invalidOpeningCheckpoint(checkpoint);
+    }
+    if (checkpoint.review.baseReviewStatus === "valid") {
+      if (!checkpoint.generated) invalidOpeningCheckpoint(checkpoint);
+      return {
+        status: "completed",
+        generated: checkpoint.generated,
+        narrationPermit: issueNarrationPermit(
+          checkpoint.review.contentHash,
+          allCandidates,
+          "user_keep",
+          checkpoint.attempt,
+        ),
+        narrationReviews: structuredClone(checkpoint.reviewTrace ?? []),
+      };
+    }
+  }
+
+  const rewriting = action.kind === "rewrite";
+  if (rewriting && (checkpoint.attempt >= 2 || checkpoint.rewriteCount >= 1)) {
+    throw attachModelUsage(
+      Object.assign(new Error("Opening narration rewrite allowance is exhausted."), {
+        code: "narration_rewrite_exhausted",
+      }),
+      checkpoint.accumulatedTokens,
+      checkpoint.usageEstimated,
+    );
+  }
+
+  let firstCall = true;
+  let writerReplayed = false;
+  const replayWriter = action.kind === "keep";
+  const replayCompleter: OpeningModelCompleter = async (request) => {
+    if (firstCall) {
+      firstCall = false;
+      return { value: structuredClone(checkpoint.plan), usageTokens: 0, usageEstimated: false };
+    }
+    if (replayWriter && !writerReplayed) {
+      writerReplayed = true;
+      return {
+        value: {
+          title: checkpoint.draft.title,
+          paragraphs: [...checkpoint.draft.paragraphs],
+        },
+        usageTokens: 0,
+        usageEstimated: false,
+      };
+    }
+    return complete(request);
+  };
+
+  let narrationPermit: NarrationPermit | undefined;
+  const narrationReviews = structuredClone(checkpoint.reviewTrace ?? []);
+  try {
+    const generated = await generateStoryOpeningWithConnection(
+      checkpoint.context,
+      connection,
+      replayCompleter,
+      checkpoint.tokenBudget,
+      failureObserver,
+      {
+        pauseOnAskUser: true,
+        initialUsageTokens: checkpoint.accumulatedTokens,
+        initialUsageEstimated: checkpoint.usageEstimated,
+        startingWriterAttempt: replayWriter
+          ? checkpoint.attempt as 1 | 2
+          : (checkpoint.attempt + 1) as 2,
+        initialFailureMessage: rewriting
+          ? "Narration review requested one rewrite."
+          : undefined,
+        chapterWriterUsageOverride: replayWriter
+          ? {
+              usageTokens: checkpoint.draft.writerUsageTokens,
+              usageEstimated: checkpoint.draft.writerUsageEstimated,
+            }
+          : undefined,
+        reviewerResumeCount: replayWriter
+          ? checkpoint.reviewerResumeCount + 1
+          : checkpoint.reviewerResumeCount,
+        initialNarrationReviews: structuredClone(checkpoint.reviewTrace ?? []),
+        onNarrationPermit: (permit) => {
+          narrationPermit = permit;
+        },
+        onNarrationReview: (review) => {
+          narrationReviews.push(review);
+        },
+      },
+    );
+    if (!narrationPermit) invalidOpeningCheckpoint(checkpoint);
+    return { status: "completed", generated, narrationPermit, narrationReviews };
+  } catch (error) {
+    const pause = openingNarrationPauseDetails(error);
+    if (pause) {
+      return {
+        status: "awaiting_user_review",
+        checkpoint: pause.checkpoint,
+        review: pause.review,
+      };
+    }
+    throw attachOpeningNarrationReviews(error, narrationReviews);
+  }
+}
 export async function generateCandidateDraftsWithConnection(
   connection: ModelConnection,
   story: Story,
@@ -2076,7 +2706,12 @@ export async function generateCandidateDraftsWithConnection(
     .slice(-12)
     .map((event) => ({ id: event.id, title: event.title, storyTime: event.storyTime }));
   const plannerSystem = "你是剧情规划器。只返回 JSON，包含 candidates 数组；每项必须有 creativeAxis,event,cause,cost,impact,novelty,participantNames,storyTime,dependsOnEventIds,knowledgeClaims,itemTransitions。knowledgeClaims 每项含 characterName/fact/sourceRevisionId；itemTransitions 只记录实体物品的状态流转，每项含 itemName/actorName/fromStatus/toStatus，fromStatus 与 toStatus 只能是 available、held、lost、destroyed、consumed 之一；能力升级、身份、排名、职位、效忠和权限变化不得填入 itemTransitions，没有实体物品变化时返回空数组。只给短剧情胶囊，不写正文。";
-  const plannerPrompt = `故事：${story.title}；题材：${story.genre}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；题材创意轴：${story.storyGene.creativeAxes.join("、")}；篇幅：第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，第 ${storyArc.volumeNumber} / ${storyArc.totalVolumes} 卷，本卷第 ${storyArc.chapterInVolume} / ${storyArc.volumeChapterCount} 章，阶段=${storyArc.label}；阶段要求：${storyArc.guidance}；结局契约：${story.endingContract.targetEnding}；必要前置条件：${story.endingContract.prerequisites.join("；")}。${formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1)}。所有候选必须在同一事件中兑现两个阅读体验轴，并让结果产生正文可引用的证据。所有候选的核心事件、资源、两难与代价都必须属于“${story.genre}”的典型叙事，不得把非悬疑题材统一写成追踪线索、救证人或查案；终卷不得开启新世界、新势力或大型支线，目标章候选必须明确兑现结局契约及至少一项必要前置条件。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 3 个结构不同的候选。`;
+  const cadenceDirective = formatReadingExperienceCadenceForPrompt(
+    story.readingExperience,
+    story.readingExperienceDeliveryLedger,
+    story.chapters.length + 1,
+  );
+  const plannerPrompt = `故事：${story.title}；题材：${story.genre}；故事基因：${story.storyGene.conflictEngine}；持续代价：${story.storyGene.recurringCost}；题材创意轴：${story.storyGene.creativeAxes.join("、")}；篇幅：第 ${story.chapters.length + 1} / ${story.targetChapterCount} 章，第 ${storyArc.volumeNumber} / ${storyArc.totalVolumes} 卷，本卷第 ${storyArc.chapterInVolume} / ${storyArc.volumeChapterCount} 章，阶段=${storyArc.label}；阶段要求：${storyArc.guidance}；结局契约：${story.endingContract.targetEnding}；必要前置条件：${story.endingContract.prerequisites.join("；")}。${formatReadingExperienceForPrompt(story.readingExperience, story.chapters.length + 1)}。${cadenceDirective}。所有候选必须在同一事件中兑现硬性交付轴，并让硬性结果产生正文可引用的证据；软窗口体验不要求每个候选本章获胜，应按上面的跨章节奏状态安排，至少保留一个符合当前节奏优先级的候选。所有候选的核心事件、资源、两难与代价都必须属于“${story.genre}”的典型叙事，不得把非悬疑题材统一写成追踪线索、救证人或查案；终卷不得开启新世界、新势力或大型支线，目标章候选必须明确兑现结局契约及至少一项必要前置条件。可用人物知识账本：${JSON.stringify(activeKnowledgeLedger)}；可依赖活动事件：${JSON.stringify(activeEventIds)}。每个有参与者的候选至少声明一条正文实际使用、且来自上述账本的 knowledgeClaim；若无法给出来源就不要生成该候选。生成 3 个结构不同的候选。`;
   assertModelCallTokenBudget({
     remainingTokens: tokenBudget,
     system: plannerSystem,
@@ -2251,6 +2886,7 @@ export async function generateChapterWithConnection(
   maxTokens = 6_500,
   complete: JsonModelCompleter = completeJson,
   tokenBudget = CONTINUATION_JOB_TOKEN_BUDGET,
+  writerIdleTimeoutMs: number = GENERATION_STAGE_TIMEOUT_MS.writer,
 ): Promise<GeneratedChapter> {
   const systemPrompt = chapterWriterSystemPrompt(false);
   assertModelCallTokenBudget({
@@ -2265,7 +2901,7 @@ export async function generateChapterWithConnection(
     connection.routes.writer,
     systemPrompt,
     prompt,
-    GENERATION_STAGE_TIMEOUT_MS.writer,
+    writerIdleTimeoutMs,
     maxTokens,
     {
       remainingTokens: tokenBudget,
@@ -2359,6 +2995,7 @@ export async function streamChapterWithConnection(
   maxTokens = 6_500,
   dependencies: CompleteJsonDependencies = {},
   tokenBudget = CONTINUATION_JOB_TOKEN_BUDGET,
+  writerIdleTimeoutMs: number = GENERATION_STAGE_TIMEOUT_MS.writer,
 ): Promise<GeneratedChapter> {
   const systemPrompt = chapterWriterSystemPrompt(true);
   const now = dependencies.now ?? Date.now;
@@ -2413,7 +3050,7 @@ export async function streamChapterWithConnection(
   if (connection.capabilities?.jsonSchema) body.response_format = { type: "json_object" };
   await trace("request", {
     completionApi: "chat_completions",
-    timeoutMs: GENERATION_STAGE_TIMEOUT_MS.writer,
+    timeoutMs: writerIdleTimeoutMs,
     maxTokens,
     system: systemPrompt,
     prompt,
@@ -2426,8 +3063,8 @@ export async function streamChapterWithConnection(
       apiKey,
       "/chat/completions",
       { method: "POST", body: JSON.stringify(body) },
-      GENERATION_STAGE_TIMEOUT_MS.writer,
-      streamedCompletionOverallTimeout(GENERATION_STAGE_TIMEOUT_MS.writer, maxTokens),
+      writerIdleTimeoutMs,
+      streamedCompletionOverallTimeout(writerIdleTimeoutMs, maxTokens),
     );
   } catch (error) {
     await trace("error", { error: error instanceof Error ? error.message : String(error) });
@@ -2532,8 +3169,14 @@ export async function extractChapterStateWithConnection(
     const baselineSignal = axis.observableSignals.find((signal) => !signal.id.includes("_model_signal_"));
     return Array.from(new Set([modelSignal?.id, baselineSignal?.id].filter((id): id is string => Boolean(id))));
   };
+  const softExperienceAxes = readingExperience?.axes.filter((axis) =>
+    readingExperienceAxisUsesSoftWindow(readingExperience, axis.id)
+  ) ?? [];
+  const hardExperienceAxes = readingExperience?.axes.filter((axis) =>
+    !readingExperienceAxisUsesSoftWindow(readingExperience, axis.id)
+  ) ?? [];
   const endingSchema = endingContract
-    ? `，"endingResolution":{"targetEndingSatisfied":true,"targetEndingEvidence":"正文中的原句","satisfiedPrerequisiteIndices":[0],"prerequisiteEvidence":[{"prerequisiteIndex":0,"evidence":"正文中的原句"}],"noContinuationHook":true}`
+    ? `,"endingResolution":{"targetEndingSatisfied":true,"targetEndingEvidence":"正文中的原句","satisfiedPrerequisiteIndices":[0],"prerequisiteEvidence":[{"prerequisiteIndex":0,"evidence":"正文中的原句"}],"noContinuationHook":true}`
     : "";
   const endingInstruction = endingContract
     ? ` 独立判断结局是否在剧情行动中真实完成。结局目标=${endingContract.targetEnding}；前置条件（按下标）=${endingContract.prerequisites.map((item, index) => `${index}:${item}`).join("；")}。evidence 必须逐字引用正文中至少 8 个字的连续原句；仅复述后台契约、不对应行动结果时必须判为 false。`
@@ -2550,10 +3193,23 @@ export async function extractChapterStateWithConnection(
     return requiredSignalIds.length > 0 ? requiredSignalIds : evidenceSignalExample(axis);
   };
   const experienceSchema = readingExperience
-    ? `，"experienceEvidence":[{"axisId":"primary","word":"${readingExperience.axes[0].word}","signalIds":${JSON.stringify(signalIdsForEvidence(readingExperience.axes[0]))},"quote":"正文中的连续原句"},{"axisId":"secondary","word":"${readingExperience.axes[1].word}","signalIds":${JSON.stringify(signalIdsForEvidence(readingExperience.axes[1]))},"quote":"正文中的连续原句"}]`
+    ? `,"experienceEvidence":${JSON.stringify(hardExperienceAxes.map((axis) => ({ axisId: axis.id, word: axis.word, signalIds: signalIdsForEvidence(axis), quote: "正文中的连续原句" })))},"experienceDelivery":${JSON.stringify(softExperienceAxes.map((axis) => ({ axisId: axis.id, state: "no_conflict", sourceQuote: "非 no_conflict 时填写正文中的连续原句" })))},"editorialIssues":[]`
     : "";
   const experienceInstruction = readingExperience
-    ? ` 独立审查两个阅读体验轴，契约=${JSON.stringify(readingExperience)}。${chapterNumber !== undefined ? `当前是第 ${chapterNumber} 章；本章必需信号=${JSON.stringify(chapterRequirement?.requiredSignalIds ?? [])}。有正文证据时，每个轴的 signalIds 必须包含该轴的本章必需信号，不得用其他章节的信号代替。` : ""}每个 evidence 必须逐字引用正文中至少 8 个字的连续原句，并具体对应所申报信号中的人物、动作、对象与结果；申报 _model_signal_ 时，同一句 quote 还必须逐字包含该信号 evidenceAnchors 中至少两个相互独立的短语，只出现体验词、人物称谓共词或无关动作不算兑现。若某轴同时有 _model_signal_ 与基础 signal，signalIds 必须各命中至少一项；quote 不必出现体验词本身，但两轴不得复用同一句证据。系统奖励、权限、能力和长期状态必须作为主角的 knowledgeGained 原文保存。无法找到真实证据时返回空数组，让正文被拒绝重写。`
+    ? [
+        ` 独立审查阅读体验轴，契约=${JSON.stringify(readingExperience)}。`,
+        chapterNumber !== undefined
+          ? `当前是第 ${chapterNumber} 章；本章硬性必需信号=${JSON.stringify(chapterRequirement?.requiredSignalIds ?? [])}。`
+          : "",
+        hardExperienceAxes.length
+          ? `硬性交付轴=${hardExperienceAxes.map((axis) => axis.word).join("、")}。这些轴有正文证据时，signalIds 必须包含本章必需信号，不得用其他章节的信号代替。每个 evidence 必须逐字引用正文中至少 8 个字的连续原句，并具体对应人物、动作、对象与结果；申报 _model_signal_ 时，同一句 quote 还必须包含该信号 evidenceAnchors 中至少两个相互独立的短语。无法找到真实证据时不要伪造 evidence，并在 editorialIssues 中给出具体退修问题。`
+          : "",
+        softExperienceAxes.length
+          ? `软窗口轴=${softExperienceAxes.map((axis) => axis.word).join("、")}。软窗口轴不要求本章出现胜利或 evidence，也不得仅因本章铺垫、暂时五五开、冲突未决或缺少压倒性胜利填写 editorialIssues。必须为每个软窗口轴返回 experienceDelivery：state 只能是 no_conflict、open_parity、dominant_victory、conclusive_defeat；dominant_victory 仅指主角已经完成决定性胜利，open_parity 指对抗仍势均力敌或未决，conclusive_defeat 仅指主角已经形成最终落败，暂时受伤、受压或五五开不算。除 no_conflict 外，sourceQuote 必须逐字引用至少 8 个字的正文连续原句。`
+          : "",
+        `只出现体验词、人物称谓共词或无关动作不算兑现。系统奖励、权限、能力和长期状态必须作为主角的 knowledgeGained 原文保存。editorialIssues 每项格式为 {"code":"missing_experience_signal|weak_experience_signal|unsupported_experience_claim|missing_required_outcome|explicit_protagonist_defeat","axisId":"primary|secondary","axisWord":"契约中的体验词","signalIds":[],"location":"title|body|chapter","sourceQuote":"最接近问题的连续原句，可缺省","reason":"原稿为什么没有满足信号","requestedChange":"作者应如何在保留既有剧情的前提下修改"}。硬性交付轴均满足且没有真正的最终失败时，editorialIssues 必须是空数组。`,
+        "只有主角明确形成已经落地的最终失败时，才可在 editorialIssues 使用 code=explicit_protagonist_defeat；暂时受伤、受压、五五开、未决或缺少胜利时不得使用。",
+      ].join("")
     : "";
   const extractorSystem = `你是独立的正史状态与阅读体验证据抽取器。只返回 JSON：{"events":[{"type":"choice","title":"","cause":"","outcome":"","participantNames":[],"location":""}],"characterUpdates":[{"name":"","status":"","location":"","goal":"","knowledgeGained":[]}],"itemUpdates":[{"name":"","status":"held","holderName":"","location":""}]${experienceSchema}${endingSchema}}；不得新增正文没有的事实。${experienceInstruction}${endingInstruction}`;
   const extractorPrompt = `${chapter.title}\n${chapter.paragraphs.join("\n")}`;
@@ -2582,6 +3238,26 @@ export async function extractChapterStateWithConnection(
         if (!Array.isArray(value.itemUpdates)) issues.push("itemUpdates 必须是数组");
         if (readingExperience && !Array.isArray(value.experienceEvidence)) {
           issues.push("experienceEvidence 必须是数组");
+        }
+        if (softExperienceAxes.length > 0) {
+          if (!Array.isArray(value.experienceDelivery)) {
+            issues.push("experienceDelivery 必须是数组");
+          } else {
+            for (const axis of softExperienceAxes) {
+              const observation = value.experienceDelivery.find((candidate) =>
+                isOpeningPlanRecord(candidate) && candidate.axisId === axis.id
+              );
+              if (!observation || typeof observation.state !== "string" ||
+                !["no_conflict", "open_parity", "dominant_victory", "conclusive_defeat"].includes(observation.state)) {
+                issues.push(`experienceDelivery 缺少 ${axis.id} 的有效状态`);
+              } else if (observation.state !== "no_conflict" && typeof observation.sourceQuote !== "string") {
+                issues.push(`experienceDelivery[${axis.id}] 的非空状态必须提供 sourceQuote`);
+              }
+            }
+          }
+        }
+        if (readingExperience && value.editorialIssues !== undefined && !Array.isArray(value.editorialIssues)) {
+          issues.push("editorialIssues 必须是数组");
         }
         if (endingContract) {
           const resolution = value.endingResolution;
@@ -2665,6 +3341,29 @@ export async function extractChapterStateWithConnection(
         quote: item.quote.slice(0, 500),
       }));
   }
+  let experienceDelivery: ReadingExperienceDeliveryObservation[] | undefined;
+  if (softExperienceAxes.length > 0) {
+    if (!Array.isArray(parsed.experienceDelivery)) throw new Error("抽取模型没有返回软窗口体验状态。");
+    experienceDelivery = softExperienceAxes.map((axis) => {
+      const observation = parsed.experienceDelivery!.find((candidate) => candidate?.axisId === axis.id);
+      const state = observation?.state;
+      if (!state || !["no_conflict", "open_parity", "dominant_victory", "conclusive_defeat"].includes(state)) {
+        return { axisId: axis.id, state: "no_conflict" };
+      }
+      if (state === "no_conflict") return { axisId: axis.id, state };
+      const sourceQuote = typeof observation.sourceQuote === "string"
+        ? observation.sourceQuote.trim().slice(0, 500)
+        : "";
+      if (Array.from(sourceQuote.replace(/\r\n?|\n/g, "")).length < 8 ||
+        !contentContainsSourceQuote(extractorPrompt, sourceQuote)) {
+        return { axisId: axis.id, state: "no_conflict" };
+      }
+      return { axisId: axis.id, state, sourceQuote };
+    });
+  }
+  const editorialIssues = readingExperience
+    ? normalizeChapterEditorialIssues(readingExperience, extractorPrompt, parsed.editorialIssues)
+    : undefined;
   let endingResolution: ExtractedChapterState["endingResolution"];
   if (endingContract) {
     const resolution = parsed.endingResolution;
@@ -2693,6 +3392,8 @@ export async function extractChapterStateWithConnection(
       characterUpdates,
       itemUpdates,
       experienceEvidence,
+      experienceDelivery,
+      editorialIssues,
       endingResolution,
       usageTokens: completion.usageTokens,
       usageEstimated: completion.usageEstimated,

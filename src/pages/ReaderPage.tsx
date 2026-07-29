@@ -102,6 +102,7 @@ export function ReaderPage() {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [generationRecovering, setGenerationRecovering] = useState(false);
   const [generationStage, setGenerationStage] = useState(0);
   const [streamedTitle, setStreamedTitle] = useState("");
   const [streamedParagraphs, setStreamedParagraphs] = useState<string[]>([]);
@@ -124,6 +125,7 @@ export function ReaderPage() {
       setChapterId((current) => current ?? value.readingProgress.chapterId ?? value.chapters.at(-1)?.id ?? null);
       setError(null);
     } catch (requestError) {
+      setGenerationRecovering(false);
       setError(requestError instanceof Error ? requestError.message : "章节加载失败。" );
     }
   };
@@ -145,6 +147,7 @@ export function ReaderPage() {
       setReports((current) => [report, ...current]);
       toast("举报已提交。审核记录与正文生成解耦，不会静默修改正史。");
     } catch (requestError) {
+      setGenerationRecovering(false);
       toast(requestError instanceof Error ? requestError.message : "举报提交失败。", "error");
     }
   };
@@ -155,6 +158,7 @@ export function ReaderPage() {
       setReports((current) => current.map((report) => report.id === updated.id ? updated : report));
       toast("申诉已进入复核队列。");
     } catch (requestError) {
+      setGenerationRecovering(false);
       toast(requestError instanceof Error ? requestError.message : "申诉提交失败。", "error");
     }
   };
@@ -218,9 +222,10 @@ export function ReaderPage() {
 
   const generateNext = async () => {
     if (!story || generating || story.status !== "active") return;
-    setGenerating(true); setGenerationStage(0); setStreamedTitle(""); setStreamedParagraphs([]); setGenerationFailure(null);
+    setGenerating(true); setGenerationRecovering(false); setGenerationStage(0); setStreamedTitle(""); setStreamedParagraphs([]); setGenerationFailure(null);
     try {
       const result = await api.generateChapter(story, (update) => {
+        if (update.event === "reconnecting") setGenerationRecovering(true);
         if (update.event === "stage" && typeof update.stage === "number") setGenerationStage(update.stage);
         if (update.event === "reset_draft") { setStreamedTitle(""); setStreamedParagraphs([]); }
         if (update.event === "paragraph" && update.paragraph) {
@@ -229,6 +234,7 @@ export function ReaderPage() {
         }
       }, { chapterLength: settings.chapterLength, idempotencyKey: generationIdempotencyKey.current });
       setStory(result.story);
+      setGenerationRecovering(false);
       progressVersion.current = result.story.readingProgress.progressVersion;
       generationIdempotencyKey.current = crypto.randomUUID();
       const next = result.story.chapters.at(-1);
@@ -237,6 +243,7 @@ export function ReaderPage() {
       setStreamedParagraphs([]);
       toast(`第 ${next?.number ?? "下一"} 章已经成为正史。`);
     } catch (requestError) {
+      setGenerationRecovering(false);
       const message = requestError instanceof Error ? requestError.message : "续章失败。";
       setGenerationFailure(message);
       toast(message, "error");
@@ -259,10 +266,12 @@ export function ReaderPage() {
           .at(-1)?.id,
       });
       setStory(result.story);
+      setGenerationRecovering(false);
       setFeedbackContext("");
       await refresh();
       if (/不希望.*死|不要.*死|别让.*死/.test(text)) toast("正史修订完成：没有追问写法，也没有覆盖旧版本。" );
     } catch (requestError) {
+      setGenerationRecovering(false);
       setDraft(text);
       toast(requestError instanceof Error ? requestError.message : "消息处理失败。", "error");
     } finally { setSending(false); }
@@ -401,9 +410,10 @@ export function ReaderPage() {
       {generating && (
         <div className="generation-overlay" role="status" aria-live="polite">
           <div className="generation-card">
-            <span className="generation-glyph"><Sparkles size={22} /></span><span className="eyebrow">后台自主创作</span><h2>下一章正在发生</h2>
+            <span className="generation-glyph"><Sparkles size={22} /></span><span className="eyebrow">后台自主创作</span><h2>{generationRecovering ? "连接波动，正在确认后台进度" : "下一章正在发生"}</h2>
             <ol>{["组装当前正史与相关记忆", "生成 5 个短剧情胶囊", "执行正史与因果门禁", "选择并扩写一个方案", "提取事件并提交 Revision"].map((item, index) => <li key={item} className={index < generationStage ? "done" : index === generationStage ? "active" : ""}><span>{index < generationStage ? <Check size={13} /> : index + 1}</span>{item}</li>)}</ol>
-            {streamedParagraphs.length > 0 ? <blockquote><strong>{streamedTitle}</strong><span>{streamedParagraphs.at(-1)}</span><small>已完成 {streamedParagraphs.length} 段，提交前仍是草稿</small></blockquote> : <p>只扩写一个完整章节；不会把整本小说反复发送给模型。</p>}
+            {generationRecovering && <p>浏览器连接短暂中断，但后台创作仍在继续；正在自动对账，请不要重复点击。</p>}
+            {streamedParagraphs.length > 0 ? <blockquote><strong>{streamedTitle}</strong><span>{streamedParagraphs.at(-1)}</span><small>已完成 {streamedParagraphs.length} 段，提交前仍是草稿</small></blockquote> : !generationRecovering && <p>只扩写一个完整章节；不会把整本小说反复发送给模型。</p>}
           </div>
         </div>
       )}

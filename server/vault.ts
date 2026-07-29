@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { loadApplicationEncryptionKey } from "./appEncryption";
 import { dataDirectory, usesPersistentStorage } from "./storage";
 
 interface SecretRecord {
@@ -12,48 +13,8 @@ interface SecretRecord {
 type SecretStore = Record<string, SecretRecord>;
 
 const secretFile = path.join(dataDirectory, "secrets.json");
-const developmentKeyFile = path.join(dataDirectory, ".master-key");
-let masterKeyPromise: Promise<Buffer> | null = null;
 let secretSaveQueue = Promise.resolve();
 let inMemorySecrets: SecretStore = {};
-
-function parseEnvironmentKey(value: string): Buffer {
-  const key = /^[0-9a-f]{64}$/i.test(value)
-    ? Buffer.from(value, "hex")
-    : Buffer.from(value, "base64");
-  if (key.length !== 32) {
-    throw new Error("APP_ENCRYPTION_KEY 必须是 32 字节 Base64 或 64 位十六进制值。");
-  }
-  return key;
-}
-
-async function resolveMasterKey(): Promise<Buffer> {
-  const configured = process.env.APP_ENCRYPTION_KEY?.trim();
-  if (configured) {
-    return parseEnvironmentKey(configured);
-  }
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("生产环境必须设置 APP_ENCRYPTION_KEY，拒绝把模型密钥绑定到本地临时主密钥。");
-  }
-
-  await mkdir(dataDirectory, { recursive: true });
-  try {
-    return Buffer.from((await readFile(developmentKeyFile, "utf8")).trim(), "base64");
-  } catch (error) {
-    const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
-    if (!missing) {
-      throw error;
-    }
-    const key = randomBytes(32);
-    await writeFile(developmentKeyFile, key.toString("base64"), { encoding: "utf8", mode: 0o600 });
-    return key;
-  }
-}
-
-async function loadMasterKey(): Promise<Buffer> {
-  masterKeyPromise ??= resolveMasterKey();
-  return Buffer.from(await masterKeyPromise);
-}
 
 async function readSecrets(): Promise<SecretStore> {
   if (!usesPersistentStorage()) return structuredClone(inMemorySecrets);
@@ -79,7 +40,7 @@ async function saveSecrets(secrets: SecretStore): Promise<void> {
 }
 
 export async function storeSecret(id: string, value: string): Promise<{ secretRef: string; version: number }> {
-  const key = await loadMasterKey();
+  const key = await loadApplicationEncryptionKey();
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
@@ -111,7 +72,7 @@ export async function readSecret(id: string, version?: number): Promise<string> 
   if (!record) {
     throw new Error("连接凭据不存在，请重新保存 API Key。");
   }
-  const key = await loadMasterKey();
+  const key = await loadApplicationEncryptionKey();
   const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(record.iv, "base64"));
   decipher.setAuthTag(Buffer.from(record.tag, "base64"));
   return Buffer.concat([

@@ -2,7 +2,7 @@ import { Activity, AlertTriangle, CheckCircle2, CircleDollarSign, Clock3, Gauge,
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { ErrorState, LoadingState } from "../components/States";
-import type { AuditEvent, ContentReport, GenerationJob, OpsMetrics, OpsQualityBucket, SafetyDecision } from "../types";
+import type { AuditEvent, ContentReport, GenerationFailureSummaryBucket, GenerationJob, NarrationReviewMetricBucket, OpsMetrics, OpsQualityBucket, SafetyDecision } from "../types";
 import { formatDateTime, money, percent } from "../utils";
 
 export function OpsPage() {
@@ -12,11 +12,21 @@ export function OpsPage() {
   const [reports, setReports] = useState<ContentReport[]>([]);
   const [safetyDecisions, setSafetyDecisions] = useState<SafetyDecision[]>([]);
   const [qualityBreakdown, setQualityBreakdown] = useState<OpsQualityBucket[]>([]);
+  const [failurePatterns, setFailurePatterns] = useState<GenerationFailureSummaryBucket[]>([]);
+  const [narrationReviewMetrics, setNarrationReviewMetrics] = useState<NarrationReviewMetricBucket[]>([]);
   const [error, setError] = useState<string | null>(null);
   const load = async () => {
     try {
       const payload = await api.ops();
-      setMetrics(payload.metrics); setJobs(payload.jobs); setAuditEvents(payload.auditEvents); setReports(payload.reports); setSafetyDecisions(payload.safetyDecisions); setQualityBreakdown(payload.qualityBreakdown); setError(null);
+      setMetrics(payload.metrics);
+      setJobs(payload.jobs);
+      setAuditEvents(payload.auditEvents);
+      setReports(payload.reports);
+      setSafetyDecisions(payload.safetyDecisions);
+      setQualityBreakdown(payload.qualityBreakdown);
+      setFailurePatterns(payload.failurePatterns);
+      setNarrationReviewMetrics(payload.narrationReviewMetrics);
+      setError(null);
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "观察台加载失败。" ); }
   };
   useEffect(() => { void load(); }, []);
@@ -49,7 +59,7 @@ export function OpsPage() {
           <div className="section-heading"><div><span className="eyebrow">最近作业</span><h2>生成与修史</h2></div><button type="button" className="text-link" onClick={() => void load()}>刷新</button></div>
           <div className="table-wrap">
             <table><thead><tr><th>故事 / 章节</th><th>任务</th><th>模型</th><th>Token</th><th>延迟</th><th>成本</th><th>状态</th></tr></thead>
-              <tbody>{jobs.map((job) => <tr key={job.id}><td><strong>{job.storyTitle}</strong><small>第 {job.chapterNumber} 章 · {formatDateTime(job.createdAt)}</small></td><td>{job.task === "opening" ? "开篇" : job.task === "chapter" ? "续章" : job.task === "retcon" ? "修史" : "状态提取"}{job.filterSummary && <small title={job.filterSummary}>{job.candidateTrace ? `${job.candidateTrace.length} 个候选 · ${job.candidateTrace.filter((item) => item.status === "selected")[0]?.creativeAxis ?? "已过滤"}` : job.filterSummary}</small>}</td><td>{job.model}<small>{job.connectionId} · {job.promptVersion}</small></td><td>{job.tokens.toLocaleString("zh-CN")}</td><td>{(job.latencyMs / 1000).toFixed(1)}s</td><td>{job.costEstimated ? "≈" : ""}{money(job.cost)}</td><td><span className={`job-status job-status--${job.status}`}>{job.status === "completed" ? "完成" : job.status === "running" ? "运行中" : "失败"}</span></td></tr>)}</tbody>
+              <tbody>{jobs.map((job) => <tr key={job.id}><td><strong>{job.storyTitle}</strong><small>第 {job.chapterNumber} 章 · {formatDateTime(job.createdAt)}</small></td><td>{job.task === "opening" ? "开篇" : job.task === "chapter" ? "续章" : job.task === "retcon" ? "修史" : "状态提取"}{job.filterSummary && <small title={job.filterSummary}>{job.candidateTrace ? `${job.candidateTrace.length} 个候选 · ${job.candidateTrace.filter((item) => item.status === "selected")[0]?.creativeAxis ?? "已过滤"}` : job.filterSummary}</small>}</td><td>{job.model}<small>{job.connectionId} · {job.promptVersion}</small></td><td>{job.tokens.toLocaleString("zh-CN")}</td><td>{(job.latencyMs / 1000).toFixed(1)}s</td><td>{job.costEstimated ? "≈" : ""}{money(job.cost)}</td><td><span className={`job-status job-status--${job.status}`}>{job.status === "completed" ? "完成" : job.status === "running" ? "运行中" : job.status === "awaiting_user_review" ? "等待用户判断" : "失败"}</span></td></tr>)}</tbody>
             </table>
           </div>
         </section>
@@ -65,6 +75,23 @@ export function OpsPage() {
         <div className="section-heading"><div><span className="eyebrow">质量抽检聚合</span><h2>按模型、题材与提示词版本</h2></div><span>{qualityBreakdown.length} 组</span></div>
         <div className="table-wrap"><table><thead><tr><th>模型</th><th>题材</th><th>提示词</th><th>完成 / 作业</th><th>硬阻断</th><th>举报</th></tr></thead><tbody>
           {qualityBreakdown.map((bucket) => <tr key={bucket.key}><td>{bucket.model}</td><td>{bucket.genre}</td><td>{bucket.promptVersion}</td><td>{bucket.completed} / {bucket.jobs}</td><td>{bucket.blockedCandidates}</td><td>{bucket.reports}</td></tr>)}
+        </tbody></table></div>
+      </section>
+
+
+      <section className="jobs-panel quality-panel">
+        <div className="section-heading"><div><span className="eyebrow">上下文语义规则</span><h2>规则质量与用户选择</h2></div><span>{narrationReviewMetrics.length} 组</span></div>
+        <p className="ops-privacy-note">仅展示按规则版本聚合的结构化计数；用户保留率是误报率的近似信号，不提供原句或跨用户明细。</p>
+        <div className="table-wrap"><table><thead><tr><th>规则 / 版本</th><th>候选</th><th>模型放行</th><th>模型重写</th><th>模型询问</th><th>用户保留</th><th>用户重写</th><th>超时重写</th><th>重写成功</th><th>最终成功</th><th>最近发生</th></tr></thead><tbody>
+          {narrationReviewMetrics.map((bucket) => <tr key={bucket.key}><td><strong>{bucket.ruleId}</strong><small>{bucket.ruleVersion}</small></td><td>{bucket.candidates}</td><td>{bucket.modelAllow}</td><td>{bucket.modelRewrite}</td><td>{bucket.modelAskUser}</td><td><strong>{bucket.userKeep}</strong><small>{bucket.userKeep + bucket.userRewrite ? percent(bucket.userKeep / (bucket.userKeep + bucket.userRewrite), 1) : "0.0%"} · 误报近似</small></td><td>{bucket.userRewrite}</td><td>{bucket.timeoutRewrite}</td><td>{bucket.rewriteSucceeded}</td><td>{bucket.finalJobsCompleted}</td><td>{formatDateTime(bucket.lastSeenAt)}</td></tr>)}
+          {narrationReviewMetrics.length === 0 && <tr><td colSpan={11}>暂无上下文语义规则反馈；产生候选后会自动汇总结构化决定。</td></tr>}
+        </tbody></table></div>
+      </section>
+      <section className="jobs-panel quality-panel">
+        <div className="section-heading"><div><span className="eyebrow">可靠性纠错数据</span><h2>按原因、阶段与模型聚合的失败模式</h2></div><span>{failurePatterns.length} 组</span></div>
+        <div className="table-wrap"><table><thead><tr><th>原因码</th><th>阶段</th><th>模型</th><th>发生次数</th><th>影响作业</th><th>终止</th><th>重写后恢复</th><th>最近发生</th></tr></thead><tbody>
+          {failurePatterns.map((pattern) => <tr key={pattern.key}><td><strong>{pattern.reasonCode}</strong><small>{pattern.category}</small></td><td>{pattern.stage}</td><td>{pattern.model}</td><td>{pattern.occurrences}</td><td>{pattern.affectedJobs}</td><td>{pattern.terminalFailures}</td><td>{pattern.recoveredJobs}</td><td>{formatDateTime(pattern.lastSeenAt)}</td></tr>)}
+          {failurePatterns.length === 0 && <tr><td colSpan={8}>暂无结构化失败观测；后续生成重写、终止与服务中断会自动记录。</td></tr>}
         </tbody></table></div>
       </section>
 

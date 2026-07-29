@@ -1,9 +1,39 @@
 import type { GenerationJob } from "../src/types";
 
-export const CONTINUATION_JOB_TOKEN_BUDGET = 50_000;
+export interface ContinuationGenerationTier {
+  readonly attempt: 1 | 2 | 3;
+  readonly cumulativeTokenBudget: number;
+  readonly writerIdleTimeoutMs: number;
+}
+
+export const CONTINUATION_GENERATION_TIERS = Object.freeze([
+  Object.freeze({ attempt: 1, cumulativeTokenBudget: 50_000, writerIdleTimeoutMs: 300_000 }),
+  Object.freeze({ attempt: 2, cumulativeTokenBudget: 110_000, writerIdleTimeoutMs: 480_000 }),
+  Object.freeze({ attempt: 3, cumulativeTokenBudget: 170_000, writerIdleTimeoutMs: 720_000 }),
+] as const satisfies readonly ContinuationGenerationTier[]);
+
+export const CONTINUATION_JOB_TOKEN_BUDGET: number = CONTINUATION_GENERATION_TIERS[0].cumulativeTokenBudget;
+export const MAX_CONTINUATION_QUALITY_ATTEMPTS = CONTINUATION_GENERATION_TIERS.length;
 export const OPENING_JOB_TOKEN_BUDGET = 120_000;
 export const CHAPTER_EXTRACTION_ADMISSION_RESERVE = 14_000;
 const MODEL_CALL_FRAMING_TOKEN_RESERVE = 32;
+
+export function continuationGenerationTier(attempt: number): ContinuationGenerationTier {
+  if (!Number.isInteger(attempt) || attempt < 1 || attempt > CONTINUATION_GENERATION_TIERS.length) {
+    throw new RangeError(`续写最多允许 ${CONTINUATION_GENERATION_TIERS.length} 稿，收到稿次 ${attempt}。`);
+  }
+  return CONTINUATION_GENERATION_TIERS[attempt - 1] as ContinuationGenerationTier;
+}
+
+export function continuationGenerationBudgetIncrease(
+  currentBudget: number | undefined,
+  targetTier: ContinuationGenerationTier,
+): number {
+  const normalizedCurrentBudget = Number.isFinite(currentBudget)
+    ? Math.max(0, Math.floor(currentBudget ?? 0))
+    : 0;
+  return Math.max(0, targetTier.cumulativeTokenBudget - normalizedCurrentBudget);
+}
 
 interface GenerationTokenBudgetInput {
   jobs: GenerationJob[];
@@ -54,7 +84,8 @@ export function assertModelCallTokenBudget(input: ModelCallTokenBudgetInput): vo
 export function assertGenerationTokenBudget(input: GenerationTokenBudgetInput): void {
   const cutoff = (input.now ?? Date.now()) - 24 * 60 * 60 * 1_000;
   const recent = input.jobs.filter((job) => Date.parse(job.createdAt) >= cutoff);
-  const reserved = (job: GenerationJob) => job.status === "running"
+  const reserved = (job: GenerationJob) =>
+    job.status === "running" || job.status === "awaiting_user_review"
     ? (job.tokenBudget ?? input.defaultRunningBudget)
     : job.tokens;
   const userTokens = recent

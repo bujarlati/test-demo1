@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, readdir } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { build } from "esbuild";
 
@@ -60,5 +60,19 @@ await build({
   },
 });
 
+await build({
+  entryPoints: ["server/index.ts"],
+  outfile: "dist/node/server.js",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  banner: {
+    js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
+  },
+});
+
 await mkdir("dist/.openai", { recursive: true });
 await copyFile(".openai/hosting.json", "dist/.openai/hosting.json");
+await cp("server/database/migrations", "dist/server/database/migrations", { recursive: true });
+await cp("server/database/migrations", "dist/node/database/migrations", { recursive: true });

@@ -2,10 +2,21 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type { ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
+import type { ChapterGenerationStatusPayload, ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
 import { isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
 import { recoverableGenerationJobs } from "../src/jobRecovery";
-import { audit, authenticate, login, publicUser, requireAdmin, type AuthLocals } from "./auth";
+import {
+  audit,
+  authenticate,
+  createAuthSession,
+  createAuditEvent,
+  createReaderAccount,
+  hashSessionToken,
+  publicUser,
+  requireAdmin,
+  verifyPassword,
+  type AuthLocals,
+} from "./auth";
 import {
   assertSafeEndpoint,
   extractChapterStateWithConnection,
@@ -17,16 +28,59 @@ import {
   testConnection,
 } from "./modelGateway";
 import {
+  ChapterEditorialValidationError,
   buildChapterPrompt,
+  buildEditorialRevisionPrompt,
+  editorialRevisionIssuesForFailure,
   generateLocalChapter,
   planNextChapter,
   validateGeneratedChapter,
   type GenerationPlan,
   type GeneratedChapter,
   type ExtractedChapterState,
+  type ChapterEditorialIssue,
 } from "./narrativeEngine";
 import { handleReaderMessage, rollbackRetcon } from "./retconService";
-import { createStoreMutationGate, loadStore, saveStore, shouldAbandonQueuedRequest, usesPersistentStorage } from "./storage";
+import {
+  checkStorageHealth,
+  claimNarrationReviewDecision,
+  claimExpiredNarrationReviews,
+  contextualNarrationReviewEnabled,
+  deleteExpiredNarrationReviewData,
+  failExpiredNarrationReviewCase,
+  listRecoverableNarrationReviews,
+  findStoredGenerationJob,
+  getNarrationReviewCaseById,
+  getNarrationReviewCaseForOwner,
+  upsertNarrationReviewFeedback,
+  pauseOpeningForNarrationReview,
+  replaceNarrationReviewCase,
+  resolveNarrationReviewCase,
+  clearPersistedStoryModelConnection,
+  createStoreMutationGate,
+  deleteAuthSession,
+  deletePersistedModelConnection,
+  findUserByEmail,
+  findUserBySessionTokenHash,
+  findStoredStoryCreationRequest,
+  hasStoredIdempotencyKey,
+  listStoryPage,
+  listGenerationFailurePatterns,
+  listNarrationReviewMetrics,
+  loadOwnedStory,
+  loadStore,
+  registerUser,
+  releaseStoredIdempotencyKey,
+  reserveStoredIdempotencyKey,
+  saveAuthSession,
+  saveStore,
+  shouldAbandonQueuedRequest,
+  shouldSerializeFileStoreRequest,
+  storageBackend,
+  supportsDurableNarrationReview,
+  usesDatabaseStorage,
+  usesPersistentStorage,
+} from "./storage";
 import {
   commitNextChapter,
   finalizeStoryIfTargetReached,
@@ -34,8 +88,14 @@ import {
   toggleCharacterProtection,
 } from "./storyService";
 import { createStoryWithOpening, storyOpeningPublicationText } from "./openingService";
+import { OpeningJobService } from "./openingJobService";
+import { runNarrationReviewSweep, startNarrationReviewScheduler } from "./narrationReviewScheduler";
 import { accessibleConnectionOrThrow, connectionStatusAfterTestFailure, isManagedLocalConnection, listGenerationModelOptions } from "./modelConnectionAccess";
 import {
+  continuationGenerationBudgetIncrease,
+  continuationGenerationTier,
+  MAX_CONTINUATION_QUALITY_ATTEMPTS,
+  type ContinuationGenerationTier,
   assertGenerationTokenBudget,
   CHAPTER_EXTRACTION_ADMISSION_RESERVE,
   CONTINUATION_JOB_TOKEN_BUDGET as JOB_TOKEN_BUDGET,
@@ -46,6 +106,12 @@ import { deleteSecrets, storeSecret } from "./vault";
 import { assertSafetyAllowed, recordSafetyDecision, safetyCategories } from "./safetyService";
 import { appendStoryCoreEvent, createStoryConstraint, describeReaderStoryEvent, projectStoryWorldState } from "./storyCore";
 import { aiTraceEnabled, configuredAiTracePath, initializeAiTrace } from "./aiTrace";
+import {
+  appendGenerationFailure,
+  createGenerationFailureObservation,
+  sanitizeGenerationFailureMessage,
+} from "./failureTelemetry";
+import { readingExperienceCadenceAuditEvents } from "./readingExperience";
 
 interface HostedStaticAsset {
   body: string;
@@ -68,22 +134,33 @@ function sendHostedStaticAsset(assetPath: string, response: Response): boolean {
 
 const app = express();
 const store = await loadStore();
-const interruptedJobs = store.jobs.filter((job) => job.status === "running");
+const recoverableReviewJobIds = supportsDurableNarrationReview()
+  ? new Set((await listRecoverableNarrationReviews()).map((review) => review.jobId))
+  : new Set<string>();
+const interruptedJobs = store.jobs.filter((job) =>
+  job.status === "running" && !recoverableReviewJobIds.has(job.id)
+);
 if (interruptedJobs.length > 0) {
   for (const job of interruptedJobs) {
+    const interruption = new Error("服务重启中断了这次生成，正史没有提交；可以安全重试。");
     job.status = "failed";
-    job.filterSummary = "服务重启中断了这次生成，正史没有提交；可以安全重试。";
+    job.filterSummary = interruption.message;
+    appendGenerationFailure(store, createGenerationFailureObservation(job, interruption, {
+      stage: "服务恢复",
+      terminal: true,
+    }));
     if (job.idempotencyKey) {
-      const scopedKey = `${job.ownerId}:${job.idempotencyKey}`;
-      store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== scopedKey);
+      await releaseStoredIdempotencyKey(store, job.ownerId, job.idempotencyKey);
     }
   }
   await saveStore(store);
 }
 const port = Number(process.env.PORT ?? 8787);
+const host = process.env.HOST?.trim() || "0.0.0.0";
 const projectRoot = process.cwd();
 const storyMutationLocks = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
 const storyCoreWriteWindows = new Map<string, { count: number; resetAt: number }>();
 const STORY_CORE_WRITES_PER_MINUTE = 60;
 const USER_DAILY_TOKEN_BUDGET = 1_500_000;
@@ -93,7 +170,11 @@ const acquireStoreMutation = createStoreMutationGate();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
 app.use(async (request, response, next) => {
-  if (!request.path.startsWith("/api/") || request.path === "/api/health" || request.method === "OPTIONS") {
+  if (!shouldSerializeFileStoreRequest(request)) {
+    next();
+    return;
+  }
+  if (usesDatabaseStorage()) {
     next();
     return;
   }
@@ -138,6 +219,25 @@ function storyOrThrow(id: string, user: UserAccount) {
   return story;
 }
 
+function cacheStory(story: Story): void {
+  const previous = store.stories.findIndex((item) => item.id === story.id);
+  if (previous >= 0) store.stories.splice(previous, 1);
+  store.stories.unshift(story);
+  const configuredLimit = Number(process.env.XUMO_STORY_CACHE_SIZE ?? 32);
+  const limit = Number.isFinite(configuredLimit) ? Math.max(4, Math.min(256, configuredLimit)) : 32;
+  while (store.stories.length > limit) {
+    let removable = -1;
+    for (let index = store.stories.length - 1; index >= 0; index -= 1) {
+      if (!storyMutationLocks.has(store.stories[index].id)) {
+        removable = index;
+        break;
+      }
+    }
+    if (removable < 0) break;
+    store.stories.splice(removable, 1);
+  }
+}
+
 function storyIndexOrThrow(id: string) {
   const index = store.stories.findIndex((story) => story.id === id);
   if (index < 0) {
@@ -166,16 +266,13 @@ function assertCanonCommand(
   }
 }
 
-function reserveIdempotencyKey(userId: string, idempotencyKey: string) {
-  const scopedKey = `${userId}:${idempotencyKey}`;
-  if (store.idempotencyKeys.includes(scopedKey)) return { duplicate: true, scopedKey };
-  store.idempotencyKeys.push(scopedKey);
-  store.idempotencyKeys = store.idempotencyKeys.slice(-500);
-  return { duplicate: false, scopedKey };
+async function reserveIdempotencyKey(userId: string, idempotencyKey: string) {
+  const reserved = await reserveStoredIdempotencyKey(store, userId, idempotencyKey);
+  return { duplicate: !reserved };
 }
 
-function hasIdempotencyKey(userId: string, idempotencyKey: string) {
-  return store.idempotencyKeys.includes(`${userId}:${idempotencyKey}`);
+async function hasIdempotencyKey(userId: string, idempotencyKey: string) {
+  return hasStoredIdempotencyKey(store, userId, idempotencyKey);
 }
 
 function assertStoryCoreWriteRate(userId: string, storyId: string): void {
@@ -230,6 +327,76 @@ function assertTokenBudget(userId: string, storyId: string, requestedBudget = JO
     defaultRunningBudget: JOB_TOKEN_BUDGET,
     userLimit: USER_DAILY_TOKEN_BUDGET,
     storyLimit: STORY_DAILY_TOKEN_BUDGET,
+  });
+}
+
+const openingJobService = new OpeningJobService({
+  store,
+  persistence: {
+    save: (rollback) => persist(rollback),
+    findStoryCreationRequest: (ownerId, key) => findStoredStoryCreationRequest(store, ownerId, key),
+    loadStory: (ownerId, storyId) => loadOwnedStory(store, ownerId, storyId),
+    findJob: (ownerId, key) => findStoredGenerationJob(store, ownerId, key),
+    reserveIdempotencyKey: (ownerId, key) => reserveStoredIdempotencyKey(store, ownerId, key),
+    releaseIdempotencyKey: (ownerId, key) => releaseStoredIdempotencyKey(store, ownerId, key),
+    pauseOpeningForNarrationReview,
+    getNarrationReviewCaseForOwner,
+    getNarrationReviewCaseById,
+    claimNarrationReviewDecision,
+    replaceNarrationReviewCase,
+    resolveNarrationReviewCase,
+    failExpiredNarrationReviewCase,
+    upsertNarrationReviewFeedback,
+  },
+  resolveConnection: (owner, connectionId) => connectionOrThrow(connectionId, owner),
+  admitStart: async (owner, input, connection) => {
+    const safety = recordSafetyDecision(
+      store,
+      owner.id,
+      "story_input",
+      `${input.genre} ${input.tone ?? ""} ${input.inspiration ?? ""}`,
+    );
+    audit(store, owner.id, `safety.${safety.decision}`, "story", "new-story", { surface: safety.surface });
+    await persist();
+    assertSafetyAllowed(safety);
+    if (connection.status !== "active") {
+      const error = new Error(`\u6a21\u578b\u8fde\u63a5\u5f53\u524d\u4e3a ${connection.status}\uff0c\u8bf7\u5148\u5b8c\u6210\u8fde\u63a5\u6d4b\u8bd5\uff1b\u4e0d\u4f1a\u9759\u9ed8\u5207\u6362\u6a21\u578b\u3002`);
+      Object.assign(error, { status: 409 });
+      throw error;
+    }
+    if (isManagedLocalConnection(connection)) {
+      const error = new Error("\u5e73\u53f0\u6258\u7ba1\u8fde\u63a5\u5c1a\u672a\u914d\u7f6e\u771f\u5b9e\u751f\u6210\u6a21\u578b\uff0c\u8bf7\u9009\u62e9\u4e00\u4e2a\u5df2\u6d4b\u8bd5\u7684\u81ea\u5b9a\u4e49\u6a21\u578b\u8fde\u63a5\u3002");
+      Object.assign(error, { status: 409 });
+      throw error;
+    }
+    assertTokenBudget(owner.id, `opening_${owner.id}`, OPENING_JOB_TOKEN_BUDGET);
+  },
+  publicationGate: (story, owner) => {
+    const safety = recordSafetyDecision(
+      store,
+      owner.id,
+      "chapter_output",
+      storyOpeningPublicationText(story),
+      story.id,
+    );
+    assertSafetyAllowed(safety);
+  },
+});
+
+if (supportsDurableNarrationReview()) {
+  startNarrationReviewScheduler({
+    sweep: () => runNarrationReviewSweep({
+      now: new Date(),
+      repository: {
+        listRecoverableNarrationReviews,
+        claimExpiredNarrationReviews,
+        deleteExpiredNarrationReviewData,
+      },
+      resume: (caseId) => openingJobService.resumeClaimedCase(caseId),
+    }),
+    onError: (error) => {
+      console.error(`[NARRATION-REVIEW] Scheduler sweep failed: ${sanitizeGenerationFailureMessage(error)}`);
+    },
   });
 }
 
@@ -315,6 +482,16 @@ const createStorySchema = z.object({
   idempotencyKey: z.string().min(8).max(120).optional(),
 });
 
+const narrationReviewDecisionSchema = z.object({
+  caseId: z.string().min(1).max(120),
+  caseVersion: z.number().int().positive(),
+  contentHash: z.string().regex(/^[0-9a-f]{64}$/i),
+  candidateIds: z.array(z.string().min(1).max(120)).min(1).max(20)
+    .refine((ids) => new Set(ids).size === ids.length),
+  decision: z.enum(["keep", "rewrite"]),
+  shareRedactedContext: z.boolean().default(false),
+}).strict();
+
 const modelConnectionSchema = z.object({
   name: z.string().min(1).max(50),
   baseUrl: z.string().url(),
@@ -379,12 +556,14 @@ const appendEventSchema = z.object({
   idempotencyKey: z.string().trim().min(8).max(120).optional(),
 }).strict();
 
-app.get("/api/health", (_request, response) => {
+app.get("/api/health", async (_request, response) => {
+  await checkStorageHealth();
   response.json({
     ok: true,
     service: "xumo-api",
     aiTraceEnabled: aiTraceEnabled(),
-    storage: usesPersistentStorage() ? "filesystem" : "memory",
+    storage: storageBackend(),
+    persistent: usesPersistentStorage(),
   });
 });
 
@@ -397,8 +576,8 @@ app.post("/api/auth/login", async (request, response) => {
     return;
   }
   const body = z.object({ email: z.string().email(), password: z.string().min(8).max(200) }).parse(request.body);
-  const result = login(store, body.email, body.password);
-  if (!result) {
+  const user = await findUserByEmail(store, body.email);
+  if (!user || !verifyPassword(user, body.password)) {
     loginAttempts.set(key, {
       count: attempt && attempt.resetAt > now ? attempt.count + 1 : 1,
       resetAt: now + 10 * 60 * 1000,
@@ -407,39 +586,103 @@ app.post("/api/auth/login", async (request, response) => {
     return;
   }
   loginAttempts.delete(key);
+  const { token, session } = createAuthSession(user.id);
+  await saveAuthSession(store, session);
+  audit(store, user.id, "auth.login", "auth", user.id, { role: user.role });
   await persist();
-  response.json(result);
+  response.json({ token, user: publicUser(user) });
 });
 
-app.use("/api", authenticate(store));
+app.post("/api/auth/register", async (request, response) => {
+  const key = request.ip ?? "unknown";
+  const now = Date.now();
+  const attempt = registrationAttempts.get(key);
+  if (attempt && attempt.resetAt > now && attempt.count >= 5) {
+    response.status(429).json({ message: "注册尝试过多，请稍后再试。" });
+    return;
+  }
+  registrationAttempts.set(key, {
+    count: attempt && attempt.resetAt > now ? attempt.count + 1 : 1,
+    resetAt: now + 60 * 60 * 1000,
+  });
+  const body = z.object({
+    email: z.string().trim().email().max(254),
+    password: z.string().min(10).max(200),
+    name: z.string().trim().min(1).max(40),
+  }).parse(request.body);
+  const user = createReaderAccount(body.email, body.password, body.name);
+  const { token, session } = createAuthSession(user.id);
+  const event = createAuditEvent(user.id, "auth.register", "auth", user.id, { role: "reader" });
+  await registerUser(store, user, session, event);
+  registrationAttempts.delete(key);
+  response.status(201).json({ token, user: publicUser(user) });
+});
+
+app.use("/api", authenticate(store, (hash) => findUserBySessionTokenHash(store, hash)));
+
+app.param("storyId", async (request, response, next, storyId) => {
+  try {
+    const user = currentUser(response);
+    const story = await loadOwnedStory(store, user.id, String(storyId));
+    if (!story) {
+      response.status(404).json({ message: "故事不存在或不属于当前账号。" });
+      return;
+    }
+    cacheStory(story);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.post("/api/auth/logout", async (request, response) => {
   const header = request.header("authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const { createHash } = await import("node:crypto");
-  const hash = createHash("sha256").update(token).digest("hex");
-  store.sessions = store.sessions.filter((session) => session.tokenHash !== hash);
+  const hash = hashSessionToken(token);
+  await deleteAuthSession(store, hash);
   audit(store, currentUser(response).id, "auth.logout", "auth", currentUser(response).id);
   await persist();
   response.status(204).end();
 });
 
-app.get("/api/bootstrap", (_request, response) => {
+app.get("/api/bootstrap", async (_request, response) => {
   const user = currentUser(response);
   const userJobs = store.jobs.filter((job) => job.ownerId === user.id);
-  const stories = store.stories
-    .filter((story) => story.ownerId === user.id && story.status !== "archived")
-    .map(summarizeStory)
-    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  const storyPage = await listStoryPage(store, user.id, 24);
+  const stories = storyPage.stories;
   const availableStoryIds = new Set(stories.map((story) => story.id));
   response.json({
     user: publicUser(user),
     stories,
+    storyPage: {
+      nextCursor: storyPage.nextCursor,
+      totalStories: storyPage.totalStories,
+      totalChapters: storyPage.totalChapters,
+    },
     modelConnections: listGenerationModelOptions(store, user),
     activeStoryId: user.activeStoryId,
-    pendingJobs: userJobs.filter((job) => job.status === "running"),
+    pendingJobs: userJobs.filter((job) => job.status === "running" || job.status === "awaiting_user_review"),
     recoverableJobs: recoverableGenerationJobs(userJobs, availableStoryIds).slice(0, 3),
   });
+});
+
+app.get("/api/stories", async (request, response) => {
+  const cursor = typeof request.query.cursor === "string" ? request.query.cursor : undefined;
+  const requestedLimit = typeof request.query.limit === "string" ? Number(request.query.limit) : 24;
+  const limit = Number.isFinite(requestedLimit) ? requestedLimit : 24;
+  response.json(await listStoryPage(store, currentUser(response).id, limit, cursor));
+});
+
+app.get("/api/generation-jobs/:jobId", async (request, response) => {
+  const user = currentUser(response);
+  response.json(await openingJobService.getStatus(user.id, String(request.params.jobId)));
+});
+
+app.post("/api/generation-jobs/:jobId/narration-review", async (request, response) => {
+  const user = currentUser(response);
+  const body = narrationReviewDecisionSchema.parse(request.body);
+  const result = await openingJobService.decideNarrationReview(user.id, String(request.params.jobId), body);
+  response.status(202).json(result);
 });
 
 app.get("/api/stories/:storyId", async (request, response) => {
@@ -536,10 +779,22 @@ app.post("/api/stories", async (request, response) => {
   const user = currentUser(response);
   const input = createStorySchema.parse(request.body);
   const idempotencyKey = input.idempotencyKey ?? request.header("idempotency-key") ?? randomUUID();
-  const priorRequest = store.storyCreationRequests.find((item) => item.userId === user.id && item.idempotencyKey === idempotencyKey);
-  if (priorRequest) {
-    const priorStory = store.stories.find((story) => story.id === priorRequest.storyId && story.ownerId === user.id);
+  if (contextualNarrationReviewEnabled()) {
+    const result = await openingJobService.start({
+      owner: user,
+      input,
+      connectionId: input.modelConnectionId ?? user.defaultConnectionId,
+      idempotencyKey,
+    });
+    response.status(result.kind === "completed" ? 201 : 202).json(result);
+    return;
+  }
+
+  const priorStoryId = await findStoredStoryCreationRequest(store, user.id, idempotencyKey);
+  if (priorStoryId) {
+    const priorStory = await loadOwnedStory(store, user.id, priorStoryId);
     if (priorStory) {
+      cacheStory(priorStory);
       response.json(priorStory);
       return;
     }
@@ -566,11 +821,12 @@ app.post("/api/stories", async (request, response) => {
     throw error;
   }
   assertTokenBudget(user.id, `opening_${user.id}`, OPENING_JOB_TOKEN_BUDGET);
-  const reservation = reserveIdempotencyKey(user.id, idempotencyKey);
+  const reservation = await reserveIdempotencyKey(user.id, idempotencyKey);
   if (reservation.duplicate) {
-    const duplicateRequest = store.storyCreationRequests.find((item) => item.userId === user.id && item.idempotencyKey === idempotencyKey);
-    const duplicateStory = duplicateRequest ? store.stories.find((story) => story.id === duplicateRequest.storyId) : undefined;
+    const duplicateStoryId = await findStoredStoryCreationRequest(store, user.id, idempotencyKey);
+    const duplicateStory = duplicateStoryId ? await loadOwnedStory(store, user.id, duplicateStoryId) : undefined;
     if (duplicateStory) {
+      cacheStory(duplicateStory);
       response.json(duplicateStory);
       return;
     }
@@ -613,6 +869,16 @@ app.post("/api/stories", async (request, response) => {
         selectedConnection,
         undefined,
         OPENING_JOB_TOKEN_BUDGET,
+        async (failure) => {
+          appendGenerationFailure(store, createGenerationFailureObservation(job, failure.error, {
+            stage: failure.stage,
+            attempt: failure.attempt,
+            terminal: false,
+            latencyMs: Math.round(performance.now() - startedAt),
+            tokens: openingUsageTokens,
+          }));
+          await persist();
+        },
       ),
       (generated) => {
         openingUsageTokens = generated.usageTokens;
@@ -646,7 +912,7 @@ app.post("/api/stories", async (request, response) => {
       filterSummary: "规划、正文与双体验证据检查均已通过。",
     });
     const previousActiveStoryId = user.activeStoryId;
-    store.stories.unshift(story);
+    cacheStory(story);
     user.activeStoryId = story.id;
     store.storyCreationRequests.push({ userId: user.id, idempotencyKey, storyId: story.id, createdAt: new Date().toISOString() });
     store.storyCreationRequests = store.storyCreationRequests.slice(-500);
@@ -666,7 +932,7 @@ app.post("/api/stories", async (request, response) => {
     }
     response.status(201).json(story);
   } catch (error) {
-    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    await releaseStoredIdempotencyKey(store, user.id, idempotencyKey);
     recordFailedJobUsage(job, error, {
       tokens: openingUsageTokens,
       estimated: openingUsageEstimated,
@@ -677,6 +943,12 @@ app.post("/api/stories", async (request, response) => {
       latencyMs: Math.round(performance.now() - startedAt),
       filterSummary: `${error instanceof Error ? error.message : "开篇生成失败"}；故事未创建，可以安全重试。`,
     });
+    appendGenerationFailure(store, createGenerationFailureObservation(job, error, {
+      stage: "开篇生成",
+      terminal: true,
+      latencyMs: job.latencyMs,
+      tokens: job.tokens,
+    }));
     await persist();
     if (error instanceof Error && !("status" in error)) {
       Object.assign(error, { status: /体验|沉浸|Schema|第一章|开篇/.test(error.message) ? 422 : 502 });
@@ -727,7 +999,7 @@ async function generateChapter(
     Object.assign(error, { status: 409 });
     throw error;
   }
-  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+  if (await hasIdempotencyKey(user.id, body.idempotencyKey)) {
     return duplicateGenerationResult(storedStory, user.id, body.idempotencyKey);
   }
   assertCanonCommand(storedStory, body);
@@ -747,7 +1019,7 @@ async function generateChapter(
     Object.assign(error, { status: 409 });
     throw error;
   }
-  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  const reservation = await reserveIdempotencyKey(user.id, body.idempotencyKey);
   if (reservation.duplicate) return duplicateGenerationResult(storedStory, user.id, body.idempotencyKey);
   storyMutationLocks.add(storedStory.id);
   const baselineStory = structuredClone(storedStory);
@@ -791,60 +1063,120 @@ async function generateChapter(
   let firstTokenMs: number | undefined;
   let effectiveConnection = connection;
   let isManagedLocal = isManagedLocalConnection(connection);
+  const maximumQualityAttempts = isManagedLocal ? 1 : MAX_CONTINUATION_QUALITY_ATTEMPTS;
+  let nextQualityAttempt = 1;
+  let editorialRevision: { originalDraft: GeneratedChapter; issues: ChapterEditorialIssue[] } | undefined;
+  const reserveContinuationTier = async (tier: ContinuationGenerationTier) => {
+    const previousBudget = job.tokenBudget ?? JOB_TOKEN_BUDGET;
+    const requestedIncrease = continuationGenerationBudgetIncrease(previousBudget, tier);
+    if (requestedIncrease <= 0) return;
+
+    assertTokenBudget(user.id, story.id, requestedIncrease);
+    job.tokenBudget = tier.cumulativeTokenBudget;
+    audit(store, user.id, "generation.budget-tier-promoted", "generation", job.id, {
+      qualityAttempt: tier.attempt,
+      revisionNumber: tier.attempt - 1,
+      previousTokenBudget: previousBudget,
+      targetTokenBudget: tier.cumulativeTokenBudget,
+      writerIdleTimeoutMs: tier.writerIdleTimeoutMs,
+      usedTokens,
+      connectionId: effectiveConnection.id,
+    });
+    const promotionAuditId = store.auditEvents[0]?.id;
+    const rollbackPromotion = () => {
+      job.tokenBudget = previousBudget;
+      if (promotionAuditId) {
+        store.auditEvents = store.auditEvents.filter((event) => event.id !== promotionAuditId);
+      }
+    };
+    try {
+      await persist(rollbackPromotion);
+    } catch (error) {
+      rollbackPromotion();
+      const persistenceError = new Error("退修预算档位未能保存，未启动下一稿。");
+      Object.assign(persistenceError, {
+        cause: error,
+        code: "continuation_tier_persistence_failed",
+      });
+      throw persistenceError;
+    }
+  };
   try {
     await persist();
     emit("stage", { stage: 0, label: "组装当前正史与相关记忆" });
     const runGenerationPipeline = async () => {
-      plan = undefined;
       generated = undefined;
       extracted = undefined;
-      if (usedTokens >= JOB_TOKEN_BUDGET) {
-        throw new Error("前序模型调用已耗尽本次 Token 预算，未继续启动回退调用。");
+      const planningBudget = job.tokenBudget ?? JOB_TOKEN_BUDGET;
+      if (!plan) {
+        if (usedTokens >= planningBudget) {
+          throw new Error("前序模型调用已耗尽本次 Token 预算，未继续启动回退调用。");
+        }
+        const candidateBatch = isManagedLocal
+          ? undefined
+          : await generateCandidateDraftsWithConnection(
+            effectiveConnection,
+            story,
+            undefined,
+            planningBudget - usedTokens,
+          );
+        if (candidateBatch) {
+          usedTokens += candidateBatch.usageTokens;
+          usageEstimated ||= candidateBatch.usageEstimated;
+        }
+        const candidateDrafts = candidateBatch?.candidates;
+        if (candidateDrafts && usedTokens > planningBudget * 0.2) {
+          candidateDrafts.splice(3);
+          budgetDegraded = true;
+        }
+        const crossStoryRecentAxes = store.stories
+          .filter((item) => item.ownerId === user.id && item.id !== story.id)
+          .flatMap((item) => item.events.filter((event) => event.active && event.branchId === item.activeBranchId).slice(-8).map((event) => event.creativeAxis))
+          .filter((axis): axis is string => Boolean(axis));
+        plan = planNextChapter(story, candidateDrafts, body.chapterLength, crossStoryRecentAxes);
+        for (const candidate of plan.candidates) {
+          recordSafetyDecision(
+            store,
+            user.id,
+            "candidate",
+            `${candidate.event} ${candidate.cause} ${candidate.cost} ${candidate.impact}`,
+            story.id,
+          );
+        }
+        emit("stage", { stage: 1, label: `生成 ${plan.candidates.length} 个短剧情胶囊` });
+        emit("stage", { stage: 2, label: plan.filterSummary });
       }
-      const candidateBatch = isManagedLocal
-        ? undefined
-        : await generateCandidateDraftsWithConnection(
-          effectiveConnection,
-          story,
-          undefined,
-          JOB_TOKEN_BUDGET - usedTokens,
-        );
-      if (candidateBatch) {
-        usedTokens += candidateBatch.usageTokens;
-        usageEstimated ||= candidateBatch.usageEstimated;
-      }
-      const candidateDrafts = candidateBatch?.candidates;
-      if (candidateDrafts && usedTokens > JOB_TOKEN_BUDGET * 0.2) {
-        candidateDrafts.splice(3);
-        budgetDegraded = true;
-      }
-      const crossStoryRecentAxes = store.stories
-        .filter((item) => item.ownerId === user.id && item.id !== story.id)
-        .flatMap((item) => item.events.filter((event) => event.active && event.branchId === item.activeBranchId).slice(-8).map((event) => event.creativeAxis))
-        .filter((axis): axis is string => Boolean(axis));
-      plan = planNextChapter(story, candidateDrafts, body.chapterLength, crossStoryRecentAxes);
-      for (const candidate of plan.candidates) {
-        recordSafetyDecision(
-          store,
-          user.id,
-          "candidate",
-          `${candidate.event} ${candidate.cause} ${candidate.cost} ${candidate.impact}`,
-          story.id,
-        );
-      }
-      emit("stage", { stage: 1, label: `生成 ${plan.candidates.length} 个短剧情胶囊` });
-      emit("stage", { stage: 2, label: plan.filterSummary });
-      const basePrompt = buildChapterPrompt(story, plan);
-      const maxQualityAttempts = isManagedLocal ? 1 : 2;
-      let qualityFailure: unknown;
-      for (let qualityAttempt = 1; qualityAttempt <= maxQualityAttempts; qualityAttempt += 1) {
+
+      const generationPlan = plan;
+      if (!generationPlan) throw new Error("续写管线没有产生可复用的剧情计划。");
+      const basePrompt = buildChapterPrompt(story, generationPlan);
+      while (nextQualityAttempt <= maximumQualityAttempts) {
+        const qualityAttempt = nextQualityAttempt;
+        const tier = continuationGenerationTier(qualityAttempt);
         generated = undefined;
         extracted = undefined;
-        const rewriteTargetMin = Math.max(plan.minCharacters + 200, plan.targetCharacters - 100);
-        const rewriteTargetMax = Math.min(plan.maxCharacters - 100, plan.targetCharacters + 300);
+        if (qualityAttempt > 1 && !editorialRevision) {
+          throw new Error("章节退修缺少上一稿或具体审核意见，已停止生成。");
+        }
+        if (qualityAttempt > 1) {
+          await reserveContinuationTier(tier);
+          emit("stage", {
+            stage: 2,
+            label: `正在基于上一稿进行第 ${qualityAttempt - 1} 次定向退修`,
+          });
+        }
+        const activeTokenBudget = job.tokenBudget ?? tier.cumulativeTokenBudget;
+        if (usedTokens >= activeTokenBudget) {
+          throw new Error("前序模型调用已耗尽当前退修档位的 Token 预算，未启动下一稿。");
+        }
         const prompt = qualityAttempt === 1
           ? basePrompt
-          : `${basePrompt}\n请另起思路生成一份全新成稿，只呈现人物在故事世界中当下可感知的行动、对话与结果，不要解释或复述任何写作要求。成稿长度请稳定落在 ${rewriteTargetMin}—${rewriteTargetMax} 字，并用具体动作分别兑现两个阅读体验。`;
+          : buildEditorialRevisionPrompt(
+            story,
+            generationPlan,
+            editorialRevision!.originalDraft,
+            editorialRevision!.issues,
+          );
         const writerInputBudget = estimateChapterWriterInputTokenBudget(
           prompt,
           Boolean(effectiveConnection.capabilities?.streaming),
@@ -854,13 +1186,13 @@ async function generateChapter(
           : body.chapterLength === "standard" ? 5_800 : 6_500;
         const writerTokenBudget = Math.min(
           writerOutputLimit,
-          Math.floor(JOB_TOKEN_BUDGET - usedTokens - writerInputBudget - CHAPTER_EXTRACTION_ADMISSION_RESERVE),
+          Math.floor(activeTokenBudget - usedTokens - writerInputBudget - CHAPTER_EXTRACTION_ADMISSION_RESERVE),
         );
         if (!isManagedLocal && writerTokenBudget < 2_000) {
-          throw new Error("候选与上下文已接近 Token 上限，未启动正文调用；可以缩短章节后重试。");
+          throw new Error("候选与上下文已接近当前退修档位的 Token 上限，未启动正文调用；可以缩短章节后重试。");
         }
         if (isManagedLocal) {
-          generated = generateLocalChapter(story, plan);
+          generated = generateLocalChapter(story, generationPlan);
         } else if (effectiveConnection.capabilities?.streaming) {
           generated = await streamChapterWithConnection(
             effectiveConnection,
@@ -878,7 +1210,8 @@ async function generateChapter(
             },
             writerTokenBudget,
             undefined,
-            JOB_TOKEN_BUDGET - usedTokens,
+            activeTokenBudget - usedTokens,
+            tier.writerIdleTimeoutMs,
           );
         } else {
           generated = await generateChapterWithConnection(
@@ -886,7 +1219,8 @@ async function generateChapter(
             prompt,
             writerTokenBudget,
             undefined,
-            JOB_TOKEN_BUDGET - usedTokens,
+            activeTokenBudget - usedTokens,
+            tier.writerIdleTimeoutMs,
           );
         }
         if (isManagedLocal) {
@@ -904,31 +1238,66 @@ async function generateChapter(
             isTerminalPlannedChapter ? story.endingContract : undefined,
             story.readingExperience,
             undefined,
-            JOB_TOKEN_BUDGET - usedTokens,
+            activeTokenBudget - usedTokens,
             story.chapters.length + 1,
           );
           usedTokens += extracted.usageTokens ?? 0;
           usageEstimated ||= extracted.usageEstimated ?? true;
         }
-        if (usedTokens > JOB_TOKEN_BUDGET) throw new Error(`本次作业超过 ${JOB_TOKEN_BUDGET.toLocaleString("en-US")} Token 上限，未提交正史。`);
+        if (usedTokens > activeTokenBudget) {
+          throw new Error(`本次作业超过当前 ${activeTokenBudget.toLocaleString("en-US")} Token 退修档位上限，未提交正史。`);
+        }
         try {
-          validateGeneratedChapter(story, generated, plan, extracted);
-          qualityFailure = undefined;
-          break;
+          validateGeneratedChapter(story, generated, generationPlan, extracted);
+          return;
         } catch (validationError) {
-          qualityFailure = validationError;
-          if (qualityAttempt >= maxQualityAttempts) throw validationError;
+          const editorialIssues = editorialRevisionIssuesForFailure(
+            validationError,
+            extracted?.editorialIssues,
+          );
+          const canRevise = !isManagedLocal &&
+            generated !== undefined &&
+            editorialIssues.length > 0 &&
+            qualityAttempt < maximumQualityAttempts;
+          appendGenerationFailure(store, createGenerationFailureObservation(job, validationError, {
+            stage: "章节质量校验",
+            attempt: qualityAttempt,
+            terminal: !canRevise,
+            latencyMs: Math.round(performance.now() - startedAt),
+            tokens: usedTokens,
+          }));
+          if (!canRevise) throw validationError;
+
+          editorialRevision = {
+            originalDraft: {
+              ...generated,
+              paragraphs: [...generated.paragraphs],
+            },
+            issues: editorialIssues,
+          };
+          nextQualityAttempt = qualityAttempt + 1;
+          const affectedAxes = Array.from(new Set(editorialIssues
+            .map((issue) => issue.axisWord)
+            .filter((word): word is string => Boolean(word))));
           if (streamedParagraphCount > 0) {
             streamedParagraphCount = 0;
-            emit("reset_draft", { reason: "正文未同时兑现两个阅读体验，已自动撤回并重写。" });
+            const axisSummary = affectedAxes.length > 0 ? "“" + affectedAxes.join("、") + "”" : "约定";
+            emit("reset_draft", {
+              reason: "审核发现正文尚未充分兑现" + axisSummary + "体验，正在根据原稿修改。",
+            });
           }
           audit(store, user.id, "generation.quality-rewrite", "generation", story.id, {
             attempt: qualityAttempt,
-            reason: validationError instanceof Error ? validationError.message : "quality validation failed",
+            nextAttempt: nextQualityAttempt,
+            mode: "editorial_revision",
+            issueCodes: Array.from(new Set(editorialIssues.map((issue) => issue.code))).join(","),
+            axisIds: Array.from(new Set(editorialIssues.map((issue) => issue.axisId).filter(Boolean))).join(","),
+            axisWords: affectedAxes.join(","),
+            issueSources: Array.from(new Set(editorialIssues.map((issue) => issue.source))).join(","),
           });
         }
       }
-      if (qualityFailure) throw qualityFailure;
+      throw new Error(`章节已达到最多 ${maximumQualityAttempts} 稿，未产生可提交正文。`);
     };
     const runGenerationPipelineWithUsage = async () => {
       try {
@@ -943,7 +1312,13 @@ async function generateChapter(
     try {
       await runGenerationPipelineWithUsage();
     } catch (routeError) {
-      if (routeError instanceof Error && "status" in routeError && routeError.status === 422) throw routeError;
+      const routeStatus = routeError instanceof Error && "status" in routeError ? routeError.status : undefined;
+      const routeCode = routeError instanceof Error && "code" in routeError ? routeError.code : undefined;
+      if (
+        routeStatus === 422 || routeStatus === 429 ||
+        routeError instanceof ChapterEditorialValidationError ||
+        routeCode === "continuation_tier_persistence_failed"
+      ) throw routeError;
       if (connection.fallbackPolicy === "none") throw routeError;
       if (connection.fallbackPolicy === "same_connection") {
         effectiveConnection = {
@@ -989,7 +1364,22 @@ async function generateChapter(
       emit("paragraph", { index, title: generated.title, paragraph });
       if (isManagedLocal) await new Promise((resolve) => setTimeout(resolve, 90));
     }
+    const experienceLedgerBeforeCommit = story.readingExperienceDeliveryLedger?.map((entry) => ({ ...entry }));
     const chapter = commitNextChapter(story, plan, generated, extracted);
+    const committedRevision = chapter.revisions.find((revision) => revision.id === chapter.currentRevisionId);
+    for (const cadenceEvent of readingExperienceCadenceAuditEvents(
+      story.readingExperience,
+      experienceLedgerBeforeCommit,
+      story.readingExperienceDeliveryLedger,
+      committedRevision?.experienceDelivery,
+    )) {
+      const { code, ...cadenceMetadata } = cadenceEvent;
+      audit(store, user.id, code, "generation", chapter.id, {
+        storyId: story.id,
+        chapterNumber: chapter.number,
+        ...cadenceMetadata,
+      });
+    }
     finalizeStoryIfTargetReached(story);
     emit("stage", { stage: 4, label: "事件已提取并提交为不可变 Revision" });
     Object.assign(job, {
@@ -1034,7 +1424,7 @@ async function generateChapter(
     }
     return { story, chapter, duplicate: false };
   } catch (error) {
-    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    await releaseStoredIdempotencyKey(store, user.id, body.idempotencyKey);
     Object.assign(job, {
       model: effectiveConnection.routes.writer,
       connectionId: effectiveConnection.id,
@@ -1048,6 +1438,13 @@ async function generateChapter(
       candidateTrace: plan?.candidates,
       filterSummary: error instanceof Error ? error.message : "生成失败",
     });
+    appendGenerationFailure(store, createGenerationFailureObservation(job, error, {
+      stage: "章节生成",
+      terminal: true,
+      attempt: nextQualityAttempt,
+      latencyMs: job.latencyMs,
+      tokens: job.tokens,
+    }));
     audit(store, user.id, "generation.failed", "generation", story.id, {
       connectionId: connection.id,
       reason: error instanceof Error ? error.message : "unknown",
@@ -1064,6 +1461,36 @@ const generateSchema = z.object({
   branchId: z.string().min(1),
   baseCanonVersion: z.number().int().positive(),
   chapterLength: z.enum(["compact", "standard", "immersive"]).default("standard"),
+});
+
+const chapterGenerationStatusSchema = z.object({
+  idempotencyKey: z.string().min(8).max(120),
+}).strict();
+
+app.post("/api/stories/:storyId/chapters/generation-status", async (request, response) => {
+  const user = currentUser(response);
+  const story = storyOrThrow(request.params.storyId, user);
+  const { idempotencyKey } = chapterGenerationStatusSchema.parse(request.body);
+  const job = await findStoredGenerationJob(store, user.id, idempotencyKey);
+  response.setHeader("Cache-Control", "no-store");
+
+  let payload: ChapterGenerationStatusPayload;
+  if (!job || job.storyId !== story.id || job.task !== "chapter") {
+    payload = { status: "not_found" };
+  } else if (job.status === "completed") {
+    payload = { jobId: job.id, status: "completed", story };
+  } else if (job.status === "failed") {
+    const failure = store.generationFailures.find((observation) => observation.jobId === job.id && observation.terminal);
+    payload = {
+      jobId: job.id,
+      status: "failed",
+      message: failure?.message ?? sanitizeGenerationFailureMessage(job.filterSummary || "续章失败。"),
+      retryable: failure?.retryable ?? true,
+    };
+  } else {
+    payload = { jobId: job.id, status: "running" };
+  }
+  response.json(payload);
 });
 
 app.post("/api/stories/:storyId/chapters/generate", async (request, response, next) => {
@@ -1086,6 +1513,10 @@ app.post("/api/stories/:storyId/chapters/generate", async (request, response, ne
   const emit = (event: string, payload: unknown) => {
     response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
   };
+  const heartbeat = setInterval(() => {
+    if (!response.writableEnded && !response.destroyed) response.write(": keep-alive\n\n");
+  }, 15_000);
+  heartbeat.unref();
   try {
     const result = await generateChapter(request.params.storyId, user, body, emit);
     emit("complete", result);
@@ -1093,6 +1524,7 @@ app.post("/api/stories/:storyId/chapters/generate", async (request, response, ne
     const message = error instanceof Error ? error.message : "续章失败。";
     emit("error", { message });
   } finally {
+    clearInterval(heartbeat);
     response.end();
   }
 });
@@ -1138,12 +1570,12 @@ app.post("/api/stories/:storyId/messages", async (request, response) => {
     response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
     return;
   }
-  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+  if (await hasIdempotencyKey(user.id, body.idempotencyKey)) {
     response.json({ story: storedStory, duplicate: true });
     return;
   }
   assertCanonCommand(storedStory, body);
-  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  const reservation = await reserveIdempotencyKey(user.id, body.idempotencyKey);
   if (reservation.duplicate) {
     response.json({ story: storedStory, duplicate: true });
     return;
@@ -1178,7 +1610,7 @@ app.post("/api/stories/:storyId/messages", async (request, response) => {
     store.stories[storyIndexOrThrow(storedStory.id)] = storedStory;
     store.jobs = previousJobs;
     store.auditEvents = previousAuditEvents;
-    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    await releaseStoredIdempotencyKey(store, user.id, body.idempotencyKey);
     throw error;
   } finally {
     storyMutationLocks.delete(storedStory.id);
@@ -1278,7 +1710,7 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
     response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
     return;
   }
-  if (hasIdempotencyKey(user.id, body.idempotencyKey)) {
+  if (await hasIdempotencyKey(user.id, body.idempotencyKey)) {
     const priorRollback = storedStory.retcons.find(
       (item) => item.kind === "rollback" && item.reversesRetconId === request.params.retconId,
     );
@@ -1286,7 +1718,7 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
     return;
   }
   assertCanonCommand(storedStory, body);
-  const reservation = reserveIdempotencyKey(user.id, body.idempotencyKey);
+  const reservation = await reserveIdempotencyKey(user.id, body.idempotencyKey);
   if (reservation.duplicate) {
     response.json({ story: storedStory, duplicate: true });
     return;
@@ -1307,7 +1739,7 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
   } catch (error) {
     store.stories[storyIndexOrThrow(storedStory.id)] = storedStory;
     store.auditEvents = previousAuditEvents;
-    store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== reservation.scopedKey);
+    await releaseStoredIdempotencyKey(store, user.id, body.idempotencyKey);
     throw error;
   } finally {
     storyMutationLocks.delete(storedStory.id);
@@ -1536,6 +1968,8 @@ app.delete("/api/model-connections/:connectionId", requireAdmin, async (request,
   const fallback = store.connections.find((item) => item.id === "conn_platform")!;
   for (const account of store.users) if (account.defaultConnectionId === connection.id) account.defaultConnectionId = fallback.id;
   for (const story of store.stories) if (story.modelConnectionId === connection.id) story.modelConnectionId = null;
+  await clearPersistedStoryModelConnection(connection.id);
+  await deletePersistedModelConnection(connection.id);
   store.connections = store.connections.filter((item) => item.id !== connection.id);
   audit(store, user.id, "connection.delete", "connection", connection.id, { retainedHistoricalJobReferences: true });
   await persist();
@@ -1589,10 +2023,16 @@ app.post("/api/model-connections/:connectionId/default", requireAdmin, async (re
   response.json({ defaultConnectionId: connection.id });
 });
 
-app.get("/api/ops", requireAdmin, (_request, response) => {
+app.get("/api/ops", requireAdmin, async (_request, response) => {
+  const [failurePatterns, narrationReviewMetrics] = await Promise.all([
+    listGenerationFailurePatterns(store, 30),
+    listNarrationReviewMetrics(30),
+  ]);
   response.json({
     metrics: calculateOpsMetrics(),
     qualityBreakdown: calculateQualityBreakdown(),
+    narrationReviewMetrics,
+    failurePatterns,
     jobs: store.jobs.slice(0, 20),
     auditEvents: store.auditEvents.slice(0, 30),
     reports: store.contentReports.slice(0, 30),
@@ -1637,8 +2077,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
   response.status(status).json({ message, ...(safetyDecisionId ? { safetyDecisionId } : {}) });
 });
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Xumo API listening on http://0.0.0.0:${port}`);
+app.listen(port, host, () => {
+  console.log(`Xumo API listening on http://${host}:${port}`);
   if (aiTraceEnabled()) {
     void initializeAiTrace();
     console.log(`[AI-TRACE] 完整模型问答将写入 ${configuredAiTracePath()}`);

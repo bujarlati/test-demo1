@@ -1,12 +1,18 @@
 import { ArrowLeft, ArrowRight, Check, CircleAlert, Dices, LoaderCircle, ServerCog, Sparkles } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { api } from "../api";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { api, ApiError } from "../api";
 import { BookCover } from "../components/BookCover";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
+import {
+  createInitialOpeningJobState,
+  openingJobReducer,
+  openingJobSecondsRemaining,
+  recoverOpeningJobId,
+} from "../openingJobState";
 import { composeCustomTone, CUSTOM_TONE_WORD_MAX_LENGTH, DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
-import type { GenerationModelOption, ModelConnectionStatus } from "../types";
+import type { GenerationModelOption, ModelConnectionStatus, PendingNarrationReviewView } from "../types";
 
 const connectionStatusLabel: Record<ModelConnectionStatus, string> = {
   draft: "待测试",
@@ -43,23 +49,44 @@ function preferredConnection(connections: GenerationModelOption[]) {
   return connections.find((connection) => canGenerateWith(connection) && connection.isDefault)
     ?? connections.find(canGenerateWith);
 }
+type ReviewCandidate = PendingNarrationReviewView["candidates"][number];
+
+function HighlightedReviewSentence({ candidate }: { candidate: ReviewCandidate }) {
+  const start = Math.max(0, Math.min(candidate.sentence.length, candidate.highlightStart));
+  const end = Math.max(start, Math.min(candidate.sentence.length, candidate.highlightEnd));
+  return (
+    <>
+      {candidate.sentence.slice(0, start)}
+      <mark>{candidate.sentence.slice(start, end)}</mark>
+      {candidate.sentence.slice(end)}
+    </>
+  );
+}
 
 export function NewStoryPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const toast = useToast();
-  const { data, refresh } = useApp();
+  const { data, refresh, reconcileOpeningJobStatus } = useApp();
   const [genre, setGenre] = useState<StoryGenre>("悬疑");
   const [presetTone, setPresetTone] = useState<string>(STORY_TONES[0]);
   const [toneMode, setToneMode] = useState<"preset" | "custom">("preset");
   const [customToneWords, setCustomToneWords] = useState<[string, string]>(["", ""]);
   const [lengthPlan, setLengthPlan] = useState<StoryLengthPlanId>(DEFAULT_STORY_LENGTH.id);
   const [inspiration, setInspiration] = useState("");
-  const [creating, setCreating] = useState(false);
   const [stage, setStage] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [openingJob, dispatchOpeningJob] = useReducer(
+    openingJobReducer,
+    undefined,
+    () => createInitialOpeningJobState(crypto.randomUUID()),
+  );
   const [modelConnectionId, setModelConnectionId] = useState(
     () => preferredConnection(data?.modelConnections ?? [])?.id ?? "",
   );
-  const creationIdempotencyKey = useRef(crypto.randomUUID());
+  const pollRequestId = useRef(0);
+  const mounted = useRef(true);
+  const completedStoryId = useRef<string | null>(null);
 
   const preview = useMemo(() => getGenreOption(genre), [genre]);
   const selectedLength = useMemo(
@@ -76,6 +103,13 @@ export function NewStoryPage() {
     () => modelConnections.find((connection) => connection.id === modelConnectionId && canGenerateWith(connection)),
     [modelConnectionId, modelConnections],
   );
+  const requestedJobId = searchParams.get("job");
+  const isGenerating = openingJob.phase === "starting" || openingJob.phase === "polling";
+  const isAwaitingReview = openingJob.phase === "awaiting_user_review" || openingJob.phase === "submitting_decision";
+  const isBusy = isGenerating || isAwaitingReview || openingJob.phase === "completed";
+  const secondsRemaining = openingJob.review
+    ? openingJobSecondsRemaining(openingJob.review.deadlineAt, nowMs)
+    : 0;
 
   useEffect(() => {
     setModelConnectionId((currentId) => {
@@ -85,6 +119,84 @@ export function NewStoryPage() {
       return preferredConnection(modelConnections)?.id ?? "";
     });
   }, [modelConnections]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isGenerating) return;
+    const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 900);
+    return () => window.clearInterval(timer);
+  }, [isGenerating]);
+
+  useEffect(() => {
+    if (!isAwaitingReview) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [isAwaitingReview, openingJob.review?.id]);
+
+  useEffect(() => {
+    if (openingJob.phase !== "idle" || openingJob.jobId) return;
+    const recoveredJobId = recoverOpeningJobId(data?.pendingJobs ?? [], requestedJobId);
+    if (!recoveredJobId) return;
+    dispatchOpeningJob({ type: "recover_job", jobId: recoveredJobId });
+    if (!requestedJobId) navigate(`/new?job=${encodeURIComponent(recoveredJobId)}`, { replace: true });
+  }, [data?.pendingJobs, navigate, openingJob.jobId, openingJob.phase, requestedJobId]);
+
+  useEffect(() => {
+    const jobId = openingJob.jobId;
+    if (!jobId || (openingJob.phase !== "polling" && openingJob.phase !== "awaiting_user_review")) return;
+    let disposed = false;
+    let timer: number | undefined;
+    let controller: AbortController | null = null;
+
+    const poll = async () => {
+      const requestId = ++pollRequestId.current;
+      controller = new AbortController();
+      dispatchOpeningJob({ type: "poll_started", requestId });
+      try {
+        const status = await api.generationJob(jobId, controller.signal);
+        if (disposed) return;
+        dispatchOpeningJob({ type: "status_received", requestId, status });
+        reconcileOpeningJobStatus(status);
+        if (status.status === "completed" || status.status === "failed") void refresh();
+      } catch (error) {
+        if (disposed || (error instanceof Error && error.name === "AbortError")) return;
+        dispatchOpeningJob({
+          type: "poll_error",
+          requestId,
+          message: error instanceof Error ? error.message : "暂时无法读取生成进度，系统会继续重试。",
+        });
+      } finally {
+        if (!disposed) timer = window.setTimeout(() => void poll(), 2_000);
+      }
+    };
+
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [openingJob.jobId, openingJob.phase, reconcileOpeningJobStatus, refresh]);
+
+  useEffect(() => {
+    if (openingJob.phase !== "completed" || !openingJob.storyId) return;
+    if (completedStoryId.current === openingJob.storyId) return;
+    completedStoryId.current = openingJob.storyId;
+    const storyId = openingJob.storyId;
+    void (async () => {
+      await refresh();
+      if (!mounted.current) return;
+      toast("第一章已经写好，故事开始了。");
+      navigate(`/story/${storyId}`);
+    })();
+  }, [navigate, openingJob.phase, openingJob.storyId, refresh, toast]);
 
   const randomize = () => {
     setGenre(STORY_GENRES[Math.floor(Math.random() * STORY_GENRES.length)].label);
@@ -96,6 +208,7 @@ export function NewStoryPage() {
   };
 
   const submit = async () => {
+    if (isBusy) return;
     if (!tone) {
       toast(`请分别输入两个不超过 ${CUSTOM_TONE_WORD_MAX_LENGTH} 个字的基调词语。`, "error");
       return;
@@ -104,25 +217,65 @@ export function NewStoryPage() {
       toast("请先选择一个已通过测试的模型连接；系统不会静默切换模型。", "error");
       return;
     }
-    setCreating(true);
+    const idempotencyKey = openingJob.phase === "failed"
+      ? crypto.randomUUID()
+      : openingJob.idempotencyKey;
+    if (openingJob.phase === "failed") {
+      dispatchOpeningJob({ type: "reset_after_failure", idempotencyKey });
+    }
+    dispatchOpeningJob({ type: "start" });
     setStage(0);
-    const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 420);
     try {
-      const story = await api.createStory({
+      const result = await api.createStory({
         genre,
         tone,
         lengthPlan,
         inspiration,
         modelConnectionId: selectedConnection.id,
-      }, creationIdempotencyKey.current);
-      await refresh();
-      toast("第一章已经写好，故事开始了。");
-      navigate(`/story/${story.id}`);
+      }, idempotencyKey);
+      if (!mounted.current) return;
+      dispatchOpeningJob({ type: "create_result", result });
+      if (result.kind === "job") {
+        reconcileOpeningJobStatus(result.job);
+        navigate(`/new?job=${encodeURIComponent(result.job.jobId)}`, { replace: true });
+        void refresh();
+      }
     } catch (error) {
-      toast(error instanceof Error ? error.message : "开书失败，请稍后重试。", "error");
-      setCreating(false);
-    } finally {
-      window.clearInterval(timer);
+      if (!mounted.current) return;
+      const message = error instanceof Error ? error.message : "开书失败，请稍后重试。";
+      dispatchOpeningJob({ type: "start_error", message });
+      toast(message, "error");
+    }
+  };
+
+  const decideNarration = async (decision: "keep" | "rewrite") => {
+    const review = openingJob.review;
+    const jobId = openingJob.jobId;
+    if (!review || !jobId || openingJob.phase !== "awaiting_user_review" || secondsRemaining <= 0) return;
+    dispatchOpeningJob({ type: "decision_started" });
+    try {
+      const status = await api.decideNarrationReview(jobId, {
+        caseId: review.id,
+        caseVersion: review.version,
+        contentHash: review.contentHash,
+        candidateIds: review.candidates.map((candidate) => candidate.id),
+        decision,
+        shareRedactedContext: openingJob.shareRedactedContext,
+      });
+      if (!mounted.current) return;
+      dispatchOpeningJob({ type: "decision_result", status });
+      reconcileOpeningJobStatus(status);
+      if (status.status === "completed" || status.status === "failed") void refresh();
+    } catch (error) {
+      if (!mounted.current) return;
+      if (error instanceof ApiError && error.status === 409) {
+        dispatchOpeningJob({ type: "decision_conflict" });
+        return;
+      }
+      dispatchOpeningJob({
+        type: "decision_error",
+        message: error instanceof Error ? error.message : "暂时无法提交选择，请稍后再试。",
+      });
     }
   };
 
@@ -283,8 +436,19 @@ export function NewStoryPage() {
             <p className="model-choice-note">第一章固定使用所选 Planner 与 Writer；开篇失败时会停止并明确报错，不会静默切换。后续章节按该连接已配置的回退策略执行。</p>
           </fieldset>
 
-          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={creating || !tone || !selectedConnection}>
-            {creating ? <><LoaderCircle className="spin" size={19} /> 正在让故事醒来</> : <><Sparkles size={18} /> 生成第一章 <ArrowRight size={18} /></>}
+          {openingJob.error && !isBusy && (
+            <div className="opening-job-error" role="alert">
+              <CircleAlert size={18} />
+              <span>
+                <strong>第一章还没有生成完成</strong>
+                <small>{openingJob.error}</small>
+              </span>
+            </div>
+          )}
+          <button className="button button--primary button--large story-builder__submit" type="submit" disabled={isBusy || !tone || !selectedConnection}>
+            {isBusy
+              ? <><LoaderCircle className="spin" size={19} /> 正在让故事醒来</>
+              : <><Sparkles size={18} /> {openingJob.phase === "failed" ? "重新生成第一章" : "生成第一章"} <ArrowRight size={18} /></>}
           </button>
           <p className="form-footnote">系统会在后台生成故事基因、人物与暂定结局，但不会提前剧透。</p>
         </form>
@@ -306,7 +470,7 @@ export function NewStoryPage() {
         </aside>
       </div>
 
-      {creating && (
+      {isGenerating && (
         <div className="creation-overlay" role="status" aria-live="polite">
           <div className="creation-dialog">
             <span className="creation-orbit" aria-hidden="true"><Sparkles size={22} /></span>
@@ -319,7 +483,76 @@ export function NewStoryPage() {
               ))}
             </ol>
             <p>不需要继续输入，完成后会自动翻开第一页。</p>
+            {openingJob.error && <p className="opening-job-inline-error" role="alert">{openingJob.error}</p>}
           </div>
+        </div>
+      )}
+
+      {isAwaitingReview && openingJob.review && (
+        <div className="creation-overlay creation-overlay--review">
+          <section className="narration-review-card" role="dialog" aria-modal="true" aria-labelledby="narration-review-title">
+            <header>
+              <span className="creation-orbit" aria-hidden="true"><CircleAlert size={22} /></span>
+              <div>
+                <span className="eyebrow">需要你的判断</span>
+                <h2 id="narration-review-title">这句话属于故事吗？</h2>
+              </div>
+            </header>
+            <p className="narration-review-card__explanation">系统无法确定这是故事内描述还是写作安排。请阅读上下文后，为整篇草稿选择一次处理方式。</p>
+
+            <div className="narration-review-list">
+              {openingJob.review.candidates.map((candidate, index) => (
+                <article key={candidate.id}>
+                  <span className="narration-review-list__label">
+                    {openingJob.review!.candidates.length > 1 ? `待判断句 ${index + 1}` : "待判断句"}
+                    <small>{candidate.location === "title" ? "章节标题" : "正文"}</small>
+                  </span>
+                  {candidate.previousSentence && <p className="narration-review-list__context">{candidate.previousSentence}</p>}
+                  <p className="narration-review-list__sentence"><HighlightedReviewSentence candidate={candidate} /></p>
+                  {candidate.nextSentence && <p className="narration-review-list__context">{candidate.nextSentence}</p>}
+                </article>
+              ))}
+            </div>
+
+            <div className={`narration-review-countdown ${secondsRemaining === 0 ? "expired" : ""}`} aria-live="polite">
+              <strong>{secondsRemaining > 0 ? `${secondsRemaining} 秒` : "正在自动重写"}</strong>
+              <span>{secondsRemaining > 0 ? "超时后将自动重写，无需一直停留在这里。" : "判断期限已到，系统正在接管并继续生成。"}</span>
+            </div>
+
+            <label className="narration-review-consent">
+              <input
+                type="checkbox"
+                checked={openingJob.shareRedactedContext}
+                disabled={openingJob.phase === "submitting_decision" || secondsRemaining === 0}
+                onChange={(event) => dispatchOpeningJob({ type: "set_context_consent", value: event.target.checked })}
+              />
+              <span>
+                匿名提交这三句话的脱敏版本，用于改进检测。
+                <small>默认不提交；不勾选不会影响这次生成结果。</small>
+              </span>
+            </label>
+
+            {openingJob.error && <p className="narration-review-card__error" role="alert">{openingJob.error}</p>}
+            <div className="narration-review-actions">
+              <button
+                className="button button--soft"
+                type="button"
+                disabled={openingJob.phase === "submitting_decision" || secondsRemaining === 0}
+                onClick={() => void decideNarration("keep")}
+              >
+                保留原文并继续
+              </button>
+              <button
+                className="button button--primary"
+                type="button"
+                disabled={openingJob.phase === "submitting_decision" || secondsRemaining === 0}
+                onClick={() => void decideNarration("rewrite")}
+              >
+                {openingJob.phase === "submitting_decision" && <LoaderCircle className="spin" size={16} />}
+                让 AI 重写
+              </button>
+            </div>
+          </section>
         </div>
       )}
     </div>

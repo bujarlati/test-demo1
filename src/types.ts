@@ -27,6 +27,8 @@ export interface ChapterRevision {
   changeSummary?: string;
   branchId?: string;
   endingResolution?: EndingResolution;
+  experienceEvidence?: ReadingExperienceEvidence[];
+  experienceDelivery?: ReadingExperienceDeliveryObservation[];
 }
 
 export interface Chapter {
@@ -326,6 +328,36 @@ export interface ReadingExperiencePromise {
   scope: "opening" | "every_chapter" | "every_arc" | "whole_story";
 }
 
+export type ReadingExperienceDeliveryMode = "hard_every_chapter" | "soft_window";
+
+export interface ReadingExperienceAxisDeliveryPolicy {
+  axisId: ReadingExperienceAxisId;
+  mode: ReadingExperienceDeliveryMode;
+  targetWindowChapters: number;
+  targetMaxOpenConflictChapters: number;
+}
+
+export type ReadingExperienceConflictState =
+  | "no_conflict"
+  | "open_parity"
+  | "dominant_victory"
+  | "conclusive_defeat";
+
+export interface ReadingExperienceDeliveryObservation {
+  axisId: ReadingExperienceAxisId;
+  state: ReadingExperienceConflictState;
+  sourceQuote?: string;
+}
+
+export interface ReadingExperienceDeliveryLedgerEntry {
+  axisId: ReadingExperienceAxisId;
+  lastEvaluatedChapter: number;
+  lastDeliveredChapter?: number;
+  silentChapters: number;
+  debtOpen: boolean;
+  openConflictSinceChapter?: number;
+}
+
 export interface ReadingExperienceAxisContract {
   id: ReadingExperienceAxisId;
   word: string;
@@ -354,6 +386,7 @@ export interface ReadingExperienceContract {
     minSignalsPerAxisPerChapter: number;
     maxSilentChapters: number;
     combinedSignalEveryChapters: number;
+    axisPolicies?: ReadingExperienceAxisDeliveryPolicy[];
   };
   effectiveFromChapter: number;
   provenance: "curated" | "model" | "fallback" | "legacy";
@@ -509,6 +542,7 @@ export interface Story {
   unreadCanonChanges: number;
   readingProgress: ReadingProgress;
   readingExperience: ReadingExperienceContract;
+  readingExperienceDeliveryLedger?: ReadingExperienceDeliveryLedgerEntry[];
   storyGene: StoryGene;
   endingContract: EndingContract;
   worldBible: WorldBible;
@@ -598,6 +632,74 @@ export interface ModelConnection {
   lastError?: string;
 }
 
+export type GenerationTask = "opening" | "chapter" | "retcon" | "extract";
+
+export type GenerationFailureCategory =
+  | "transport"
+  | "timeout"
+  | "provider"
+  | "json"
+  | "quality"
+  | "safety"
+  | "budget"
+  | "interrupted"
+  | "persistence"
+  | "unknown";
+
+export interface GenerationFailureObservation {
+  id: string;
+  jobId: string;
+  ownerId: string;
+  storyId: string;
+  task: GenerationTask;
+  stage: string;
+  classifierVersion: string;
+  category: GenerationFailureCategory;
+  reasonCode: string;
+  message: string;
+  fingerprint: string;
+  model: string;
+  connectionId: string;
+  promptVersion: string;
+  attempt: number;
+  terminal: boolean;
+  retryable: boolean;
+  latencyMs: number;
+  tokens: number;
+  createdAt: string;
+}
+
+export interface GenerationFailureSummaryBucket {
+  key: string;
+  category: GenerationFailureCategory;
+  reasonCode: string;
+  stage: string;
+  model: string;
+  occurrences: number;
+  affectedJobs: number;
+  terminalFailures: number;
+  recoveredJobs: number;
+  lastSeenAt: string;
+}
+
+export interface NarrationReviewMetricBucket {
+  key: string;
+  ruleId: string;
+  ruleVersion: string;
+  candidates: number;
+  modelAllow: number;
+  modelRewrite: number;
+  modelAskUser: number;
+  userKeep: number;
+  userRewrite: number;
+  timeoutRewrite: number;
+  rewriteSucceeded: number;
+  finalJobsCompleted: number;
+  lastSeenAt: string;
+}
+
+export type GenerationJobStatus = "completed" | "running" | "awaiting_user_review" | "failed";
+
 export interface GenerationJob {
   id: string;
   ownerId: string;
@@ -605,11 +707,11 @@ export interface GenerationJob {
   idempotencyKey?: string;
   storyTitle: string;
   chapterNumber: number;
-  task: "opening" | "chapter" | "retcon" | "extract";
+  task: GenerationTask;
   model: string;
   connectionId: string;
   promptVersion: string;
-  status: "completed" | "running" | "failed";
+  status: GenerationJobStatus;
   tokens: number;
   tokenBudget?: number;
   usageEstimated?: boolean;
@@ -632,6 +734,59 @@ export interface GenerationJob {
   retconId?: string;
   targetEventId?: string;
 }
+
+export type ChapterGenerationStatusPayload =
+  | { status: "not_found" }
+  | { jobId: string; status: "running" }
+  | { jobId: string; status: "completed"; story: Story }
+  | { jobId: string; status: "failed"; message: string; retryable: boolean };
+
+export interface PendingNarrationReviewView {
+  id: string;
+  version: number;
+  jobId: string;
+  contentHash: string;
+  deadlineAt: string;
+  candidates: Array<{
+    id: string;
+    ruleId: string;
+    location: "title" | "body";
+    matchedText: string;
+    sentence: string;
+    previousSentence?: string;
+    nextSentence?: string;
+    highlightStart: number;
+    highlightEnd: number;
+  }>;
+}
+
+export interface NarrationReviewDecisionInput {
+  caseId: string;
+  caseVersion: number;
+  contentHash: string;
+  candidateIds: string[];
+  decision: "keep" | "rewrite";
+  shareRedactedContext: boolean;
+}
+
+export type OpeningJobStatusPayload =
+  | { jobId: string; status: "running" }
+  | {
+      jobId: string;
+      status: "awaiting_user_review";
+      review: PendingNarrationReviewView;
+    }
+  | { jobId: string; status: "completed"; storyId: string }
+  | {
+      jobId: string;
+      status: "failed";
+      message: string;
+      retryable: boolean;
+    };
+
+export type CreateStoryResult =
+  | { kind: "completed"; story: Story }
+  | { kind: "job"; job: OpeningJobStatusPayload };
 
 export type SafetySurface = "story_input" | "reader_message" | "candidate" | "chapter_output";
 
@@ -756,6 +911,7 @@ export interface AppStore {
   stories: Story[];
   connections: ModelConnection[];
   jobs: GenerationJob[];
+  generationFailures: GenerationFailureObservation[];
   auditEvents: AuditEvent[];
   safetyDecisions: SafetyDecision[];
   contentReports: ContentReport[];
@@ -766,10 +922,22 @@ export interface AppStore {
 export interface BootstrapPayload {
   user: UserProfile;
   stories: StorySummary[];
+  storyPage: {
+    nextCursor: string | null;
+    totalStories: number;
+    totalChapters: number;
+  };
   modelConnections: GenerationModelOption[];
   activeStoryId: string | null;
   pendingJobs: GenerationJob[];
   recoverableJobs: GenerationJob[];
+}
+
+export interface StoryPagePayload {
+  stories: StorySummary[];
+  nextCursor: string | null;
+  totalStories: number;
+  totalChapters: number;
 }
 
 export interface AuthPayload {

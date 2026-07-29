@@ -2,11 +2,17 @@ import type {
   AuditEvent,
   AuthPayload,
   BootstrapPayload,
+  ChapterGenerationStatusPayload,
   AppendReaderStoryEventInput,
+  CreateStoryResult,
   CreateStoryConstraintInput,
   CreateStoryInput,
   ContentReport,
+  GenerationFailureSummaryBucket,
   GenerationJob,
+  NarrationReviewMetricBucket,
+  NarrationReviewDecisionInput,
+  OpeningJobStatusPayload,
   ModelConnection,
   ModelConnectionInput,
   OpsMetrics,
@@ -17,6 +23,7 @@ import type {
   ReadingProgress,
   SafetyDecision,
   Story,
+  StoryPagePayload,
   StoryConstraintCommandResult,
   StoryEventCommandResult,
   StoryWorldState,
@@ -65,7 +72,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export interface GenerationStreamUpdate {
-  event: "stage" | "paragraph" | "reset_draft";
+  event: "stage" | "paragraph" | "reset_draft" | "reconnecting";
   stage?: number;
   label?: string;
   index?: number;
@@ -73,29 +80,96 @@ export interface GenerationStreamUpdate {
   paragraph?: string;
 }
 
+interface GenerateChapterOptions {
+  chapterLength?: "compact" | "standard" | "immersive";
+  idempotencyKey?: string;
+  recoveryPollIntervalMs?: number;
+  recoveryTimeoutMs?: number;
+}
+
+const CHAPTER_RECOVERY_POLL_INTERVAL_MS = 2_000;
+const CHAPTER_RECOVERY_TIMEOUT_MS = 30 * 60 * 1_000;
+const CHAPTER_RECOVERY_NOT_FOUND_LIMIT = 3;
+
+function wait(milliseconds: number): Promise<void> {
+  if (milliseconds <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function recoverChapterGeneration(
+  story: Story,
+  idempotencyKey: string,
+  onUpdate: ((update: GenerationStreamUpdate) => void) | undefined,
+  options: GenerateChapterOptions,
+) {
+  onUpdate?.({
+    event: "reconnecting",
+    label: "连接短暂中断，正在确认后台续写进度。",
+  });
+  const pollIntervalMs = Math.max(0, options.recoveryPollIntervalMs ?? CHAPTER_RECOVERY_POLL_INTERVAL_MS);
+  const timeoutMs = Math.max(1, options.recoveryTimeoutMs ?? CHAPTER_RECOVERY_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
+  let observedJob = false;
+  let initialNotFoundResponses = 0;
+
+  while (Date.now() <= deadline) {
+    let status: ChapterGenerationStatusPayload | null = null;
+    try {
+      status = await request<ChapterGenerationStatusPayload>(
+        `/api/stories/${story.id}/chapters/generation-status`,
+        {
+          method: "POST",
+          body: JSON.stringify({ idempotencyKey }),
+        },
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status < 500) throw error;
+      // The recovery request can share the same brief network outage. Keep reconciling.
+    }
+    if (status?.status === "completed") return { story: status.story, duplicate: true };
+    if (status?.status === "failed") {
+      throw new ApiError(status.message || "续章失败。", status.retryable ? 422 : 500);
+    }
+    if (status?.status === "running") observedJob = true;
+    if (status?.status === "not_found" && !observedJob) {
+      initialNotFoundResponses += 1;
+      if (initialNotFoundResponses >= CHAPTER_RECOVERY_NOT_FOUND_LIMIT) {
+        throw new ApiError("连接在续写开始前中断，本次没有创建后台作业；请重新点击生成。", 503);
+      }
+    }
+    await wait(pollIntervalMs);
+  }
+
+  throw new ApiError("连接仍不稳定，后台续写可能还在继续；请稍后刷新本页查看结果。", 202);
+}
+
 async function generateChapterStream(
   story: Story,
   onUpdate?: (update: GenerationStreamUpdate) => void,
-  options?: {
-    chapterLength?: "compact" | "standard" | "immersive";
-    idempotencyKey?: string;
-  },
+  options: GenerateChapterOptions = {},
 ) {
-  const response = await fetch(`/api/stories/${story.id}/chapters/generate`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-      Authorization: `Bearer ${authStore.get() ?? ""}`,
-    },
-    body: JSON.stringify({
-      idempotencyKey: options?.idempotencyKey ?? crypto.randomUUID(),
-      branchId: story.activeBranchId,
-      baseCanonVersion: story.canonVersion,
-      chapterLength: options?.chapterLength ?? "standard",
-    }),
-  });
+  const idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
+  let response: Response;
+  try {
+    response = await fetch(`/api/stories/${story.id}/chapters/generate`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${authStore.get() ?? ""}`,
+      },
+      body: JSON.stringify({
+        idempotencyKey,
+        branchId: story.activeBranchId,
+        baseCanonVersion: story.canonVersion,
+        chapterLength: options.chapterLength ?? "standard",
+      }),
+    });
+  } catch {
+    return recoverChapterGeneration(story, idempotencyKey, onUpdate, options);
+  }
   if (!response.ok || !response.body) {
+    if (response.ok) return recoverChapterGeneration(story, idempotencyKey, onUpdate, options);
     let message = `续章请求失败（${response.status}）`;
     try {
       const body = (await response.json()) as { message?: string };
@@ -109,28 +183,41 @@ async function generateChapterStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let completed: { story: Story; duplicate: boolean } | null = null;
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done });
-    const frames = buffer.split("\n\n");
-    buffer = frames.pop() ?? "";
-    for (const frame of frames) {
-      const event = frame.match(/^event:\s*(.+)$/m)?.[1];
-      const data = frame.match(/^data:\s*(.+)$/m)?.[1];
-      if (!event || !data) continue;
-      const payload = JSON.parse(data) as Record<string, unknown>;
-      if (event === "stage" || event === "paragraph" || event === "reset_draft") {
-        onUpdate?.({ event, ...payload } as GenerationStreamUpdate);
-      } else if (event === "complete") {
-        completed = payload as unknown as { story: Story; duplicate: boolean };
-      } else if (event === "error") {
-        throw new ApiError(String(payload.message ?? "续章失败。"), 500);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const event = frame.match(/^event:\s*(.+)$/m)?.[1];
+        const data = frame.match(/^data:\s*(.+)$/m)?.[1];
+        if (!event || !data) continue;
+        const payload = JSON.parse(data) as Record<string, unknown>;
+        if (event === "stage" || event === "paragraph" || event === "reset_draft") {
+          onUpdate?.({ event, ...payload } as GenerationStreamUpdate);
+        } else if (event === "complete") {
+          completed = payload as unknown as { story: Story; duplicate: boolean };
+        } else if (event === "error") {
+          throw new ApiError(String(payload.message ?? "续章失败。"), 500);
+        }
       }
+      if (done) break;
     }
-    if (done) break;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    return recoverChapterGeneration(story, idempotencyKey, onUpdate, options);
   }
-  if (!completed) throw new ApiError("续章流在正史提交前中断。", 502);
+  if (!completed) return recoverChapterGeneration(story, idempotencyKey, onUpdate, options);
   return completed;
+}
+
+async function createStory(input: CreateStoryInput, idempotencyKey: string = crypto.randomUUID()): Promise<CreateStoryResult> {
+  const result = await request<CreateStoryResult | Story>("/api/stories", {
+    method: "POST",
+    body: JSON.stringify({ ...input, idempotencyKey }),
+  });
+  return "kind" in result ? result : { kind: "completed", story: result };
 }
 
 export const api = {
@@ -139,8 +226,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ email, password }),
     }),
+  register: (name: string, email: string, password: string) =>
+    request<AuthPayload>("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ name, email, password }),
+    }),
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   bootstrap: () => request<BootstrapPayload>("/api/bootstrap"),
+  stories: (cursor: string, limit = 24) =>
+    request<StoryPagePayload>(`/api/stories?cursor=${encodeURIComponent(cursor)}&limit=${limit}`),
   story: (storyId: string) => request<Story>(`/api/stories/${storyId}`),
   worldState: (storyId: string) => request<StoryWorldState>(`/api/stories/${storyId}/state`),
   createConstraint: (
@@ -169,8 +263,14 @@ export const api = {
       idempotencyKey,
     }),
   }),
-  createStory: (input: CreateStoryInput, idempotencyKey = crypto.randomUUID()) =>
-    request<Story>("/api/stories", { method: "POST", body: JSON.stringify({ ...input, idempotencyKey }) }),
+  createStory,
+  generationJob: (jobId: string, signal?: AbortSignal) =>
+    request<OpeningJobStatusPayload>(`/api/generation-jobs/${encodeURIComponent(jobId)}`, { signal }),
+  decideNarrationReview: (jobId: string, input: NarrationReviewDecisionInput) =>
+    request<OpeningJobStatusPayload>(`/api/generation-jobs/${encodeURIComponent(jobId)}/narration-review`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   generateChapter: generateChapterStream,
   sendMessage: (story: Story, message: string, clientContext?: ReaderMessageContext) =>
     request<{ story: Story; duplicate: boolean }>(`/api/stories/${story.id}/messages`, {
@@ -260,6 +360,8 @@ export const api = {
   ops: () => request<{
     metrics: OpsMetrics;
     qualityBreakdown: OpsQualityBucket[];
+    failurePatterns: GenerationFailureSummaryBucket[];
+    narrationReviewMetrics: NarrationReviewMetricBucket[];
     jobs: GenerationJob[];
     auditEvents: AuditEvent[];
     reports: ContentReport[];

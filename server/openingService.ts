@@ -13,18 +13,27 @@ import {
   assertPersistentExperienceFacts,
   assertReadingExperienceEvidence,
   assertReadingExperienceNegativeInvariants,
+  classifyReadingExperienceDelivery,
   type GeneratedChapter,
 } from "./narrativeEngine";
-import { createStory } from "./storyService";
-import { generateStoryOpeningWithConnection } from "./modelGateway";
-import { safetyCategories } from "./safetyService";
-import { normalizeChapterTitle } from "./narrationPolicy";
 import {
-  OPENING_CHAPTER_MAX_CHARACTERS,
+  generateStoryOpeningWithConnection,
+  type NarrationPermit,
+} from "./modelGateway";
+import {
+  assertOpeningNarrationStructure,
+  detectNarrationCandidates,
+  narrationArtifactHash,
+  normalizeChapterTitle,
+} from "./narrationPolicy";
+import {
   OPENING_CHAPTER_MIN_CHARACTERS,
   openingChapterCharacterCount,
   openingChapterLengthIsAllowed,
 } from "./openingConstraints";
+import { safetyCategories } from "./safetyService";
+import { createStory } from "./storyService";
+import { updateReadingExperienceDeliveryLedger } from "./readingExperience";
 
 export interface OpeningGenerationContext {
   input: CreateStoryInput;
@@ -61,6 +70,11 @@ export type StoryOpeningGenerator = (
 
 export type StoryOpeningObserver = (generated: GeneratedStoryOpening) => void;
 export type StoryOpeningPublicationGate = (story: Story) => void;
+
+export interface PreparedStoryOpening {
+  story: Story;
+  context: OpeningGenerationContext;
+}
 
 export function storyOpeningPublicationText(story: Story): string {
   const chapters = story.chapters.map((chapter) => {
@@ -111,33 +125,68 @@ function requiredText(value: string, label: string): string {
   return normalized;
 }
 
+function sameCandidateIds(actual: readonly string[], expected: readonly string[]): boolean {
+  if (actual.length !== expected.length) return false;
+  const left = [...actual].sort();
+  const right = [...expected].sort();
+  return left.every((value, index) => value === right[index]);
+}
+
+function validateNarrationPermit(
+  title: string,
+  paragraphs: readonly string[],
+  permit: NarrationPermit,
+): void {
+  const contentHash = narrationArtifactHash(title, paragraphs);
+  const content = paragraphs.join("\n");
+  const candidateIds = [
+    ...detectNarrationCandidates("title", title, contentHash),
+    ...detectNarrationCandidates("body", content, contentHash),
+  ].map((candidate) => candidate.id);
+  if (
+    permit.version !== 1 ||
+    permit.contentHash !== contentHash ||
+    !sameCandidateIds(permit.candidateIds, candidateIds)
+  ) {
+    throw Object.assign(new Error("元叙事复核许可与待发布正文不一致，已拒绝发布。"), {
+      code: "narration_review_checkpoint_invalid",
+    });
+  }
+  assertOpeningNarrationStructure(title, content);
+}
+
 function validateOpeningResult(
   baseContract: ReadingExperienceContract,
   connection: ModelConnection,
   generated: GeneratedStoryOpening,
+  narrationPermit?: NarrationPermit,
 ): void {
   requiredText(generated.title, "书名");
   requiredText(generated.subtitle, "副标题");
   requiredText(generated.leadName, "主角名");
-  requiredText(normalizeChapterTitle(generated.chapter.title), "第一章标题");
+  const chapterTitle = requiredText(normalizeChapterTitle(generated.chapter.title), "第一章标题");
   if (generated.plannerModel !== connection.routes.planner || generated.writerModel !== connection.routes.writer) {
     throw new Error("开篇生成结果的模型路由与所选连接不一致，已拒绝发布。");
   }
   if (generated.chapter.model !== connection.routes.writer) {
     throw new Error("第一章没有由所选正文模型生成，已拒绝发布。");
   }
-  if (generated.chapter.paragraphs.length < 12 || !generated.chapter.paragraphs.every((paragraph) => typeof paragraph === "string" && paragraph.trim())) {
+  if (generated.chapter.paragraphs.length < 4 || !generated.chapter.paragraphs.every((paragraph) => typeof paragraph === "string" && paragraph.trim())) {
     throw new Error("第一章段落不足或包含空段，已拒绝发布。");
   }
   const content = generated.chapter.paragraphs.join("\n");
   const characterCount = openingChapterCharacterCount(content);
   if (!openingChapterLengthIsAllowed(content)) {
     throw new Error(
-      `第一章字数为 ${characterCount} 字，要求 ${OPENING_CHAPTER_MIN_CHARACTERS}—${OPENING_CHAPTER_MAX_CHARACTERS} 字，已拒绝发布。`,
+      `第一章字数为 ${characterCount} 字，最低要求 ${OPENING_CHAPTER_MIN_CHARACTERS} 字，已拒绝发布。`,
     );
   }
-  assertImmersiveNarration(normalizeChapterTitle(generated.chapter.title));
-  assertImmersiveNarration(content);
+  if (narrationPermit) {
+    validateNarrationPermit(chapterTitle, generated.chapter.paragraphs, narrationPermit);
+  } else {
+    assertImmersiveNarration(chapterTitle);
+    assertImmersiveNarration(content);
+  }
   const contract = generated.readingExperience ?? baseContract;
   if (contract.sourceWords.join("\u0000") !== baseContract.sourceWords.join("\u0000")) {
     throw new Error("规划模型改变了用户输入的阅读体验词，已拒绝发布。");
@@ -161,25 +210,27 @@ function validateOpeningResult(
   });
 }
 
-export async function createStoryWithOpening(
-  input: CreateStoryInput,
-  ownerId: string,
-  connection: ModelConnection,
-  generateOpening: StoryOpeningGenerator = generateStoryOpeningWithConnection,
-  observeOpening?: StoryOpeningObserver,
-  publicationGate: StoryOpeningPublicationGate = assertStoryOpeningPublicationSafe,
-): Promise<Story> {
-  if (connection.status !== "active") throw new Error("所选模型连接尚未通过测试，无法生成故事。");
+export function prepareStoryOpening(input: CreateStoryInput, ownerId: string): PreparedStoryOpening {
   const story = createStory(input, ownerId);
-  const generated = await generateOpening({
-    input,
-    contract: story.readingExperience,
-    targetChapterCount: story.targetChapterCount,
-  }, connection);
-  // Provider usage is incurred even when a later quality/publication gate rejects
-  // the draft, so expose it before validation can throw.
-  observeOpening?.(generated);
-  validateOpeningResult(story.readingExperience, connection, generated);
+  return {
+    story,
+    context: {
+      input,
+      contract: story.readingExperience,
+      targetChapterCount: story.targetChapterCount,
+    },
+  };
+}
+
+export function applyGeneratedStoryOpening(
+  story: Story,
+  connection: ModelConnection,
+  generated: GeneratedStoryOpening,
+  narrationPermit?: NarrationPermit,
+  publicationGate: StoryOpeningPublicationGate = assertStoryOpeningPublicationSafe,
+): Story {
+  if (connection.status !== "active") throw new Error("所选模型连接尚未通过测试，无法生成故事。");
+  validateOpeningResult(story.readingExperience, connection, generated, narrationPermit);
 
   const createdAt = story.updatedAt;
   const chapter = story.chapters[0];
@@ -214,6 +265,9 @@ export async function createStoryWithOpening(
   revision.reason = "规划模型建立阅读体验契约，正文模型生成并通过开篇质量门禁";
   revision.modelName = generated.writerModel;
   revision.promptVersion = "opening-v1";
+  revision.experienceEvidence = generated.chapter.experienceEvidence
+    ?.map((evidence) => ({ ...evidence, signalIds: [...evidence.signalIds] }));
+
 
   lead.name = generated.leadName.trim().slice(0, 80);
   lead.initials = Array.from(lead.name)[0] ?? "主";
@@ -224,6 +278,21 @@ export async function createStoryWithOpening(
     generated.event.persistentFacts.map((fact) => fact.trim().slice(0, 180)),
   ));
   lead.knowledgeSources = lead.knowledge.map((fact) => ({ fact, sourceChapter: 1, sourceRevisionId: revision.id }));
+  const openingDelivery = classifyReadingExperienceDelivery(
+    contract,
+    revision.paragraphs.join("\n"),
+    { protagonistNames: [lead.name], opening: true, chapterNumber: 1 },
+    generated.chapter.experienceDelivery,
+  );
+  revision.experienceDelivery = openingDelivery.length
+    ? openingDelivery.map((observation) => ({ ...observation }))
+    : undefined;
+  story.readingExperienceDeliveryLedger = updateReadingExperienceDeliveryLedger(
+    contract,
+    undefined,
+    1,
+    openingDelivery,
+  );
 
   story.events = [{
     id: eventId,
@@ -243,8 +312,6 @@ export async function createStoryWithOpening(
     branchId: story.activeBranchId,
   }];
 
-  // The local story factory only provides a temporary shape while the selected
-  // models generate the opening. Do not let its invented props enter canon.
   story.items = [];
   story.rules = [];
   story.clues = [];
@@ -261,4 +328,25 @@ export async function createStoryWithOpening(
   story.branches[0].stateSnapshot = state;
   publicationGate(story);
   return story;
+}
+
+export async function createStoryWithOpening(
+  input: CreateStoryInput,
+  ownerId: string,
+  connection: ModelConnection,
+  generateOpening: StoryOpeningGenerator = generateStoryOpeningWithConnection,
+  observeOpening?: StoryOpeningObserver,
+  publicationGate: StoryOpeningPublicationGate = assertStoryOpeningPublicationSafe,
+): Promise<Story> {
+  if (connection.status !== "active") throw new Error("所选模型连接尚未通过测试，无法生成故事。");
+  const prepared = prepareStoryOpening(input, ownerId);
+  const generated = await generateOpening(prepared.context, connection);
+  observeOpening?.(generated);
+  return applyGeneratedStoryOpening(
+    prepared.story,
+    connection,
+    generated,
+    undefined,
+    publicationGate,
+  );
 }

@@ -2,6 +2,7 @@ import {
   BarChart3,
   BookOpenText,
   ChevronRight,
+  CircleAlert,
   Library,
   LoaderCircle,
   LogOut,
@@ -23,7 +24,8 @@ const navigation = [
 export function AppShell() {
   const { data, logout } = useApp();
   const activeStory = data?.stories.find((story) => story.id === data.activeStoryId);
-  const pendingJob = data?.pendingJobs[0];
+  const pendingJob = data?.pendingJobs.find((job) => job.status === "awaiting_user_review")
+    ?? data?.pendingJobs[0];
   const availableStoryIds = new Set(data?.stories.map((story) => story.id) ?? []);
   const recoveryNotice = data?.recoverableJobs
     .map((job) => recoveryNoticeForJob(job, availableStoryIds))
@@ -45,7 +47,12 @@ export function AppShell() {
           ))}
         </nav>
 
-        {pendingJob && (
+        {pendingJob?.status === "awaiting_user_review" ? (
+          <NavLink className="sidebar__jobs sidebar__jobs--review" to={`/new?job=${encodeURIComponent(pendingJob.id)}`}>
+            <CircleAlert size={16} />
+            <span><strong>有一句话等你判断</strong><small>查看上下文并选择保留或重写</small></span>
+          </NavLink>
+        ) : pendingJob ? (
           <div className="sidebar__jobs" role="status" aria-live="polite">
             <LoaderCircle size={16} />
             <span>
@@ -53,7 +60,7 @@ export function AppShell() {
               <small>{pendingJob.task === "opening" ? "正在准备第一章" : `${pendingJob.storyTitle} · 第 ${pendingJob.chapterNumber} 章`}</small>
             </span>
           </div>
-        )}
+        ) : null}
 
         {recoveryNotice && !pendingJob && (
           <NavLink className="sidebar__jobs sidebar__jobs--failed" to={recoveryNotice.to}>

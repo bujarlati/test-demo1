@@ -4,7 +4,8 @@
 
 ## 已实现
 
-- 账号登录、故事归属校验、私人书架与带 `progress_version` 乐观并发控制的跨设备继续阅读
+- 普通读者注册、账号登录、故事归属校验、私人书架与带 `progress_version` 乐观并发控制的跨设备继续阅读
+- PostgreSQL 线上持久化：账号/会话独立表、书架游标分页、故事按需加载、章节与不可变 Revision 分表；保留旧 JSON 幂等导入工具
 - 极简开书：题材必选，氛围、篇幅与灵感可跳过；输入会生成独立的标题、人物、故事基因、结局契约与首章
 - 沉浸阅读器：目录、阅读主题、字号、行距、正文宽度、下一章长度和移动端适配
 - 一键续章：5 个短剧情候选、独立语义知识依赖审计、带 Revision 来源的事件时间/物品库存/硬约束门禁、固定预算记忆检索、目标段落校验、逐段流式展示与可重试幂等提交
@@ -18,6 +19,7 @@
 - 用户可暂停/恢复/删除当前故事的偏好约束；角色保护状态保持同步
 - 独立内容治理：输入、候选、流式段落与完整输出审核，用户举报/申诉、管理员复核及脱敏决策记录
 - 生成观察台：由真实作业动态计算接受率、冲突率、首字 P95 与成本，并按模型/题材/提示词聚合候选、举报和过滤结果；服务重启后可识别中断作业并安全重试
+- 上下文叙述语义门禁：先按完整句意区分故事内描述与写作安排；歧义时由故事所有者选择保留或重写，90 秒无操作自动重写，管理员只查看匿名聚合指标
 
 ## 本地运行
 
@@ -49,18 +51,52 @@ pnpm build
 pnpm build
 $env:BOOTSTRAP_ADMIN_PASSWORD="请替换为强密码"
 $env:APP_ENCRYPTION_KEY="32 字节 Base64 或 64 位十六进制主密钥"
+$env:DATABASE_URL="postgresql://user:password@host:5432/xumo"
+pnpm db:migrate
 pnpm start
 ```
 
-生产环境首次创建数据时必须提供 `BOOTSTRAP_ADMIN_PASSWORD`，模型密钥功能必须提供 `APP_ENCRYPTION_KEY`，不会创建公开默认密码或本地临时主密钥。若也要启用演示读者账号，可另外设置 `BOOTSTRAP_READER_PASSWORD`；未设置时该账号使用随机不可猜测密码。
+生产环境首次创建数据时必须提供 `BOOTSTRAP_ADMIN_PASSWORD`，模型密钥功能必须提供 `APP_ENCRYPTION_KEY`，不会创建公开默认密码或本地临时主密钥。若也要启用演示读者账号，可另外设置 `BOOTSTRAP_READER_PASSWORD`；未设置时该账号使用随机不可猜测密码。正式线上必须设置 `DATABASE_URL`，不要继续使用 `/tmp` 或 memory 保存真实用户数据。新版本会拒绝在未配置数据库的生产环境启动；只有明确不保留数据的纯演示站才能设置 `XUMO_ALLOW_EPHEMERAL_PRODUCTION=true`。
 
-在没有持久卷的站点运行时，可将 `XUMO_STORAGE_MODE` 设为 `memory`。这适合公开演示，但实例重启或重新部署会重置故事、会话和后来保存的模型连接；正式长期运行应通过 `XUMO_DATA_DIRECTORY` 挂载持久目录，或把存储层替换为托管数据库与密钥服务。
+### 上下文叙述语义门禁
+
+新开篇默认仍使用原门禁。完成数据库迁移并确认主密钥稳定后，再为小流量实例配置：
+
+```dotenv
+CONTEXTUAL_NARRATION_REVIEW_ENABLED=true
+NARRATION_REVIEW_CONFIDENCE_THRESHOLD=0.85
+DATABASE_URL=postgresql://user:password@host:5432/xumo
+APP_ENCRYPTION_KEY=32字节Base64或64位十六进制值
+```
+
+开启时启动过程会校验 PostgreSQL 与主密钥；缺失或格式错误会直接拒绝启动。阈值仅影响新 assessment，案例会记录当时实际阈值。待确认 checkpoint 加密保存 24 小时，用户明确同意的脱敏上下文加密保存最多 90 天；未同意时不会写入长期正文片段。
+
+推荐发布与回滚顺序：
+
+1. 先部署代码并执行 `003` migration，保持开关为 `false`。
+2. 确认 `DATABASE_URL`、`APP_ENCRYPTION_KEY` 与 migration health check 正常。
+3. 小流量开启，观察 `ask_user`、用户保留、超时、重写成功和最老 pending 年龄。
+4. 异常时把开关恢复为 `false`；这只停止新作业进入新门禁，scheduler 仍会让已有案例完成或超时收敛。不要回滚或删除 `003` migration。
+
+### 从旧 JSON 切换到 PostgreSQL
+
+先备份旧数据并保持旧服务运行，然后对新数据库执行：
+
+```bash
+$env:DATABASE_URL="postgresql://user:password@host:5432/xumo"
+pnpm db:migrate
+pnpm db:import-json -- --source="D:\backup\store.json"
+```
+
+导入命令按源文件 SHA-256 幂等执行，并核对用户、故事、章节和 Revision 数量。它不会删除或修改旧 `store.json`。校验通过后再把 `DATABASE_URL` 配置到线上服务并重启；`GET /api/health` 的 `storage` 应为 `postgresql`。观察期保留旧 JSON，确认注册、登录、书架分页、阅读和续章均正常后再单独安排旧存储下线。
+
+在没有持久卷的站点运行时，可将 `XUMO_STORAGE_MODE` 设为 `memory`。这只适合公开演示，实例重启或重新部署会重置故事、会话和后来保存的模型连接；正式长期运行使用 PostgreSQL。
 
 当托管平台把构建产物挂载到独立目录时，可用 `XUMO_STATIC_DIRECTORY` 指向该目录；Sites Worker 使用 `/bundle`。
 
 ## 数据与密钥
 
-演示数据首次启动时由 `server/seed.ts` 生成。运行期故事、会话与 Revision 写入 `server/data/store.json`；模型 Key 使用 AES-256-GCM 加密后写入独立的 `server/data/secrets.json`。这些运行期文件均已忽略，不会提交到 Git。
+演示数据首次启动时由 `server/seed.ts` 生成。设置 `DATABASE_URL` 后，账号、会话、故事、章节和 Revision 写入 PostgreSQL；未设置时本地兼容模式仍写入 `server/data/store.json`。模型 Key 使用 AES-256-GCM 加密后写入独立的 `server/data/secrets.json`。这些运行期文件均已忽略，不会提交到 Git。
 
 生产环境应通过 `APP_ENCRYPTION_KEY` 提供 32 字节主密钥，并由正式 KMS/Vault 替换本地密钥文件。默认 `ALLOW_PRIVATE_MODEL_ENDPOINTS=false`，云端部署不会访问用户的 localhost 或私有网络。
 

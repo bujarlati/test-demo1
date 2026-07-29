@@ -1,17 +1,54 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AppStore } from "../src/types";
+import type { AppStore, AuditEvent, AuthSession, NarrationReviewMetricBucket, Story, UserAccount } from "../src/types";
+import { loadApplicationEncryptionKey } from "./appEncryption";
 import { createSeedStore } from "./seed";
+import type { GenerationJob } from "../src/types";
+import type {
+  NarrationReviewCaseRecord,
+  NarrationReviewCleanupCounts,
+  NarrationReviewDecisionClaim,
+  NarrationReviewFeedbackRecord,
+} from "./narrationReviewState";
 import { captureCanonState } from "./canonState";
-import { createLegacyExperienceContract } from "./readingExperience";
+import { createLegacyExperienceContract, normalizeReadingExperienceContract, normalizeReadingExperienceDeliveryLedger } from "./readingExperience";
+import { narrationReviewConfidenceThreshold } from "./narrationReview";
+import { summarizeStory } from "./storyService";
+import { createPostgresDatabase } from "./database/postgres";
+import type { PersistenceDatabase, StoryPage } from "./database/types";
+import {
+  appendGenerationFailure,
+  createGenerationFailureObservation,
+  summarizeGenerationFailures,
+  upgradeGenerationFailureObservation,
+} from "./failureTelemetry";
 
 export const dataDirectory = process.env.XUMO_DATA_DIRECTORY?.trim()
   || (process.env.NODE_ENV === "production" ? "/tmp/xumo-data" : path.join(process.cwd(), "server", "data"));
 const storePath = path.join(dataDirectory, "store.json");
 let persistentStorageAvailable = process.env.XUMO_STORAGE_MODE?.trim().toLowerCase() !== "memory";
+let database: PersistenceDatabase | null = null;
+
+function databaseUrl(): string {
+  return process.env.DATABASE_URL?.trim() ?? "";
+}
+
+export function contextualNarrationReviewEnabled(): boolean {
+  return process.env.CONTEXTUAL_NARRATION_REVIEW_ENABLED?.trim().toLowerCase() === "true";
+}
+
+export function usesDatabaseStorage(): boolean {
+  return database !== null;
+}
+
+export function storageBackend(): "postgresql" | "filesystem" | "memory" {
+  if (database) return "postgresql";
+  return persistentStorageAvailable ? "filesystem" : "memory";
+}
 
 export function usesPersistentStorage(): boolean {
-  return persistentStorageAvailable;
+  return database !== null || persistentStorageAvailable;
 }
 
 function isUnavailableFilesystem(error: unknown): boolean {
@@ -57,6 +94,12 @@ export function createStoreMutationGate() {
   };
 }
 
+export function shouldSerializeFileStoreRequest(request: { method: string; path: string }): boolean {
+  if (!request.path.startsWith("/api/") || request.path === "/api/health") return false;
+  const method = request.method.toUpperCase();
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+}
+
 export function shouldAbandonQueuedRequest(
   request: { aborted: boolean; destroyed: boolean },
   response: { writableEnded: boolean },
@@ -74,7 +117,11 @@ const enqueueStoreSave = createStoreSaveQueue(async (snapshot) => {
   await rename(temporaryPath, storePath);
 });
 
-function normalizeStore(store: AppStore): AppStore {
+export function normalizeStore(store: AppStore): AppStore {
+  store.generationFailures ??= [];
+  store.generationFailures = store.generationFailures
+    .map((failure) => upgradeGenerationFailureObservation(failure))
+    .slice(0, 2_000);
   store.safetyDecisions ??= [];
   store.contentReports ??= [];
   store.idempotencyKeys ??= [];
@@ -87,6 +134,12 @@ function normalizeStore(store: AppStore): AppStore {
       effectiveFromChapter: story.chapters.length + 1,
       createdAt: story.updatedAt,
     });
+    story.readingExperience = normalizeReadingExperienceContract(story.readingExperience);
+    story.readingExperienceDeliveryLedger = normalizeReadingExperienceDeliveryLedger(
+      story.readingExperience,
+      story.readingExperienceDeliveryLedger,
+      story.chapters.at(-1)?.number ?? 0,
+    );
     story.proposals ??= [];
     story.items ??= [];
     story.constraints ??= [];
@@ -194,6 +247,22 @@ function normalizeStore(store: AppStore): AppStore {
     job.storyId ??= story?.id ?? "story_unknown";
     job.ownerId ??= story?.ownerId ?? "system";
   }
+  for (const job of store.jobs.filter((item) => item.status === "failed")) {
+    if (store.generationFailures.some((failure) => failure.jobId === job.id && failure.terminal)) continue;
+    const observedAt = new Date(Date.parse(job.createdAt) + Math.max(0, job.latencyMs || 0));
+    appendGenerationFailure(store, createGenerationFailureObservation(
+      job,
+      new Error(job.filterSummary || "历史生成作业失败。"),
+      {
+        id: `failure_backfill_${job.id}`,
+        stage: job.task === "opening" ? "开篇生成" : "章节生成",
+        terminal: true,
+        latencyMs: job.latencyMs,
+        tokens: job.tokens,
+        now: () => Number.isFinite(observedAt.getTime()) ? observedAt : new Date(job.createdAt),
+      },
+    ));
+  }
   for (const connection of store.connections ?? []) {
     connection.secretVersion ??= connection.secretRef.startsWith("platform://") ? 0 : 1;
     if (connection.capabilities) {
@@ -205,6 +274,61 @@ function normalizeStore(store: AppStore): AppStore {
 }
 
 export async function loadStore(): Promise<AppStore> {
+  const connectionString = databaseUrl();
+  const narrationReviewEnabled = contextualNarrationReviewEnabled();
+  if (!connectionString && narrationReviewEnabled) {
+    throw new Error("CONTEXTUAL_NARRATION_REVIEW_ENABLED requires PostgreSQL DATABASE_URL.");
+  }
+  // Validate the stable master key at startup instead of discovering a missing or
+  // malformed key only after a user's generation has already reached a pause.
+  if (narrationReviewEnabled) {
+    narrationReviewConfidenceThreshold();
+    await loadApplicationEncryptionKey();
+  }
+  if (connectionString) {
+    database = createPostgresDatabase(connectionString);
+    const autoMigrate = process.env.DATABASE_AUTO_MIGRATE?.trim().toLowerCase() !== "false";
+    if (autoMigrate) await database.migrate();
+    if (await database.isEmpty()) {
+      let initialStore: AppStore | null = null;
+      let legacyFingerprint: string | null = null;
+      try {
+        const legacyContents = await readFile(storePath);
+        legacyFingerprint = createHash("sha256").update(legacyContents).digest("hex");
+        initialStore = normalizeStore(JSON.parse(legacyContents.toString("utf8")) as AppStore);
+        console.log(`[storage] PostgreSQL 为空，正在无损导入 ${storePath}`);
+      } catch (error) {
+        const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
+        if (!missing) throw error;
+      }
+      await database.saveSnapshot(initialStore ?? createSeedStore());
+      if (initialStore && legacyFingerprint) {
+        const expected = {
+          users: initialStore.users.length,
+          stories: initialStore.stories.length,
+          chapters: initialStore.stories.reduce((total, story) => total + story.chapters.length, 0),
+          revisions: initialStore.stories.reduce(
+            (total, story) => total + story.chapters.reduce((chapterTotal, chapter) => chapterTotal + chapter.revisions.length, 0),
+            0,
+          ),
+        };
+        const actual = await database.counts();
+        for (const key of Object.keys(expected) as Array<keyof typeof expected>) {
+          if (actual[key] < expected[key]) {
+            throw new Error(`旧 JSON 自动导入校验失败：${key} 期望至少 ${expected[key]}，数据库只有 ${actual[key]}。`);
+          }
+        }
+        await database.recordLegacyImport(legacyFingerprint, storePath, expected);
+      }
+    }
+    return normalizeStore(await database.loadRuntimeStore());
+  }
+  const allowsEphemeralProduction = process.env.XUMO_ALLOW_EPHEMERAL_PRODUCTION?.trim().toLowerCase() === "true";
+  if (process.env.NODE_ENV === "production" && !allowsEphemeralProduction) {
+    throw new Error(
+      "生产环境必须配置 DATABASE_URL，拒绝把真实账号和故事写入临时 JSON；纯演示环境可显式设置 XUMO_ALLOW_EPHEMERAL_PRODUCTION=true。",
+    );
+  }
   if (!persistentStorageAvailable) return createSeedStore();
   try {
     await mkdir(dataDirectory, { recursive: true });
@@ -226,5 +350,310 @@ export async function loadStore(): Promise<AppStore> {
 }
 
 export async function saveStore(store: AppStore, rollbackOnFailure?: () => void): Promise<void> {
+  if (database) {
+    await database.saveSnapshot(store, rollbackOnFailure);
+    return;
+  }
   await enqueueStoreSave(store, rollbackOnFailure);
+}
+
+export async function loadLegacyStoreFromFile(filePath: string): Promise<AppStore> {
+  const contents = await readFile(filePath, "utf8");
+  return normalizeStore(JSON.parse(contents) as AppStore);
+}
+
+function cacheUser(store: AppStore, user: UserAccount): void {
+  const index = store.users.findIndex((item) => item.id === user.id);
+  if (index >= 0) store.users[index] = user;
+  else store.users.push(user);
+}
+
+export async function findUserByEmail(store: AppStore, email: string): Promise<UserAccount | null> {
+  if (database) {
+    const user = await database.findUserByEmail(email);
+    if (user) cacheUser(store, user);
+    return user;
+  }
+  return store.users.find((item) => item.email.toLowerCase() === email.trim().toLowerCase()) ?? null;
+}
+
+export async function findUserBySessionTokenHash(store: AppStore, hash: string): Promise<UserAccount | null> {
+  if (database) {
+    const user = await database.findUserBySessionTokenHash(hash);
+    if (user) cacheUser(store, user);
+    return user;
+  }
+  const session = store.sessions.find((item) => item.tokenHash === hash && Date.parse(item.expiresAt) > Date.now());
+  return session ? store.users.find((item) => item.id === session.userId) ?? null : null;
+}
+
+export async function registerUser(
+  store: AppStore,
+  user: UserAccount,
+  session: AuthSession,
+  event: AuditEvent,
+): Promise<void> {
+  if (database) {
+    await database.register(user, session, event);
+    cacheUser(store, user);
+    store.auditEvents.unshift(event);
+    store.auditEvents = store.auditEvents.slice(0, 500);
+    return;
+  }
+  if (store.users.some((item) => item.email.trim().toLowerCase() === user.email.trim().toLowerCase())) {
+    throw Object.assign(new Error("该邮箱已经注册，请直接登录。"), { status: 409 });
+  }
+  store.users.push(user);
+  store.sessions.push(session);
+  store.auditEvents.unshift(event);
+  store.auditEvents = store.auditEvents.slice(0, 500);
+  await saveStore(store, () => {
+    store.users = store.users.filter((item) => item.id !== user.id);
+    store.sessions = store.sessions.filter((item) => item.id !== session.id);
+    store.auditEvents = store.auditEvents.filter((item) => item.id !== event.id);
+  });
+}
+
+export async function saveAuthSession(store: AppStore, session: AuthSession): Promise<void> {
+  const existing = store.sessions.findIndex((item) => item.id === session.id);
+  if (existing >= 0) store.sessions[existing] = session;
+  else store.sessions.push(session);
+  if (database) await database.saveSession(session);
+}
+
+export async function deleteAuthSession(store: AppStore, hash: string): Promise<void> {
+  store.sessions = store.sessions.filter((session) => session.tokenHash !== hash);
+  if (database) await database.deleteSession(hash);
+}
+
+export async function reserveStoredIdempotencyKey(
+  store: AppStore,
+  userId: string,
+  idempotencyKey: string,
+): Promise<boolean> {
+  const scopedKey = `${userId}:${idempotencyKey}`;
+  if (database) {
+    const reserved = await database.reserveIdempotencyKey(userId, idempotencyKey);
+    if (reserved && !store.idempotencyKeys.includes(scopedKey)) store.idempotencyKeys.push(scopedKey);
+    return reserved;
+  }
+  if (store.idempotencyKeys.includes(scopedKey)) return false;
+  store.idempotencyKeys.push(scopedKey);
+  store.idempotencyKeys = store.idempotencyKeys.slice(-500);
+  return true;
+}
+
+export async function hasStoredIdempotencyKey(
+  store: AppStore,
+  userId: string,
+  idempotencyKey: string,
+): Promise<boolean> {
+  if (database) return database.hasIdempotencyKey(userId, idempotencyKey);
+  return store.idempotencyKeys.includes(`${userId}:${idempotencyKey}`);
+}
+
+export async function releaseStoredIdempotencyKey(
+  store: AppStore,
+  userId: string,
+  idempotencyKey: string,
+): Promise<void> {
+  const scopedKey = `${userId}:${idempotencyKey}`;
+  store.idempotencyKeys = store.idempotencyKeys.filter((key) => key !== scopedKey);
+  if (database) await database.releaseIdempotencyKey(userId, idempotencyKey);
+}
+
+export async function findStoredStoryCreationRequest(
+  store: AppStore,
+  userId: string,
+  idempotencyKey: string,
+): Promise<string | null> {
+  if (database) return database.findStoryCreationRequest(userId, idempotencyKey);
+  return store.storyCreationRequests.find((request) =>
+    request.userId === userId && request.idempotencyKey === idempotencyKey,
+  )?.storyId ?? null;
+}
+
+
+export async function findStoredGenerationJob(
+  store: AppStore,
+  userId: string,
+  idempotencyKey: string,
+): Promise<GenerationJob | null> {
+  const cached = store.jobs.find((job) =>
+    job.ownerId === userId && job.idempotencyKey === idempotencyKey
+  );
+  if (cached) return cached;
+  if (!database) return null;
+  return database.findGenerationJobByIdempotencyKey(userId, idempotencyKey);
+}
+
+function encodeLegacyCursor(updatedAt: string, id: string): string {
+  return Buffer.from(JSON.stringify({ updatedAt, id }), "utf8").toString("base64url");
+}
+
+function decodeLegacyCursor(cursor: string): { updatedAt: string; id: string } {
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, unknown>;
+    if (typeof value.updatedAt !== "string" || typeof value.id !== "string") throw new Error("invalid");
+    return { updatedAt: value.updatedAt, id: value.id };
+  } catch {
+    throw Object.assign(new Error("书架分页游标无效，请重新加载。"), { status: 400 });
+  }
+}
+
+export async function listStoryPage(
+  store: AppStore,
+  ownerId: string,
+  limit = 24,
+  cursor?: string,
+): Promise<StoryPage> {
+  if (database) return database.listStories(ownerId, limit, cursor);
+  const all = store.stories
+    .filter((story) => story.ownerId === ownerId && story.status !== "archived")
+    .map(summarizeStory)
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.id.localeCompare(left.id));
+  const position = cursor ? decodeLegacyCursor(cursor) : null;
+  const start = position
+    ? all.findIndex((story) => story.updatedAt < position.updatedAt || (story.updatedAt === position.updatedAt && story.id < position.id))
+    : 0;
+  const safeStart = start < 0 ? all.length : start;
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const stories = all.slice(safeStart, safeStart + safeLimit);
+  const last = stories.at(-1);
+  return {
+    stories,
+    nextCursor: safeStart + stories.length < all.length && last ? encodeLegacyCursor(last.updatedAt, last.id) : null,
+    totalStories: all.length,
+    totalChapters: all.reduce((total, story) => total + story.chapterCount, 0),
+  };
+}
+
+export async function listGenerationFailurePatterns(
+  store: AppStore,
+  limit = 30,
+) {
+  const safeLimit = Math.max(1, Math.min(100, Math.round(limit)));
+  if (database) return database.listGenerationFailurePatterns(safeLimit);
+  return summarizeGenerationFailures(store.generationFailures, store.jobs).slice(0, safeLimit);
+}
+
+export async function listNarrationReviewMetrics(
+  limit = 30,
+): Promise<NarrationReviewMetricBucket[]> {
+  if (!database) return [];
+  const safeLimit = Math.max(1, Math.min(100, Math.round(limit)));
+  try {
+    return await database.listNarrationReviewMetrics(safeLimit);
+  } catch (error) {
+    console.error("[NARRATION-REVIEW] Failed to aggregate structured metrics.", error);
+    return [];
+  }
+}
+
+export async function loadOwnedStory(store: AppStore, ownerId: string, storyId: string): Promise<Story | null> {
+  const cached = store.stories.find((story) => story.id === storyId && story.ownerId === ownerId);
+  if (cached) return cached;
+  if (!database) return null;
+  return database.loadStory(ownerId, storyId);
+}
+
+export async function deletePersistedModelConnection(connectionId: string): Promise<void> {
+  if (database) await database.deleteModelConnection(connectionId);
+}
+
+export async function clearPersistedStoryModelConnection(connectionId: string): Promise<void> {
+  if (database) await database.clearStoryModelConnection(connectionId);
+}
+
+export async function checkStorageHealth(): Promise<void> {
+  if (database) await database.health();
+}
+export function supportsDurableNarrationReview(): boolean {
+  return database !== null;
+}
+
+function requireNarrationReviewDatabase(): PersistenceDatabase {
+  if (!database) {
+    throw Object.assign(new Error("Narration review state requires PostgreSQL persistence."), {
+      code: "narration_review_state_unavailable",
+    });
+  }
+  return database;
+}
+
+export async function pauseOpeningForNarrationReview(
+  job: GenerationJob,
+  review: NarrationReviewCaseRecord,
+): Promise<void> {
+  await requireNarrationReviewDatabase().pauseOpeningForNarrationReview(job, review);
+}
+
+export async function getNarrationReviewCaseForOwner(
+  ownerId: string,
+  jobId: string,
+): Promise<NarrationReviewCaseRecord | null> {
+  return requireNarrationReviewDatabase().getNarrationReviewCaseForOwner(ownerId, jobId);
+}
+
+export async function getNarrationReviewCaseById(
+  id: string,
+): Promise<NarrationReviewCaseRecord | null> {
+  return requireNarrationReviewDatabase().getNarrationReviewCaseById(id);
+}
+
+export async function claimNarrationReviewDecision(
+  claim: NarrationReviewDecisionClaim,
+): Promise<NarrationReviewCaseRecord | null> {
+  return requireNarrationReviewDatabase().claimNarrationReviewDecision(claim);
+}
+
+export async function claimExpiredNarrationReviews(
+  now: string,
+  limit: number,
+): Promise<NarrationReviewCaseRecord[]> {
+  return requireNarrationReviewDatabase().claimExpiredNarrationReviews(now, limit);
+}
+
+export async function listRecoverableNarrationReviews(
+  limit?: number,
+): Promise<NarrationReviewCaseRecord[]> {
+  return requireNarrationReviewDatabase().listRecoverableNarrationReviews(limit);
+}
+
+export async function replaceNarrationReviewCase(
+  oldCaseId: string,
+  job: GenerationJob,
+  review: NarrationReviewCaseRecord,
+  resolvedAt: string,
+): Promise<boolean> {
+  return requireNarrationReviewDatabase().replaceNarrationReviewCase(
+    oldCaseId,
+    job,
+    review,
+    resolvedAt,
+  );
+}
+
+export async function resolveNarrationReviewCase(
+  id: string,
+  finalStatus: "resolved" | "failed",
+  resolvedAt: string,
+): Promise<boolean> {
+  return requireNarrationReviewDatabase().resolveNarrationReviewCase(id, finalStatus, resolvedAt);
+}
+
+export async function failExpiredNarrationReviewCase(id: string, now: string): Promise<boolean> {
+  return requireNarrationReviewDatabase().failExpiredNarrationReviewCase(id, now);
+}
+
+export async function upsertNarrationReviewFeedback(
+  feedback: NarrationReviewFeedbackRecord,
+): Promise<void> {
+  await requireNarrationReviewDatabase().upsertNarrationReviewFeedback(feedback);
+}
+
+export async function deleteExpiredNarrationReviewData(
+  now: string,
+): Promise<NarrationReviewCleanupCounts> {
+  return requireNarrationReviewDatabase().deleteExpiredNarrationReviewData(now);
 }

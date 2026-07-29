@@ -3,7 +3,12 @@ import test from "node:test";
 import { captureCanonState, replayBranchState } from "../server/canonState";
 import { generateLocalChapter, planNextChapter } from "../server/narrativeEngine";
 import { createSeedStore } from "../server/seed";
-import { createStoreMutationGate, createStoreSaveQueue, shouldAbandonQueuedRequest } from "../server/storage";
+import {
+  createStoreMutationGate,
+  createStoreSaveQueue,
+  shouldAbandonQueuedRequest,
+  shouldSerializeFileStoreRequest,
+} from "../server/storage";
 import {
   appendStoryCoreEvent,
   createStoryConstraint,
@@ -512,6 +517,30 @@ test("store mutation gate prevents a failed transaction leaking into the next su
 
   assert.equal(JSON.parse(persisted[1]).users[0].activeStoryId, secondStoryId);
   assert.equal(store.users[0].activeStoryId, secondStoryId);
+});
+
+test("a long generation mutation does not block a bootstrap refresh", async () => {
+  const acquire = createStoreMutationGate();
+  const releaseGeneration = await acquire();
+  const bootstrapRefresh = shouldSerializeFileStoreRequest({ method: "GET", path: "/api/bootstrap" })
+    ? acquire().then((release) => {
+        release();
+        return "returned";
+      })
+    : Promise.resolve("returned");
+
+  const outcome = await Promise.race([
+    bootstrapRefresh,
+    new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+  ]);
+  releaseGeneration();
+
+  assert.equal(outcome, "returned");
+});
+
+test("file-store mutation serialization remains enabled for writes", () => {
+  assert.equal(shouldSerializeFileStoreRequest({ method: "POST", path: "/api/stories" }), true);
+  assert.equal(shouldSerializeFileStoreRequest({ method: "PATCH", path: "/api/stories/story_1/status" }), true);
 });
 
 test("a consumed JSON request is not mistaken for an aborted queued request", () => {

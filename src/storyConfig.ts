@@ -23,7 +23,6 @@ export interface ChapterLengthPreset {
   note: string;
   targetCharacters: number;
   minCharacters: number;
-  maxCharacters: number;
   targetParagraphs: number;
 }
 
@@ -101,9 +100,9 @@ export type StoryLengthPlanId = (typeof STORY_LENGTH_OPTIONS)[number]["id"];
 export const DEFAULT_STORY_LENGTH = STORY_LENGTH_OPTIONS[1];
 
 export const CHAPTER_LENGTH_PRESETS: Record<ChapterLengthMode, ChapterLengthPreset> = {
-  compact: { name: "轻快", note: "约 2000 字", targetCharacters: 2_000, minCharacters: 1_700, maxCharacters: 2_500, targetParagraphs: 12 },
-  standard: { name: "标准", note: "约 2800 字", targetCharacters: 2_800, minCharacters: 1_900, maxCharacters: 4_800, targetParagraphs: 16 },
-  immersive: { name: "沉浸", note: "约 3800 字", targetCharacters: 3_800, minCharacters: 3_300, maxCharacters: 4_600, targetParagraphs: 22 },
+  compact: { name: "轻快", note: "约 2000 字", targetCharacters: 2_000, minCharacters: 1_700, targetParagraphs: 12 },
+  standard: { name: "标准", note: "约 2800 字", targetCharacters: 2_800, minCharacters: 1_900, targetParagraphs: 16 },
+  immersive: { name: "沉浸", note: "约 3800 字", targetCharacters: 3_800, minCharacters: 3_300, targetParagraphs: 22 },
 };
 
 export function getGenreOption(label: StoryGenre): (typeof STORY_GENRES)[number] {
