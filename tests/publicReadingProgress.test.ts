@@ -37,6 +37,7 @@ function detail(readingProgress: PublicReadingProgress | null = progress()): Pub
     genre: "科幻",
     tone: "理性 · 冷静",
     length: "标准长篇",
+    targetChapterCount: 200,
     coverTheme: "moon",
     status: "active",
     authorPenName: "青砚",

@@ -56,6 +56,7 @@ const publicSummary: PublicStorySummary = {
 
 const publicDetail: PublicStoryDetail = {
   ...publicSummary,
+  targetChapterCount: 200,
   chapters: [{
     id: "chapter_1",
     number: 1,

@@ -49,6 +49,7 @@ interface PublicStorySummaryRow {
 }
 
 interface PublicStoryDetailRow extends PublicStorySummaryRow {
+  target_chapter_count: number;
   viewer_is_owner: boolean;
 }
 
@@ -546,6 +547,7 @@ export class PublicStoryPostgresRepository
          s.genre,
          s.tone,
          s.length_label,
+         s.target_chapter_count,
          s.cover_theme,
          s.status,
          u.public_pen_name AS author_pen_name,
@@ -616,6 +618,7 @@ export class PublicStoryPostgresRepository
     const chapters = chapterResult.rows.map(chapterFromRow);
     return {
       ...summaryFromRow(summaryRow),
+      targetChapterCount: summaryRow.target_chapter_count,
       chapters,
       readingProgress: resolveReadingProgress(progressResult.rows[0], chapters),
       viewerIsOwner: summaryRow.viewer_is_owner,

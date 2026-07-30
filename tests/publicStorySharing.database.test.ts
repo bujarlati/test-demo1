@@ -201,6 +201,7 @@ test("public repository lists and reads only safe current-canon fields", async (
     assert.ok(detail);
     assert.equal(detail.authorPenName, "青砚阁");
     assert.equal(detail.viewerIsOwner, false);
+    assert.equal(detail.targetChapterCount, target.targetChapterCount);
     assert.equal(detail.chapters[0]?.currentRevision.id, currentRevision.id);
     assert.deepEqual(detail.chapters[0]?.currentRevision.paragraphs, currentRevision.paragraphs);
     assert.equal(detail.chapters.some((chapter) => chapter.currentRevision.id === "revision_private_history"), false);

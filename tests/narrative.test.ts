@@ -5511,7 +5511,7 @@ test("chapter planning honors terminal length and hard character protection", ()
   assert.equal(compact.storyArc.id, storyArcPhase(story.chapters.length, story.targetChapterCount).id);
   assert.match(buildChapterPrompt(story, compact), new RegExp(`${story.chapters.length + 1} / ${story.targetChapterCount}`));
   const firstVolumeOpening = storyArcPhase(0, 1_000);
-  const firstVolumeTurn = storyArcPhase(49, 1_000);
+  const firstVolumeTurn = storyArcPhase(46, 1_000);
   const secondVolumeOpening = storyArcPhase(50, 1_000);
   const finalVolumeEnding = storyArcPhase(990, 1_000);
   assert.equal(firstVolumeOpening.totalVolumes, 20);

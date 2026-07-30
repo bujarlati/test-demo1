@@ -661,6 +661,7 @@ export interface PublicStorySummary {
 }
 
 export interface PublicStoryDetail extends PublicStorySummary {
+  targetChapterCount: number;
   chapters: PublicStoryChapter[];
   readingProgress: PublicReadingProgress | null;
   viewerIsOwner: boolean;

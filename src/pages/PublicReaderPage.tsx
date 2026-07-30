@@ -42,6 +42,7 @@ import {
   saveReaderSettings,
   type ReaderSettings,
 } from "../readerSettings";
+import { buildStoryChapterSections } from "../storyStructure";
 import type {
   PublicReadingProgress,
   PublicStoryChapter,
@@ -335,19 +336,10 @@ export function PublicReaderPage() {
     "--reader-width": `${settings.width}px`,
   } as CSSProperties;
 
-  const chapterSections = useMemo(() => {
-    if (!detail) return [];
-    const groupSize = 30;
-    return Array.from({ length: Math.ceil(detail.chapters.length / groupSize) }, (_, index) => {
-      const chapters = detail.chapters.slice(index * groupSize, (index + 1) * groupSize);
-      return {
-        label: detail.chapters.length <= groupSize
-          ? "全部章节"
-          : `第 ${chapters[0]?.number ?? 1}—${chapters.at(-1)?.number ?? 1} 章`,
-        chapters,
-      };
-    });
-  }, [detail]);
+  const chapterSections = useMemo(
+    () => detail ? buildStoryChapterSections(detail.chapters, detail.targetChapterCount) : [],
+    [detail],
+  );
 
   const closePanel = () => {
     setPanel(null);
@@ -557,7 +549,7 @@ export function PublicReaderPage() {
           </header>
           <div className="contents-scroll">
             {chapterSections.map((section) => (
-              <section key={section.label}>
+              <section key={section.key}>
                 <h3>{section.label}</h3>
                 {section.chapters.map((item) => (
                   <button

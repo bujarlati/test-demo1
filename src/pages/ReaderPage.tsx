@@ -47,6 +47,7 @@ import {
   type ReaderSettings,
 } from "../readerSettings";
 import { currentRevision } from "../storyDomain";
+import { buildStoryChapterSections } from "../storyStructure";
 import { CHAPTER_LENGTH_PRESETS, type ChapterLengthMode } from "../storyConfig";
 import type { Chapter, ContentReport, ConversationMessage, Story } from "../types";
 import { formatDateTime } from "../utils";
@@ -226,14 +227,10 @@ export function ReaderPage() {
     "--reader-width": `${settings.width}px`,
   } as CSSProperties;
 
-  const chaptersByAct = useMemo(() => {
-    if (!story) return [];
-    const groupSize = Math.max(6, Math.ceil(story.chapters.length / 3));
-    return Array.from({ length: Math.ceil(story.chapters.length / groupSize) }, (_, index) => ({
-      label: index === 0 ? "第一部 · 潮线初现" : index === 1 ? "第二部 · 旧城回声" : "第三部 · 黑潮将至",
-      chapters: story.chapters.slice(index * groupSize, (index + 1) * groupSize),
-    }));
-  }, [story]);
+  const chapterSections = useMemo(
+    () => story ? buildStoryChapterSections(story.chapters, story.targetChapterCount) : [],
+    [story],
+  );
 
   const changeChapter = (nextChapter: Chapter) => {
     restorePosition.current = false;
@@ -395,7 +392,7 @@ export function ReaderPage() {
       <aside className={`reader-side-panel contents-panel${panel === "contents" ? " open" : ""}`} aria-hidden={panel !== "contents"}>
         <header><div><span className="eyebrow">目录</span><h2>{story.title}</h2></div><button type="button" aria-label="关闭目录" onClick={() => setPanel(null)}><X size={19} /></button></header>
         <div className="contents-scroll">
-          {chaptersByAct.map((act) => <section key={act.label}><h3>{act.label}</h3>{act.chapters.map((item) => <button type="button" key={item.id} className={item.id === chapter.id ? "active" : ""} onClick={() => changeChapter(item)}><span>{String(item.number).padStart(2, "0")}</span><strong>{currentRevision(item)?.title ?? item.title}</strong>{item.hasUnreadRevision && <i>已修订</i>}</button>)}</section>)}
+          {chapterSections.map((section) => <section key={section.key}><h3>{section.label}</h3>{section.chapters.map((item) => <button type="button" key={item.id} className={item.id === chapter.id ? "active" : ""} onClick={() => changeChapter(item)}><span>{String(item.number).padStart(2, "0")}</span><strong>{currentRevision(item)?.title ?? item.title}</strong>{item.hasUnreadRevision && <i>已修订</i>}</button>)}</section>)}
         </div>
       </aside>
 
