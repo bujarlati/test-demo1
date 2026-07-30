@@ -1,4 +1,5 @@
 import type {
+  ApiErrorPayload,
   AuditEvent,
   AuthPayload,
   BootstrapPayload,
@@ -16,18 +17,30 @@ import type {
   ModelConnection,
   ModelConnectionInput,
   OpsMetrics,
+  OpsPublicationModeration,
   OpsQualityBucket,
+  OwnerPublicationState,
+  PublicationModerationSummary,
+  PublicProfile,
+  PublicProfileInput,
+  PublicReadingProgress,
+  PublicStoryDetail,
+  PublicStoryPage,
+  PublicStoryQuery,
   RetconTransaction,
   ReaderMessageContext,
   ReaderPreference,
   ReadingProgress,
   SafetyDecision,
+  SavePublicReadingProgressInput,
+  SetStoryPublicationInput,
   Story,
   StoryPagePayload,
   StoryConstraintCommandResult,
   StoryEventCommandResult,
   StoryWorldState,
 } from "./types";
+import { publicStoryCollectionUrl } from "./publicStoryState";
 
 const tokenKey = "xumo-auth-token";
 
@@ -39,11 +52,20 @@ export const authStore = {
 
 export class ApiError extends Error {
   status: number;
+  code?: string;
+  details?: Readonly<Record<string, unknown>>;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    code?: string,
+    details?: Readonly<Record<string, unknown>>,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.details = details;
   }
 }
 
@@ -59,13 +81,19 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
+    let code: string | undefined;
+    let details: Readonly<Record<string, unknown>> | undefined;
     try {
-      const body = (await response.json()) as { message?: string };
-      if (body.message) message = body.message;
+      const body = (await response.json()) as Partial<ApiErrorPayload>;
+      if (typeof body.message === "string" && body.message) message = body.message;
+      if (typeof body.code === "string") code = body.code;
+      if (body.details && typeof body.details === "object" && !Array.isArray(body.details)) {
+        details = body.details;
+      }
     } catch {
       // Keep the status-based fallback message.
     }
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, code, details);
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -235,6 +263,41 @@ export const api = {
   bootstrap: () => request<BootstrapPayload>("/api/bootstrap"),
   stories: (cursor: string, limit = 24) =>
     request<StoryPagePayload>(`/api/stories?cursor=${encodeURIComponent(cursor)}&limit=${limit}`),
+  ownerPublication: (storyId: string) =>
+    request<OwnerPublicationState>(`/api/stories/${encodeURIComponent(storyId)}/publication`),
+  setStoryPublication: (storyId: string, input: SetStoryPublicationInput) =>
+    request<OwnerPublicationState>(`/api/stories/${encodeURIComponent(storyId)}/publication`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  updatePublicProfile: (input: PublicProfileInput) =>
+    request<PublicProfile>("/api/me/public-profile", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  publicStories: (query: PublicStoryQuery = {}, signal?: AbortSignal) =>
+    request<PublicStoryPage>(publicStoryCollectionUrl(query), { signal }),
+  publicStory: (publicStoryId: string, signal?: AbortSignal) =>
+    request<PublicStoryDetail>(`/api/public-stories/${encodeURIComponent(publicStoryId)}`, { signal }),
+  savePublicStoryProgress: (publicStoryId: string, input: SavePublicReadingProgressInput) =>
+    request<PublicReadingProgress>(`/api/public-stories/${encodeURIComponent(publicStoryId)}/progress`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  reportPublicStory: (publicStoryId: string, chapterId: string, reason: string) =>
+    request<ContentReport>(`/api/public-stories/${encodeURIComponent(publicStoryId)}/reports`, {
+      method: "POST",
+      body: JSON.stringify({ chapterId, reason }),
+    }),
+  suspendPublicStory: (publicStoryId: string, reason: string) =>
+    request<PublicationModerationSummary>(`/api/ops/publications/${encodeURIComponent(publicStoryId)}/suspend`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+  restorePublicStory: (publicStoryId: string) =>
+    request<PublicationModerationSummary>(`/api/ops/publications/${encodeURIComponent(publicStoryId)}/restore`, {
+      method: "POST",
+    }),
   story: (storyId: string) => request<Story>(`/api/stories/${storyId}`),
   worldState: (storyId: string) => request<StoryWorldState>(`/api/stories/${storyId}/state`),
   createConstraint: (
@@ -366,5 +429,6 @@ export const api = {
     auditEvents: AuditEvent[];
     reports: ContentReport[];
     safetyDecisions: SafetyDecision[];
+    publicationModeration: OpsPublicationModeration;
   }>("/api/ops"),
 };

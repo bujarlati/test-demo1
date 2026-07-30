@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { ErrorState, LoadingState } from "../components/States";
+import { StoryPublicationActions } from "../components/StoryPublicationActions";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
 import type { Story } from "../types";
@@ -99,6 +100,8 @@ export function ArchivePage() {
           <button className="text-link text-link--danger" type="button" onClick={() => void setStoryStatus("archived")}><Archive size={15} /> 移出书架</button>
         </div>
       </header>
+
+      <StoryPublicationActions story={story} mode="panel" />
 
       <div className="archive-layout">
         <nav className="archive-tabs" aria-label="故事档案分类">

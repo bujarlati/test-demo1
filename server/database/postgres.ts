@@ -26,8 +26,13 @@ import type {
   NarrationReviewDecisionClaim,
   NarrationReviewFeedbackRecord,
 } from "../narrationReviewState";
+import {
+  createPublicStorySharingModule,
+  type PublicStorySharingModule,
+} from "../publicStorySharing";
 import { summarizeStory } from "../storyService";
 import { NarrationReviewPostgresRepository } from "./narrationReviewRepository";
+import { PublicStoryPostgresRepository } from "./publicStoryRepository";
 import type { DatabaseExecutor, LegacyImportCounts, PersistenceDatabase, QueryResult, StoryPage } from "./types";
 
 const { Pool } = pg;
@@ -55,6 +60,7 @@ interface UserRow {
   role: UserAccount["role"];
   active_story_id: string | null;
   default_connection_id: string;
+  public_pen_name: string | null;
 }
 
 interface StoryRow extends JsonRow {
@@ -217,6 +223,7 @@ function toUser(row: UserRow): UserAccount {
     role: row.role,
     activeStoryId: row.active_story_id,
     defaultConnectionId: row.default_connection_id,
+    publicPenName: row.public_pen_name,
   };
 }
 
@@ -286,12 +293,16 @@ export function createPostgresDatabase(connectionString: string): PostgresDataba
 
 export class PostgresDatabase implements PersistenceDatabase {
   readonly kind = "postgresql" as const;
+  readonly publicStories: PublicStoryPostgresRepository;
+  readonly publicStorySharing: PublicStorySharingModule;
   private saveQueue = Promise.resolve();
   private readonly fingerprints = new Map<string, string>();
   private readonly narrationReviews: NarrationReviewPostgresRepository;
 
   constructor(private readonly executor: DatabaseExecutor) {
     this.narrationReviews = new NarrationReviewPostgresRepository(executor);
+    this.publicStories = new PublicStoryPostgresRepository(executor);
+    this.publicStorySharing = createPublicStorySharingModule(this.publicStories);
   }
 
   async migrate(): Promise<void> {
@@ -355,7 +366,7 @@ export class PostgresDatabase implements PersistenceDatabase {
     const [activeJobOwners, connections, jobs, failures, audits, safety, reports, keys, requests] = await Promise.all([
       this.executor.query<UserRow>(
         `SELECT DISTINCT u.id, u.email, u.password_salt, u.password_hash, u.name, u.initials,
-                u.role, u.active_story_id, u.default_connection_id
+                u.role, u.active_story_id, u.default_connection_id, u.public_pen_name
          FROM xumo_users u
          JOIN xumo_generation_jobs j ON j.owner_id = u.id
          WHERE j.status IN ('running', 'awaiting_user_review')`,
@@ -411,7 +422,7 @@ export class PostgresDatabase implements PersistenceDatabase {
 
   async findUserByEmail(email: string): Promise<UserAccount | null> {
     const result = await this.executor.query<UserRow>(
-      `SELECT id, email, password_salt, password_hash, name, initials, role, active_story_id, default_connection_id
+      `SELECT id, email, password_salt, password_hash, name, initials, role, active_story_id, default_connection_id, public_pen_name
        FROM xumo_users WHERE normalized_email = $1`,
       [normalizedEmail(email)],
     );
@@ -513,7 +524,7 @@ export class PostgresDatabase implements PersistenceDatabase {
   async findUserBySessionTokenHash(tokenHash: string): Promise<UserAccount | null> {
     const result = await this.executor.query<UserRow>(
       `SELECT u.id, u.email, u.password_salt, u.password_hash, u.name, u.initials, u.role,
-              u.active_story_id, u.default_connection_id
+              u.active_story_id, u.default_connection_id, u.public_pen_name
        FROM xumo_auth_sessions s
        JOIN xumo_users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > now()`,
@@ -816,14 +827,14 @@ export class PostgresDatabase implements PersistenceDatabase {
     const conflict = insertOnly ? "DO NOTHING" : `DO UPDATE SET email = excluded.email, normalized_email = excluded.normalized_email,
       password_salt = excluded.password_salt, password_hash = excluded.password_hash, name = excluded.name,
       initials = excluded.initials, role = excluded.role, active_story_id = excluded.active_story_id,
-      default_connection_id = excluded.default_connection_id, updated_at = now()`;
+      default_connection_id = excluded.default_connection_id, public_pen_name = excluded.public_pen_name, updated_at = now()`;
     const result = await executor.query(
       `INSERT INTO xumo_users(id, email, normalized_email, password_salt, password_hash, name, initials, role,
-                              active_story_id, default_connection_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                              active_story_id, default_connection_id, public_pen_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (normalized_email) ${conflict}`,
       [user.id, user.email, normalizedEmail(user.email), user.passwordSalt, user.passwordHash, user.name,
-        user.initials, user.role, user.activeStoryId, user.defaultConnectionId],
+        user.initials, user.role, user.activeStoryId, user.defaultConnectionId, user.publicPenName],
     );
     if (insertOnly && result.rowCount === 0) {
       throw Object.assign(new Error("该邮箱已经注册，请直接登录。"), { status: 409, code: "23505" });
@@ -869,6 +880,17 @@ export class PostgresDatabase implements PersistenceDatabase {
         story.unreadCanonChanges, summary.currentChapterNumber, summary.currentChapterTitle, summary.chapterCount,
         stableJson(payload), story.updatedAt],
     );
+    if (story.status === "archived") {
+      await executor.query(
+        `UPDATE xumo_story_publications
+         SET status = 'author_unpublished',
+             status_updated_at = now(),
+             admin_actor_user_id = NULL,
+             admin_reason = NULL
+         WHERE story_id = $1 AND status = 'active'`,
+        [story.id],
+      );
+    }
     for (const chapter of chapters) {
       await executor.query(
         `INSERT INTO xumo_chapters(id, story_id, chapter_number, title, current_revision_id, estimated_minutes,

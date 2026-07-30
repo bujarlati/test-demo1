@@ -3,6 +3,7 @@ import {
   BookOpenText,
   ChevronRight,
   CircleAlert,
+  Compass,
   Library,
   LoaderCircle,
   LogOut,
@@ -14,15 +15,17 @@ import { useApp } from "../context/AppContext";
 import { recoveryNoticeForJob } from "../jobRecovery";
 import { Logo } from "./Logo";
 
-const navigation = [
-  { to: "/", label: "我的书架", icon: Library, end: true },
-  { to: "/new", label: "开始新故事", icon: Plus },
-  { to: "/settings/models", label: "模型连接", icon: Settings2 },
-  { to: "/ops", label: "生成观察台", icon: BarChart3 },
-];
-
 export function AppShell() {
   const { data, logout } = useApp();
+  const navigation = [
+    { to: "/", label: "我的书架", icon: Library, end: true },
+    ...(data?.features.publicStorySharing
+      ? [{ to: "/discover", label: "大家的故事", icon: Compass, end: true }]
+      : []),
+    { to: "/new", label: "开始新故事", icon: Plus },
+    { to: "/settings/models", label: "模型连接", icon: Settings2 },
+    { to: "/ops", label: "生成观察台", icon: BarChart3 },
+  ];
   const activeStory = data?.stories.find((story) => story.id === data.activeStoryId);
   const pendingJob = data?.pendingJobs.find((job) => job.status === "awaiting_user_review")
     ?? data?.pendingJobs[0];
@@ -103,7 +106,11 @@ export function AppShell() {
         {visibleNavigation.filter((item) => item.to !== "/ops").slice(0, 3).map(({ to, label, icon: Icon, end }) => (
           <NavLink key={to} to={to} end={end} className={({ isActive }) => (isActive ? "active" : "")}>
             <Icon size={20} />
-            <span>{label === "开始新故事" ? "新故事" : label.replace("我的", "")}</span>
+            <span>{label === "开始新故事"
+              ? "新故事"
+              : label === "大家的故事"
+                ? "发现"
+                : label.replace("我的", "")}</span>
           </NavLink>
         ))}
         {activeStory && (

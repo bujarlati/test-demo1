@@ -78,6 +78,28 @@ APP_ENCRYPTION_KEY=32字节Base64或64位十六进制值
 3. 小流量开启，观察 `ask_user`、用户保留、超时、重写成功和最老 pending 年龄。
 4. 异常时把开关恢复为 `false`；这只停止新作业进入新门禁，scheduler 仍会让已有案例完成或超时收敛。不要回滚或删除 `003` migration。
 
+### 注册用户公共书库
+
+公共书库只允许注册用户访问。作者设置账号统一笔名后，可以立即公开至少含一章成功正文的非归档故事；读者通过公共书库或稳定分享链接只读访问当前正史，并保存独立阅读进度。作者取消公开或管理员下架后，链接立即不可读，但发布记录、稳定链接和读者进度保留。
+
+启用前必须使用 PostgreSQL 并完成 `004_public_story_sharing.sql`：
+
+```dotenv
+DATABASE_URL=postgresql://user:password@host:5432/xumo
+PUBLIC_STORY_SHARING_ENABLED=false
+AI_TRACE_ENABLED=false
+```
+
+先保持开关关闭部署、迁移和验证私人流程，再做双账号冒烟并开启。功能开关关闭是首选回滚方式；不要删除 `004` 新增表或修改已执行 migration。完整操作见 [公共书库发布、灰度与回滚手册](docs/runbooks/public-story-sharing-release.md)。
+
+发布前统一执行：
+
+```bash
+npm run verify:release
+```
+
+结构化公共请求日志只包含固定 route 名、状态码、耗时和匿名请求关联 ID，不应包含搜索原文、笔名、标题、故事 ID 或正文。
+
 ### 从旧 JSON 切换到 PostgreSQL
 
 先备份旧数据并保持旧服务运行，然后对新数据库执行：

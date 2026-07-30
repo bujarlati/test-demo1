@@ -5,6 +5,9 @@ import type {
   GenerationFailureSummaryBucket,
   NarrationReviewMetricBucket,
   GenerationJob,
+  PublicStoryDetail,
+  PublicStoryPage,
+  PublicStoryQuery,
   Story,
   StorySummary,
   UserAccount,
@@ -15,6 +18,7 @@ import type {
   NarrationReviewDecisionClaim,
   NarrationReviewFeedbackRecord,
 } from "../narrationReviewState";
+import type { PublicStorySharingModule } from "../publicStorySharing";
 
 export interface QueryResult<Row = Record<string, unknown>> {
   rows: Row[];
@@ -38,6 +42,11 @@ export interface StoryPage {
   totalChapters: number;
 }
 
+export interface PublicStoryReadRepository {
+  list(query: PublicStoryQuery): Promise<PublicStoryPage>;
+  read(viewerId: string, storyId: string): Promise<PublicStoryDetail | null>;
+}
+
 export interface LegacyImportCounts {
   users: number;
   stories: number;
@@ -47,6 +56,8 @@ export interface LegacyImportCounts {
 
 export interface PersistenceDatabase {
   readonly kind: "postgresql";
+  readonly publicStories: PublicStoryReadRepository;
+  readonly publicStorySharing: PublicStorySharingModule;
   migrate(): Promise<void>;
   isEmpty(): Promise<boolean>;
   loadRuntimeStore(): Promise<AppStore>;

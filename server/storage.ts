@@ -14,6 +14,12 @@ import type {
 import { captureCanonState } from "./canonState";
 import { createLegacyExperienceContract, normalizeReadingExperienceContract, normalizeReadingExperienceDeliveryLedger } from "./readingExperience";
 import { narrationReviewConfidenceThreshold } from "./narrationReview";
+import {
+  assertPublicStorySharingPrerequisites,
+  createPublicStorySharingDisabledError,
+  publicStorySharingEnabled,
+  type PublicStorySharingModule,
+} from "./publicStorySharing";
 import { summarizeStory } from "./storyService";
 import { createPostgresDatabase } from "./database/postgres";
 import type { PersistenceDatabase, StoryPage } from "./database/types";
@@ -118,6 +124,10 @@ const enqueueStoreSave = createStoreSaveQueue(async (snapshot) => {
 });
 
 export function normalizeStore(store: AppStore): AppStore {
+  for (const user of store.users ?? []) {
+    user.publicPenName ??= null;
+  }
+
   store.generationFailures ??= [];
   store.generationFailures = store.generationFailures
     .map((failure) => upgradeGenerationFailureObservation(failure))
@@ -275,6 +285,7 @@ export function normalizeStore(store: AppStore): AppStore {
 
 export async function loadStore(): Promise<AppStore> {
   const connectionString = databaseUrl();
+  assertPublicStorySharingPrerequisites();
   const narrationReviewEnabled = contextualNarrationReviewEnabled();
   if (!connectionString && narrationReviewEnabled) {
     throw new Error("CONTEXTUAL_NARRATION_REVIEW_ENABLED requires PostgreSQL DATABASE_URL.");
@@ -568,6 +579,14 @@ export async function clearPersistedStoryModelConnection(connectionId: string): 
 export async function checkStorageHealth(): Promise<void> {
   if (database) await database.health();
 }
+
+export function requirePublicStorySharingModule(): PublicStorySharingModule {
+  if (!publicStorySharingEnabled() || !database) {
+    throw createPublicStorySharingDisabledError();
+  }
+  return database.publicStorySharing;
+}
+
 export function supportsDurableNarrationReview(): boolean {
   return database !== null;
 }

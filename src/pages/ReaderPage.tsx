@@ -2,7 +2,6 @@ import {
   ArrowLeft,
   ArrowRight,
   BookMarked,
-  BookOpenText,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -15,16 +14,12 @@ import {
   List,
   LoaderCircle,
   MessageCircle,
-  Minus,
-  Moon,
   MoreHorizontal,
-  Plus,
   ScrollText,
   Send,
   Settings2,
   ShieldCheck,
   Sparkles,
-  Sun,
   TextCursorInput,
   X,
 } from "lucide-react";
@@ -38,34 +33,55 @@ import {
 } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
+import { ReaderSettingsControls } from "../components/ReaderSettingsControls";
 import { ErrorState, LoadingState } from "../components/States";
 import { Logo } from "../components/Logo";
+import { StoryPublicationActions } from "../components/StoryPublicationActions";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
+import {
+  DEFAULT_READER_SETTINGS,
+  READER_SETTINGS_STORAGE_KEY,
+  loadReaderSettings,
+  saveReaderSettings,
+  type ReaderSettings,
+} from "../readerSettings";
 import { currentRevision } from "../storyDomain";
 import { CHAPTER_LENGTH_PRESETS, type ChapterLengthMode } from "../storyConfig";
 import type { Chapter, ContentReport, ConversationMessage, Story } from "../types";
 import { formatDateTime } from "../utils";
 
-type ReaderTheme = "paper" | "mist" | "night";
 type ReaderPanel = "contents" | "settings" | "chat" | null;
 
-interface ReaderSettings {
-  theme: ReaderTheme;
-  fontSize: number;
-  lineHeight: number;
-  width: number;
+interface AuthorReaderSettings extends ReaderSettings {
   chapterLength: ChapterLengthMode;
 }
 
-const defaultSettings: ReaderSettings = { theme: "paper", fontSize: 20, lineHeight: 1.95, width: 720, chapterLength: "standard" };
+const CHAPTER_LENGTH_STORAGE_KEY = "xumo-reader-chapter-length";
+const defaultSettings: AuthorReaderSettings = {
+  ...DEFAULT_READER_SETTINGS,
+  chapterLength: "standard",
+};
 
-function loadSettings(): ReaderSettings {
+function loadChapterLength(): ChapterLengthMode {
   try {
-    return { ...defaultSettings, ...JSON.parse(localStorage.getItem("xumo-reader-settings") ?? "{}") } as ReaderSettings;
+    const stored = localStorage.getItem(CHAPTER_LENGTH_STORAGE_KEY);
+    if (stored === "compact" || stored === "standard" || stored === "immersive") return stored;
+    const legacy = JSON.parse(localStorage.getItem(READER_SETTINGS_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
+    if (legacy.chapterLength === "compact" || legacy.chapterLength === "standard" || legacy.chapterLength === "immersive") {
+      return legacy.chapterLength;
+    }
   } catch {
-    return defaultSettings;
+    // Use the generation default when storage is unavailable or malformed.
   }
+  return "standard";
+}
+
+function loadAuthorReaderSettings(): AuthorReaderSettings {
+  return {
+    ...loadReaderSettings(),
+    chapterLength: loadChapterLength(),
+  };
 }
 
 function ConversationCard({ message, story }: { message: ConversationMessage; story: Story }) {
@@ -98,7 +114,7 @@ export function ReaderPage() {
   const [error, setError] = useState<string | null>(null);
   const [chapterId, setChapterId] = useState<string | null>(null);
   const [panel, setPanel] = useState<ReaderPanel>(null);
-  const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
+  const [settings, setSettings] = useState<AuthorReaderSettings>(loadAuthorReaderSettings);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -132,7 +148,12 @@ export function ReaderPage() {
   useEffect(() => { void load(); }, [storyId]);
 
   useEffect(() => {
-    localStorage.setItem("xumo-reader-settings", JSON.stringify(settings));
+    saveReaderSettings(settings);
+    try {
+      localStorage.setItem(CHAPTER_LENGTH_STORAGE_KEY, settings.chapterLength);
+    } catch {
+      // Display and generation preferences are best-effort local state.
+    }
   }, [settings]);
 
   const currentIndex = story?.chapters.findIndex((chapter) => chapter.id === chapterId) ?? -1;
@@ -320,6 +341,7 @@ export function ReaderPage() {
         <nav className="reader-header__actions" aria-label="阅读工具">
           <Link to={`/story/${story.id}/archive`} aria-label="故事档案"><BookMarked size={18} /><span>档案</span></Link>
           <Link to={`/story/${story.id}/history`} aria-label="版本历史"><History size={18} /><span>版本</span></Link>
+          <StoryPublicationActions story={story} />
           <button type="button" onClick={() => void reportCurrentChapter()} aria-label="举报当前章节"><Flag size={18} /><span>举报</span></button>
           <button type="button" onClick={() => setPanel(panel === "settings" ? null : "settings")} aria-label="阅读设置"><Settings2 size={18} /><span>阅读</span></button>
           <button type="button" className={panel === "chat" ? "active" : ""} onClick={() => setPanel(panel === "chat" ? null : "chat")} aria-label="读者对话"><MessageCircle size={18} /><span>对话</span>{branchConversation.length > 1 && <i />}</button>
@@ -380,10 +402,10 @@ export function ReaderPage() {
       <aside className={`reader-side-panel settings-panel${panel === "settings" ? " open" : ""}`} aria-hidden={panel !== "settings"}>
         <header><div><span className="eyebrow">阅读偏好</span><h2>让文字更合眼</h2></div><button type="button" aria-label="关闭设置" onClick={() => setPanel(null)}><X size={19} /></button></header>
         <div className="settings-scroll">
-          <section><label>阅读主题</label><div className="theme-options"><button type="button" className={settings.theme === "paper" ? "active" : ""} onClick={() => setSettings({ ...settings, theme: "paper" })}><Sun size={17} /><span>纸张</span></button><button type="button" className={settings.theme === "mist" ? "active" : ""} onClick={() => setSettings({ ...settings, theme: "mist" })}><BookOpenText size={17} /><span>雾白</span></button><button type="button" className={settings.theme === "night" ? "active" : ""} onClick={() => setSettings({ ...settings, theme: "night" })}><Moon size={17} /><span>夜读</span></button></div></section>
-          <section><label>正文字号 <strong>{settings.fontSize}px</strong></label><div className="stepper"><button type="button" aria-label="减小字号" onClick={() => setSettings({ ...settings, fontSize: Math.max(16, settings.fontSize - 1) })}><Minus size={16} /></button><span style={{ fontSize: `${settings.fontSize}px` }}>读</span><button type="button" aria-label="增大字号" onClick={() => setSettings({ ...settings, fontSize: Math.min(26, settings.fontSize + 1) })}><Plus size={16} /></button></div></section>
-          <section><label htmlFor="line-height">行间距 <strong>{settings.lineHeight.toFixed(2)}</strong></label><input id="line-height" type="range" min="1.6" max="2.3" step="0.05" value={settings.lineHeight} onChange={(event) => setSettings({ ...settings, lineHeight: Number(event.target.value) })} /></section>
-          <section><label htmlFor="text-width">正文宽度 <strong>{settings.width}px</strong></label><input id="text-width" type="range" min="600" max="820" step="20" value={settings.width} onChange={(event) => setSettings({ ...settings, width: Number(event.target.value) })} /></section>
+          <ReaderSettingsControls
+            settings={settings}
+            onChange={(readerSettings) => setSettings({ ...settings, ...readerSettings })}
+          />
           <section><label>下一章篇幅</label><div className="theme-options chapter-length-options">{(["compact", "standard", "immersive"] as const).map((mode) => <button type="button" key={mode} className={settings.chapterLength === mode ? "active" : ""} onClick={() => setSettings({ ...settings, chapterLength: mode })}><strong>{CHAPTER_LENGTH_PRESETS[mode].name}</strong><small>{CHAPTER_LENGTH_PRESETS[mode].note}</small></button>)}</div></section>
           {reports.length > 0 && <section className="reader-reports"><label>我的内容复核</label>{reports.slice(0, 4).map((report) => <article key={report.id}><span><strong>第 {story.chapters.find((item) => item.id === report.chapterId)?.number ?? "?"} 章</strong><small>{report.status === "submitted" ? "已提交" : report.status === "reviewing" ? "审核中" : report.status === "resolved" ? "已处理" : "申诉复核中"}</small></span>{report.status === "resolved" && <button type="button" className="text-link" onClick={() => void appeal(report.id)}>申诉</button>}</article>)}</section>}
           <button type="button" className="text-link reset-settings" onClick={() => setSettings(defaultSettings)}>恢复默认阅读设置</button>

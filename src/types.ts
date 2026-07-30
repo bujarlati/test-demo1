@@ -2,7 +2,15 @@ import type { StoryGenre, StoryLengthPlanId } from "./storyConfig";
 
 export type StoryStatus = "active" | "paused" | "completed" | "archived";
 
+export type StoryPublicationStatus = "active" | "author_unpublished" | "admin_suspended";
+
 export type UserRole = "reader" | "admin";
+
+export interface ApiErrorPayload {
+  message: string;
+  code?: string;
+  details?: Readonly<Record<string, unknown>>;
+}
 
 export interface EndingResolution {
   targetEndingSatisfied: boolean;
@@ -582,6 +590,131 @@ export interface StorySummary {
   progress: number;
 }
 
+export interface OwnerPublicationState {
+  storyId: string;
+  status: "private" | StoryPublicationStatus;
+  published: boolean;
+  sharePath: string;
+  firstPublishedAt: string | null;
+  statusUpdatedAt: string | null;
+  adminReason: string | null;
+}
+
+export interface SetStoryPublicationInput {
+  published: boolean;
+  publicPenName?: string;
+}
+
+export interface PublicProfileInput {
+  publicPenName: string;
+}
+
+export interface PublicProfile {
+  publicPenName: string;
+}
+
+export interface PublicReadingProgress {
+  storyId: string;
+  chapterId: string;
+  chapterNumber: number;
+  scrollProgress: number;
+  progressVersion: number;
+  updatedAt: string;
+}
+
+export interface SavePublicReadingProgressInput {
+  chapterId: string;
+  scrollProgress: number;
+  expectedVersion: number;
+}
+
+export interface PublicStoryCurrentRevision {
+  id: string;
+  title: string;
+  paragraphs: string[];
+  createdAt: string;
+}
+
+export interface PublicStoryChapter {
+  id: string;
+  number: number;
+  title: string;
+  estimatedMinutes: number;
+  currentRevision: PublicStoryCurrentRevision;
+}
+
+export interface PublicStorySummary {
+  id: string;
+  title: string;
+  subtitle: string;
+  genre: string;
+  tone: string;
+  length: string;
+  coverTheme: CoverTheme;
+  status: Exclude<StoryStatus, "archived">;
+  authorPenName: string;
+  chapterCount: number;
+  currentChapterNumber: number;
+  currentChapterTitle: string;
+  latestExcerpt: string;
+  updatedAt: string;
+}
+
+export interface PublicStoryDetail extends PublicStorySummary {
+  chapters: PublicStoryChapter[];
+  readingProgress: PublicReadingProgress | null;
+  viewerIsOwner: boolean;
+}
+
+export interface PublicStoryPage {
+  stories: PublicStorySummary[];
+  nextCursor: string | null;
+}
+
+export interface PublicStoryQuery {
+  query?: string;
+  genre?: StoryGenre;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface PublicStoryReportTarget {
+  storyId: string;
+  chapterId: string;
+  revisionId: string;
+}
+
+export interface PublicationModerationInput {
+  action: "suspend" | "restore";
+  reason?: string;
+}
+
+export interface PublicationModerationSummary {
+  storyId: string;
+  title: string;
+  authorPenName: string;
+  status: StoryPublicationStatus;
+  firstPublishedAt: string;
+  statusUpdatedAt: string;
+  adminReason: string | null;
+}
+
+export interface PublicationModerationCounts {
+  total: number;
+  active: number;
+  authorUnpublished: number;
+  adminSuspended: number;
+}
+
+export interface PublicationModerationOverview {
+  counts: PublicationModerationCounts;
+  recent: PublicationModerationSummary[];
+}
+
+export interface OpsPublicationModeration extends PublicationModerationOverview {
+  enabled: boolean;
+}
+
 export interface ModelRoutes {
   planner: string;
   writer: string;
@@ -875,6 +1008,7 @@ export interface UserAccount {
   role: UserRole;
   activeStoryId: string | null;
   defaultConnectionId: string;
+  publicPenName: string | null;
 }
 
 export interface UserProfile {
@@ -885,6 +1019,7 @@ export interface UserProfile {
   role: UserRole;
   activeStoryId: string | null;
   defaultConnectionId: string;
+  publicPenName: string | null;
 }
 
 export interface AuthSession {
@@ -921,6 +1056,7 @@ export interface AppStore {
 
 export interface BootstrapPayload {
   user: UserProfile;
+  features: { publicStorySharing: boolean };
   stories: StorySummary[];
   storyPage: {
     nextCursor: string | null;

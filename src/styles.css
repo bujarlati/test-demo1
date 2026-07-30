@@ -48,6 +48,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .button--ghost { border-color: transparent; color: var(--ink-2); background: transparent; }
 .button--ghost:hover:not(:disabled) { background: rgba(23,52,49,0.07); }
 .button--soft { color: var(--jade-dark); background: var(--jade-soft); }
+.button--danger { color: #fff; background: var(--rust); }
+.button--danger:hover:not(:disabled) { background: #8e4534; }
 .button--large { min-height: 50px; padding: 0 22px; border-radius: 12px; }
 .text-link { display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 0; color: var(--jade); background: none; font-weight: 680; cursor: pointer; }
 .text-link:hover { color: var(--jade-dark); text-decoration: underline; text-underline-offset: 4px; }
@@ -101,6 +103,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .page-heading h1 { margin-bottom: 10px; color: var(--ink); font-family: "Songti SC", STSong, serif; font-size: clamp(30px, 3vw, 46px); font-weight: 680; letter-spacing: -0.035em; line-height: 1.15; }
 .page-heading p { max-width: 670px; margin-bottom: 0; color: var(--muted); font-size: 14px; line-height: 1.8; }
 .page-heading--compact h1 { max-width: 760px; }
+.library-heading__actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
+.library-heading__actions .button { white-space: nowrap; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }
 .section-heading .eyebrow { margin-bottom: 7px; }
 .section-heading h2, .section-heading h3 { margin-bottom: 0; color: var(--ink); font-family: "Songti SC", STSong, serif; font-size: 25px; }
@@ -370,6 +374,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .ops-privacy-note { margin: 12px 0 0; color: var(--muted); font-size: 9px; line-height: 1.65; }
 .guardrail-panel { display: flex; flex-direction: column; overflow: hidden; border: 1px solid #d6d8d2; border-radius: 16px; background: rgba(255,253,248,0.82); }.guardrail-panel > div { display: flex; gap: 10px; padding: 18px; border-bottom: 1px solid #e3e4df; }.guardrail-panel > div svg { color: var(--jade); }.guardrail-panel > div span { display: flex; flex-direction: column; }.guardrail-panel strong { color: var(--ink); font-size: 10px; }.guardrail-panel small { margin-top: 4px; color: var(--muted); font-size: 8px; line-height: 1.4; }.guardrail-panel > p { margin: 0; padding: 17px; color: #7d8582; background: #f0eee7; font-size: 8px; line-height: 1.6; }
 .governance-panel { margin-top: 20px; padding: 24px; border: 1px solid #d6d8d2; border-radius: 16px; background: rgba(255,253,248,0.82); }.governance-list { margin-top: 14px; }.governance-list article { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 13px 0; border-bottom: 1px solid #e3e4df; }.governance-list article > div:first-child { display: flex; flex-direction: column; }.governance-list strong { font-size: 10px; }.governance-list small, .governance-list > p { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.publication-counts { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; margin-top: 16px; }
+.publication-counts article { display: flex; min-height: 74px; flex-direction: column; justify-content: space-between; padding: 13px; border: 1px solid #dde1dc; border-radius: 10px; background: #f7f6f1; }
+.publication-counts span { color: var(--muted); font-size: 8px; }.publication-counts strong { color: var(--ink); font-family: "Songti SC", STSong, serif; font-size: 21px; }
+.publication-status { display: inline-flex; padding: 4px 7px; border-radius: 999px; font-size: 8px; font-weight: 700; }
+.publication-status--active { color: var(--jade-dark); background: var(--jade-soft); }.publication-status--author_unpublished { color: #6c6f6b; background: #ecece8; }.publication-status--admin_suspended { color: #963f31; background: #f4dfd8; }
+.jobs-panel td.publication-actions-cell { display: flex; min-width: 250px; align-items: center; gap: 9px; }.publication-actions-cell input, .report-suspend-action input { min-width: 150px; height: 34px; padding: 0 9px; border: 1px solid #d4d8d3; border-radius: 7px; background: #fff; font-size: 9px; }
+.publication-actions-cell > small { max-width: 190px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }.publication-action-error { margin: 12px 0 0; color: var(--rust); font-size: 9px; }.publication-empty { margin: 18px 0 0; color: var(--muted); font-size: 9px; }
+.governance-item-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }.governance-item-actions > div:first-child { display: flex; gap: 10px; }.report-suspend-action { display: flex; align-items: center; gap: 8px; }
+.text-link:disabled { opacity: 0.45; cursor: wait; text-decoration: none; }
 .reader-reports article { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding: 9px; border: 1px solid #d9dfdb; border-radius: 8px; }.reader-reports article span { display: flex; flex-direction: column; }.reader-reports article strong { font-size: 9px; }.reader-reports article small { color: var(--muted); font-size: 7px; }
 
 .security-notice { display: flex; gap: 13px; margin-bottom: 30px; padding: 16px 19px; border: 1px solid #b9d1c8; border-radius: 12px; color: var(--jade-dark); background: #edf6f2; }.security-notice strong { font-size: 12px; }.security-notice p { margin: 4px 0 0; color: #4d6963; font-size: 10px; line-height: 1.6; }
@@ -463,6 +476,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 @media (max-width: 720px) {
   .revision-reader { padding: 15px 11px; }.revision-reader > header { flex-direction: column; }.revision-reader__columns { grid-template-columns: 1fr; }
+  .publication-counts { grid-template-columns: repeat(2,minmax(0,1fr)); }.jobs-panel td.publication-actions-cell, .report-suspend-action { align-items: stretch; flex-direction: column; }.governance-item-actions { width: 100%; align-items: stretch; }
   .governance-panel { padding: 18px 12px; }.governance-list article { align-items: flex-start; flex-direction: column; }
 }
 
@@ -472,4 +486,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 @media (max-width: 640px) {
   .narration-review-card { max-height: calc(100vh - 24px); padding: 24px 17px; }.narration-review-list article { padding: 14px; }.narration-review-actions { grid-template-columns: 1fr; }.narration-review-countdown { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .library-heading__actions { width: 100%; flex-direction: column-reverse; align-items: stretch; }
+  .library-heading__actions .button { width: 100%; }
 }

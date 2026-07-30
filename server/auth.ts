@@ -13,8 +13,8 @@ export interface AuthLocals {
 }
 
 export function publicUser(user: UserAccount): UserProfile {
-  const { id, email, name, initials, role, activeStoryId, defaultConnectionId } = user;
-  return { id, email, name, initials, role, activeStoryId, defaultConnectionId };
+  const { id, email, name, initials, role, activeStoryId, defaultConnectionId, publicPenName } = user;
+  return { id, email, name, initials, role, activeStoryId, defaultConnectionId, publicPenName };
 }
 
 export function normalizeEmail(email: string): string {
@@ -90,6 +90,7 @@ export function createReaderAccount(email: string, password: string, name: strin
     role: "reader",
     activeStoryId: null,
     defaultConnectionId: "conn_platform",
+    publicPenName: null,
   };
 }
 

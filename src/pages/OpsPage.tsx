@@ -2,8 +2,19 @@ import { Activity, AlertTriangle, CheckCircle2, CircleDollarSign, Clock3, Gauge,
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { ErrorState, LoadingState } from "../components/States";
-import type { AuditEvent, ContentReport, GenerationFailureSummaryBucket, GenerationJob, NarrationReviewMetricBucket, OpsMetrics, OpsQualityBucket, SafetyDecision } from "../types";
+import type { AuditEvent, ContentReport, GenerationFailureSummaryBucket, GenerationJob, NarrationReviewMetricBucket, OpsMetrics, OpsPublicationModeration, OpsQualityBucket, SafetyDecision } from "../types";
 import { formatDateTime, money, percent } from "../utils";
+
+const emptyPublicationModeration: OpsPublicationModeration = {
+  enabled: false,
+  counts: {
+    total: 0,
+    active: 0,
+    authorUnpublished: 0,
+    adminSuspended: 0,
+  },
+  recent: [],
+};
 
 export function OpsPage() {
   const [metrics, setMetrics] = useState<OpsMetrics | null>(null);
@@ -14,6 +25,10 @@ export function OpsPage() {
   const [qualityBreakdown, setQualityBreakdown] = useState<OpsQualityBucket[]>([]);
   const [failurePatterns, setFailurePatterns] = useState<GenerationFailureSummaryBucket[]>([]);
   const [narrationReviewMetrics, setNarrationReviewMetrics] = useState<NarrationReviewMetricBucket[]>([]);
+  const [publicationModeration, setPublicationModeration] = useState(emptyPublicationModeration);
+  const [moderationReasons, setModerationReasons] = useState<Record<string, string>>({});
+  const [moderationActionStoryId, setModerationActionStoryId] = useState<string | null>(null);
+  const [moderationActionError, setModerationActionError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = async () => {
     try {
@@ -26,6 +41,7 @@ export function OpsPage() {
       setQualityBreakdown(payload.qualityBreakdown);
       setFailurePatterns(payload.failurePatterns);
       setNarrationReviewMetrics(payload.narrationReviewMetrics);
+      setPublicationModeration(payload.publicationModeration);
       setError(null);
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "观察台加载失败。" ); }
   };
@@ -45,6 +61,43 @@ export function OpsPage() {
   const reviewReport = async (report: ContentReport, status: "reviewing" | "resolved") => {
     const updated = await api.reviewReport(report.id, status, status === "resolved" ? "已完成人工复核；决定与生成模型解耦保存。" : undefined);
     setReports((current) => current.map((item) => item.id === updated.id ? updated : item));
+  };
+  const updateModerationReason = (storyId: string, reason: string) => {
+    setModerationReasons((current) => ({ ...current, [storyId]: reason }));
+  };
+  const moderatePublication = async (
+    storyId: string,
+    action: "suspend" | "restore",
+    fallbackReason?: string,
+  ) => {
+    const reason = (moderationReasons[storyId] ?? fallbackReason ?? "").trim();
+    if (action === "suspend" && !reason) {
+      setModerationActionError("请输入下架原因后再提交。");
+      return;
+    }
+    if (Array.from(reason).length > 120) {
+      setModerationActionError("下架原因不能超过 120 个字符。");
+      return;
+    }
+    setModerationActionStoryId(storyId);
+    setModerationActionError(null);
+    try {
+      if (action === "suspend") {
+        await api.suspendPublicStory(storyId, reason);
+      } else {
+        await api.restorePublicStory(storyId);
+      }
+      setModerationReasons((current) => {
+        const next = { ...current };
+        delete next[storyId];
+        return next;
+      });
+      await load();
+    } catch (requestError) {
+      setModerationActionError(requestError instanceof Error ? requestError.message : "发布状态操作失败。");
+    } finally {
+      setModerationActionStoryId(null);
+    }
   };
 
   return (
@@ -95,10 +148,67 @@ export function OpsPage() {
         </tbody></table></div>
       </section>
 
+      <section className="jobs-panel quality-panel publication-ops-panel">
+        <div className="section-heading"><div><span className="eyebrow">公共书库治理</span><h2>最近发布状态</h2></div><span>{publicationModeration.counts.total} 本</span></div>
+        <p className="ops-privacy-note">仅返回发布状态、笔名、标题、短原因和时间；运营响应与审计事件不包含任何章节正文。</p>
+        <div className="publication-counts" aria-label="发布状态计数">
+          <article><span>正在公开</span><strong>{publicationModeration.counts.active.toLocaleString("zh-CN")}</strong></article>
+          <article><span>作者取消</span><strong>{publicationModeration.counts.authorUnpublished.toLocaleString("zh-CN")}</strong></article>
+          <article><span>管理员下架</span><strong>{publicationModeration.counts.adminSuspended.toLocaleString("zh-CN")}</strong></article>
+          <article><span>发布记录</span><strong>{publicationModeration.counts.total.toLocaleString("zh-CN")}</strong></article>
+        </div>
+        {moderationActionError && <p className="publication-action-error" role="alert">{moderationActionError}</p>}
+        {!publicationModeration.enabled ? (
+          <p className="publication-empty">公共书库功能当前关闭，发布数据不会被读取。</p>
+        ) : (
+          <div className="table-wrap"><table><thead><tr><th>作品 / 笔名</th><th>状态</th><th>状态时间</th><th>运营操作</th></tr></thead><tbody>
+            {publicationModeration.recent.map((publication) => <tr key={publication.storyId}>
+              <td><strong>{publication.title}</strong><small>{publication.authorPenName}</small></td>
+              <td><span className={`publication-status publication-status--${publication.status}`}>{publication.status === "active" ? "正在公开" : publication.status === "admin_suspended" ? "管理员下架" : "作者取消"}</span></td>
+              <td>{formatDateTime(publication.statusUpdatedAt)}</td>
+              <td className="publication-actions-cell">
+                {publication.status === "active" ? <>
+                  <input
+                    value={moderationReasons[publication.storyId] ?? ""}
+                    onChange={(event) => updateModerationReason(publication.storyId, event.target.value)}
+                    maxLength={120}
+                    placeholder="下架原因（必填）"
+                    aria-label={`下架《${publication.title}》的原因`}
+                  />
+                  <button type="button" className="text-link text-link--danger" disabled={moderationActionStoryId === publication.storyId} onClick={() => void moderatePublication(publication.storyId, "suspend")}>下架</button>
+                </> : publication.status === "admin_suspended" ? <>
+                  <small>{publication.adminReason ?? "未记录原因"}</small>
+                  <button type="button" className="text-link" disabled={moderationActionStoryId === publication.storyId} onClick={() => void moderatePublication(publication.storyId, "restore")}>恢复公开</button>
+                </> : <small>由作者自行重新公开</small>}
+              </td>
+            </tr>)}
+            {publicationModeration.recent.length === 0 && <tr><td colSpan={4}>暂无发布记录。</td></tr>}
+          </tbody></table></div>
+        )}
+      </section>
+
       <section className="governance-panel">
         <div className="section-heading"><div><span className="eyebrow">内容治理</span><h2>举报、复核与申诉</h2></div><span>{reports.length} 条</span></div>
         <div className="governance-list">
-          {reports.map((report) => <article key={report.id}><div><strong>{report.reason}</strong><small>{report.storyId} · {report.chapterId} · {report.status}</small></div><div>{report.status === "submitted" || report.status === "appealed" ? <button type="button" className="text-link" onClick={() => void reviewReport(report, "reviewing")}>开始复核</button> : null}{report.status === "reviewing" ? <button type="button" className="text-link" onClick={() => void reviewReport(report, "resolved")}>完成处理</button> : null}</div></article>)}
+          {reports.map((report) => {
+            const reportStoryId = report.storyId;
+            return <article key={report.id}>
+              <div><strong>{report.reason}</strong><small>{reportStoryId} · {report.chapterId} · {report.status}</small></div>
+              <div className="governance-item-actions">
+                <div>{report.status === "submitted" || report.status === "appealed" ? <button type="button" className="text-link" onClick={() => void reviewReport(report, "reviewing")}>开始复核</button> : null}{report.status === "reviewing" ? <button type="button" className="text-link" onClick={() => void reviewReport(report, "resolved")}>完成处理</button> : null}</div>
+                {publicationModeration.enabled && report.status !== "resolved" && reportStoryId ? <div className="report-suspend-action">
+                  <input
+                    value={moderationReasons[reportStoryId] ?? ""}
+                    onChange={(event) => updateModerationReason(reportStoryId, event.target.value)}
+                    maxLength={120}
+                    placeholder="默认：举报待复核"
+                    aria-label={`从举报下架故事 ${reportStoryId} 的原因`}
+                  />
+                  <button type="button" className="text-link text-link--danger" disabled={moderationActionStoryId === reportStoryId} onClick={() => void moderatePublication(reportStoryId, "suspend", "举报待复核")}>下架公开版</button>
+                </div> : null}
+              </div>
+            </article>;
+          })}
           {reports.length === 0 && <p>暂无用户举报。输入、候选与输出仍会经过独立安全决策并只记录哈希。</p>}
         </div>
       </section>

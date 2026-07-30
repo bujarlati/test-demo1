@@ -2762,6 +2762,7 @@ test("OpenAI-compatible long writer completions use negotiated streaming outside
     6_500,
     {
       secretReader: async () => "test-key",
+      now: () => 1_000,
       retryDelay: async () => undefined,
       modelFetcher: async (_connection, _apiKey, _pathname, init, timeout, overall) => {
         requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;

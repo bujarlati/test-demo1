@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import type { ChapterGenerationStatusPayload, ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, Story, UserAccount } from "../src/types";
+import type { ChapterGenerationStatusPayload, ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, PublicationModerationOverview, Story, UserAccount } from "../src/types";
 import { isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
 import { recoverableGenerationJobs } from "../src/jobRecovery";
 import {
@@ -70,6 +70,7 @@ import {
   loadOwnedStory,
   loadStore,
   registerUser,
+  requirePublicStorySharingModule,
   releaseStoredIdempotencyKey,
   reserveStoredIdempotencyKey,
   saveAuthSession,
@@ -112,6 +113,8 @@ import {
   sanitizeGenerationFailureMessage,
 } from "./failureTelemetry";
 import { readingExperienceCadenceAuditEvents } from "./readingExperience";
+import { createPublicStoryRouter } from "./publicStoryRoutes";
+import { publicStorySharingEnabled } from "./publicStorySharing";
 
 interface HostedStaticAsset {
   body: string;
@@ -618,7 +621,45 @@ app.post("/api/auth/register", async (request, response) => {
   response.status(201).json({ token, user: publicUser(user) });
 });
 
+app.use("/api", (_request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
+  next();
+});
 app.use("/api", authenticate(store, (hash) => findUserBySessionTokenHash(store, hash)));
+app.use("/api", createPublicStoryRouter({
+  getSharingModule: requirePublicStorySharingModule,
+  persistReport: async (input) => {
+    const createdAt = new Date().toISOString();
+    const report: ContentReport = {
+      id: `report_${randomUUID().slice(0, 10)}`,
+      ...input,
+      status: "submitted",
+      createdAt,
+      updatedAt: createdAt,
+    };
+    store.contentReports.unshift(report);
+    audit(store, input.reporterUserId, "governance.report", "story", input.storyId, {
+      reportId: report.id,
+      chapterId: input.chapterId,
+      revisionId: input.revisionId,
+      surface: "public_story",
+    });
+    await persist();
+    return report;
+  },
+  recordModerationAudit: async (input) => {
+    audit(store, input.actorUserId, `publication.${input.action}`, "story", input.storyId, {
+      resultingStatus: input.resultingStatus,
+      ...(input.reason ? { reason: input.reason } : {}),
+    });
+    await persist();
+  },
+  observeRequest: (observation) => {
+    // This event is deliberately limited to four non-content fields. In particular,
+    // do not add request paths, IDs, search text, pen names, titles, or request bodies.
+    console.info(JSON.stringify(observation));
+  },
+}));
 
 app.param("storyId", async (request, response, next, storyId) => {
   try {
@@ -653,6 +694,7 @@ app.get("/api/bootstrap", async (_request, response) => {
   const availableStoryIds = new Set(stories.map((story) => story.id));
   response.json({
     user: publicUser(user),
+    features: { publicStorySharing: publicStorySharingEnabled() },
     stories,
     storyPage: {
       nextCursor: storyPage.nextCursor,
@@ -2023,10 +2065,24 @@ app.post("/api/model-connections/:connectionId/default", requireAdmin, async (re
   response.json({ defaultConnectionId: connection.id });
 });
 
+const emptyPublicationModerationOverview: PublicationModerationOverview = {
+  counts: {
+    total: 0,
+    active: 0,
+    authorUnpublished: 0,
+    adminSuspended: 0,
+  },
+  recent: [],
+};
+
 app.get("/api/ops", requireAdmin, async (_request, response) => {
-  const [failurePatterns, narrationReviewMetrics] = await Promise.all([
+  const publicationSharingIsEnabled = publicStorySharingEnabled();
+  const [failurePatterns, narrationReviewMetrics, publicationOverview] = await Promise.all([
     listGenerationFailurePatterns(store, 30),
     listNarrationReviewMetrics(30),
+    publicationSharingIsEnabled
+      ? requirePublicStorySharingModule().moderationOverview(30)
+      : Promise.resolve(emptyPublicationModerationOverview),
   ]);
   response.json({
     metrics: calculateOpsMetrics(),
@@ -2037,6 +2093,10 @@ app.get("/api/ops", requireAdmin, async (_request, response) => {
     auditEvents: store.auditEvents.slice(0, 30),
     reports: store.contentReports.slice(0, 30),
     safetyDecisions: store.safetyDecisions.slice(0, 50),
+    publicationModeration: {
+      enabled: publicationSharingIsEnabled,
+      ...publicationOverview,
+    },
   });
 });
 

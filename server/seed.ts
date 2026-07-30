@@ -562,6 +562,7 @@ export function createSeedStore(): AppStore {
         role: "admin",
         activeStoryId: blackTide.id,
         defaultConnectionId: "conn_platform",
+        publicPenName: null,
         ...passwordRecord(adminPassword, "admin@xumo.local"),
       },
       {
@@ -572,6 +573,7 @@ export function createSeedStore(): AppStore {
         role: "reader",
         activeStoryId: null,
         defaultConnectionId: "conn_platform",
+        publicPenName: null,
         ...passwordRecord(readerPassword, "reader@xumo.local"),
       },
     ],

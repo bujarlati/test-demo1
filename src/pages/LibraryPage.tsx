@@ -1,4 +1,4 @@
-import { ArrowRight, BookOpenText, Clock3, LoaderCircle, Plus, Sparkles } from "lucide-react";
+import { ArrowRight, BookOpenText, Clock3, Compass, LoaderCircle, Plus, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { BookCover } from "../components/BookCover";
@@ -32,9 +32,16 @@ export function LibraryPage() {
           <h1>故事已经替你翻到这里。</h1>
           <p>继续读，或让一段全新的命运自行开始。</p>
         </div>
-        <Link className="button button--primary" to="/new">
-          <Plus size={18} /> 开始新故事
-        </Link>
+        <div className="library-heading__actions">
+          {data.features.publicStorySharing && (
+            <Link className="button button--secondary" to="/discover">
+              <Compass size={18} /> 大家的故事
+            </Link>
+          )}
+          <Link className="button button--primary" to="/new">
+            <Plus size={18} /> 开始新故事
+          </Link>
+        </div>
       </header>
 
       {activeStory ? (

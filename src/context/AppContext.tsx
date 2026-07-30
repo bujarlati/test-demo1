@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { api, ApiError, authStore } from "../api";
-import type { BootstrapPayload, OpeningJobStatusPayload } from "../types";
+import type { BootstrapPayload, OpeningJobStatusPayload, PublicProfile } from "../types";
 
 interface AppContextValue {
   data: BootstrapPayload | null;
@@ -20,6 +20,7 @@ interface AppContextValue {
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   reconcileOpeningJobStatus: (status: OpeningJobStatusPayload) => void;
+  reconcilePublicProfile: (profile: PublicProfile) => void;
   loadMoreStories: () => Promise<void>;
 }
 
@@ -107,6 +108,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  const reconcilePublicProfile = useCallback((profile: PublicProfile) => {
+    setData((current) => current ? {
+      ...current,
+      user: {
+        ...current.user,
+        publicPenName: profile.publicPenName,
+      },
+    } : current);
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await api.logout();
@@ -132,9 +143,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       logout,
       refresh,
       reconcileOpeningJobStatus,
+      reconcilePublicProfile,
       loadMoreStories,
     }),
-    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, refresh, register],
+    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, reconcilePublicProfile, refresh, register],
   );
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
