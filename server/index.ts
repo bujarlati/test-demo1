@@ -717,6 +717,7 @@ app.get("/api/stories", async (request, response) => {
 
 app.get("/api/generation-jobs/:jobId", async (request, response) => {
   const user = currentUser(response);
+  response.setHeader("Cache-Control", "no-store");
   response.json(await openingJobService.getStatus(user.id, String(request.params.jobId)));
 });
 
@@ -822,7 +823,7 @@ app.post("/api/stories", async (request, response) => {
   const input = createStorySchema.parse(request.body);
   const idempotencyKey = input.idempotencyKey ?? request.header("idempotency-key") ?? randomUUID();
   if (contextualNarrationReviewEnabled()) {
-    const result = await openingJobService.start({
+    const result = await openingJobService.startInBackground({
       owner: user,
       input,
       connectionId: input.modelConnectionId ?? user.defaultConnectionId,

@@ -1,6 +1,7 @@
 import type {
   CreateStoryResult,
   GenerationJob,
+  OpeningJobProgress,
   OpeningJobStatusPayload,
   PendingNarrationReviewView,
 } from "./types";
@@ -18,6 +19,7 @@ export interface OpeningJobState {
   phase: OpeningJobPhase;
   idempotencyKey: string;
   jobId: string | null;
+  progress: OpeningJobProgress | null;
   review: PendingNarrationReviewView | null;
   storyId: string | null;
   failure: Extract<OpeningJobStatusPayload, { status: "failed" }> | null;
@@ -30,7 +32,7 @@ export type OpeningJobAction =
   | { type: "start" }
   | { type: "start_error"; message: string }
   | { type: "create_result"; result: CreateStoryResult }
-  | { type: "recover_job"; jobId: string }
+  | { type: "recover_job"; jobId: string; progress?: OpeningJobProgress | null }
   | { type: "poll_started"; requestId: number }
   | { type: "status_received"; requestId: number; status: OpeningJobStatusPayload }
   | { type: "poll_error"; requestId: number; message: string }
@@ -47,6 +49,7 @@ export function createInitialOpeningJobState(idempotencyKey: string): OpeningJob
     phase: "idle",
     idempotencyKey,
     jobId: null,
+    progress: null,
     review: null,
     storyId: null,
     failure: null,
@@ -66,6 +69,15 @@ function reviewFingerprint(review: PendingNarrationReviewView | null): string | 
   ].join(":");
 }
 
+function newestProgress(
+  current: OpeningJobProgress | null,
+  incoming: OpeningJobProgress | null | undefined,
+): OpeningJobProgress | null {
+  if (!incoming) return current;
+  if (!current || incoming.seq > current.seq) return incoming;
+  return current;
+}
+
 function applyStatus(state: OpeningJobState, status: OpeningJobStatusPayload): OpeningJobState {
   if (state.jobId && status.jobId !== state.jobId) return state;
   if (status.status === "running") {
@@ -73,6 +85,7 @@ function applyStatus(state: OpeningJobState, status: OpeningJobStatusPayload): O
       ...state,
       phase: "polling",
       jobId: status.jobId,
+      progress: newestProgress(state.progress, status.progress),
       review: null,
       failure: null,
       shareRedactedContext: false,
@@ -85,6 +98,7 @@ function applyStatus(state: OpeningJobState, status: OpeningJobStatusPayload): O
       ...state,
       phase: "awaiting_user_review",
       jobId: status.jobId,
+      progress: newestProgress(state.progress, status.progress),
       review: status.review,
       failure: null,
       shareRedactedContext: sameReview ? state.shareRedactedContext : false,
@@ -118,7 +132,7 @@ function applyStatus(state: OpeningJobState, status: OpeningJobStatusPayload): O
 export function openingJobReducer(state: OpeningJobState, action: OpeningJobAction): OpeningJobState {
   switch (action.type) {
     case "start":
-      return { ...state, phase: "starting", error: null, failure: null };
+      return { ...state, phase: "starting", progress: null, error: null, failure: null };
     case "start_error":
       return { ...state, phase: "idle", error: action.message };
     case "create_result":
@@ -133,11 +147,17 @@ export function openingJobReducer(state: OpeningJobState, action: OpeningJobActi
       }
       return applyStatus(state, action.result.job);
     case "recover_job":
-      if (state.phase !== "idle" && state.jobId === action.jobId) return state;
+      if (state.phase !== "idle" && state.jobId === action.jobId) {
+        return {
+          ...state,
+          progress: newestProgress(state.progress, action.progress),
+        };
+      }
       return {
         ...state,
         phase: "polling",
         jobId: action.jobId,
+        progress: action.progress ?? null,
         review: null,
         storyId: null,
         failure: null,
@@ -180,6 +200,78 @@ export function openingJobReducer(state: OpeningJobState, action: OpeningJobActi
     case "reset_after_failure":
       return createInitialOpeningJobState(action.idempotencyKey);
   }
+}
+
+export interface OpeningProgressPresentation {
+  stepIndex: number;
+  title: string;
+  detail: string;
+}
+
+export function openingProgressPresentation(
+  progress: OpeningJobProgress | null,
+): OpeningProgressPresentation {
+  if (!progress) {
+    return {
+      stepIndex: -1,
+      title: "正在读取真实进度",
+      detail: "任务仍在后台处理中，正在等待服务器返回最新阶段。",
+    };
+  }
+  if (progress.stage === "planning") {
+    return {
+      stepIndex: 0,
+      title: "正在构思故事蓝图",
+      detail: "正在整理人物、世界规则和核心冲突。",
+    };
+  }
+  if (progress.stage === "drafting") {
+    return {
+      stepIndex: 1,
+      title: "正在写作第一稿",
+      detail: "AI 作者正在写下第一章；这一步可能需要几分钟。",
+    };
+  }
+  if (progress.stage === "saving") {
+    return {
+      stepIndex: 3,
+      title: "正在保存到书架",
+      detail: "正文已经通过检查，正在保存故事和第一章。",
+    };
+  }
+  if (progress.activity === "checking") {
+    return {
+      stepIndex: 2,
+      title: `正在检查第 ${progress.draftNumber} 稿`,
+      detail: "正在检查人物行动、情节因果和阅读体验。",
+    };
+  }
+  if (progress.revisionSource === "user") {
+    return {
+      stepIndex: 2,
+      title: "正在按你的选择修订第 2 稿",
+      detail: "原故事设定和已有情节会继续保留。",
+    };
+  }
+  if (progress.revisionSource === "timeout") {
+    return {
+      stepIndex: 2,
+      title: "判断时间已结束，正在自动修订第 2 稿",
+      detail: "系统已接管处理，原故事设定会继续保留。",
+    };
+  }
+  const detailByReason: Record<typeof progress.revisionReason, string> = {
+    content_incomplete: "第一稿内容还不完整，正在补足关键情节与行动结果。",
+    experience_not_clear: "第一稿还没有充分呈现设定的阅读体验，正在加强人物行动与结果。",
+    structure_needs_adjustment: "第一稿的结构需要调整，正在整理段落与情节衔接。",
+    narration_needs_polish: "第一稿有一句叙述需要处理，正在保留原设定并修订表达。",
+    quality_needs_adjustment: "第一稿需要进一步打磨，正在保留原设定并修订细节。",
+  };
+  return {
+    stepIndex: 2,
+    title: "第一稿需要调整，正在修订第 2 稿",
+    detail: detailByReason[progress.revisionReason],
+  };
 }
 
 export function openingJobSecondsRemaining(deadlineAt: string, nowMs: number): number {

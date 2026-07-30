@@ -4,7 +4,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
-import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, OpenAIEmbeddingApi, ReadingExperienceContract, ReadingExperienceDeliveryObservation, ReadingExperienceEvidence, Story } from "../src/types";
+import type { CapabilitySnapshot, EndingContract, ModelConnection, OpenAICompletionApi, OpenAIEmbeddingApi, OpeningRevisionReasonCode, ReadingExperienceContract, ReadingExperienceDeliveryObservation, ReadingExperienceEvidence, Story } from "../src/types";
 import {
   assertPersistentExperienceFacts,
   assertReadingExperienceContent,
@@ -52,6 +52,7 @@ import {
   estimateModelCallTokenBudget,
   OPENING_JOB_TOKEN_BUDGET,
 } from "./generationBudget";
+import { classifyGenerationFailure } from "./failureTelemetry";
 import { addModelUsage, attachedModelUsage, attachModelUsage } from "./modelUsage";
 import { readSecret } from "./vault";
 import { writeAiTrace, type AiTraceEvent, type AiTraceWriter } from "./aiTrace";
@@ -1350,12 +1351,64 @@ export type NarrationReviewAction =
       source: "user" | "timeout";
     };
 
+export type OpeningProgressUpdate =
+  | {
+      stage: "drafting";
+      activity: "writing";
+      draftNumber: 1;
+    }
+  | {
+      stage: "reviewing";
+      activity: "checking";
+      draftNumber: 1 | 2;
+    }
+  | {
+      stage: "reviewing";
+      activity: "revising";
+      draftNumber: 2;
+      revisionSource: "quality" | "user" | "timeout";
+      revisionReason: OpeningRevisionReasonCode;
+    };
+
+export type OpeningProgressObserver = (
+  update: OpeningProgressUpdate,
+) => void | Promise<void>;
+
+export function openingRevisionReasonForError(error: unknown): OpeningRevisionReasonCode {
+  const code = error instanceof Error && "code" in error ? String(error.code) : "";
+  if (code.startsWith("narration_")) {
+    return "narration_needs_polish";
+  }
+  const classification = classifyGenerationFailure(error);
+  if (classification.reasonCode === "chapter_length" || classification.reasonCode === "chapter_too_short") {
+    return "content_incomplete";
+  }
+  if (
+    classification.category === "json" ||
+    /(?:schema|plan|structure|candidate_plan)/i.test(classification.reasonCode)
+  ) {
+    return "structure_needs_adjustment";
+  }
+  if (/narration|metadata/.test(classification.reasonCode)) {
+    return "narration_needs_polish";
+  }
+  if (
+    classification.category === "quality" &&
+    /experience|signal|evidence|system|invincible|persistent|outcome|continuity/.test(classification.reasonCode)
+  ) {
+    return "experience_not_clear";
+  }
+  return "quality_needs_adjustment";
+}
+
 interface OpeningWorkflowControl {
   pauseOnAskUser?: boolean;
   initialUsageTokens?: number;
   initialUsageEstimated?: boolean;
   startingWriterAttempt?: 1 | 2;
   initialFailureMessage?: string;
+  initialRevisionSource?: "user" | "timeout";
+  onProgress?: OpeningProgressObserver;
   chapterWriterUsageOverride?: {
     usageTokens: number;
     usageEstimated: boolean;
@@ -1880,6 +1933,13 @@ export async function generateStoryOpeningWithConnection(
       console.error(`[FAILURE-OBSERVATION] 记录开篇失败观测失败：${error instanceof Error ? error.message : String(error)}`);
     }
   };
+  const observeProgress = async (update: OpeningProgressUpdate) => {
+    try {
+      await workflowControl.onProgress?.(update);
+    } catch {
+      console.error("[OPENING-PROGRESS] 持久化开篇进度失败，生成任务继续运行。");
+    }
+  };
   const plannerRequest: OpeningCompletionRequest = {
     connection,
     model: connection.routes.planner,
@@ -2091,6 +2151,25 @@ export async function generateStoryOpeningWithConnection(
   const narrationReviewTrace = structuredClone(workflowControl.initialNarrationReviews ?? []);
   for (let attempt = workflowControl.startingWriterAttempt ?? 1; attempt <= 2; attempt += 1) {
     let writer: Awaited<ReturnType<OpeningModelCompleter>>;
+    const replayingDraft = workflowControl.chapterWriterUsageOverride !== undefined &&
+      attempt === (workflowControl.startingWriterAttempt ?? 1);
+    if (!replayingDraft) {
+      if (attempt === 1) {
+        await observeProgress({
+          stage: "drafting",
+          activity: "writing",
+          draftNumber: 1,
+        });
+      } else {
+        await observeProgress({
+          stage: "reviewing",
+          activity: "revising",
+          draftNumber: 2,
+          revisionSource: workflowControl.initialRevisionSource ?? "quality",
+          revisionReason: openingRevisionReasonForError(lastFailure),
+        });
+      }
+    }
     const recoveryHint = lastFailure instanceof Error && /系统.*(?:稳定结算|持续可用|不可操作|无反馈|无奖励)/.test(lastFailure.message)
       ? "本次重写只用正面事实表现系统持续在线、即时结算、奖励与权限永久生效，代价来自已获状态带来的世界、资源或关系变化。"
       : "本次重写逐项兑现失败原因，并让动作、对象、结果与现场反应出现在相邻句段中；软窗口体验不要求补写本章胜利。";
@@ -2185,6 +2264,11 @@ export async function generateStoryOpeningWithConnection(
       stage: "开篇审稿",
       validateJson: openingReviewValidationIssues,
     };
+    await observeProgress({
+      stage: "reviewing",
+      activity: "checking",
+      draftNumber: attempt as 1 | 2,
+    });
     try {
       assertModelCallTokenBudget({
         remainingTokens: tokenBudget - accumulatedTokens,
@@ -2533,6 +2617,7 @@ export async function beginStoryOpeningGeneration(
   complete: OpeningModelCompleter = defaultOpeningCompleter,
   tokenBudget = OPENING_JOB_TOKEN_BUDGET,
   failureObserver?: OpeningFailureObserver,
+  progressObserver?: OpeningProgressObserver,
 ): Promise<OpeningGenerationOutcome> {
   let narrationPermit: NarrationPermit | undefined;
   const narrationReviews: OpeningNarrationReviewTrace[] = [];
@@ -2551,6 +2636,7 @@ export async function beginStoryOpeningGeneration(
         onNarrationReview: (review) => {
           narrationReviews.push(review);
         },
+        onProgress: progressObserver,
       },
     );
     if (!narrationPermit) {
@@ -2578,6 +2664,7 @@ export async function resumeStoryOpeningGeneration(
   connection: ModelConnection,
   complete: OpeningModelCompleter = defaultOpeningCompleter,
   failureObserver?: OpeningFailureObserver,
+  progressObserver?: OpeningProgressObserver,
 ): Promise<OpeningGenerationOutcome> {
   const allCandidates = assertOpeningCheckpoint(checkpoint, connection);
   if (action.kind === "keep") {
@@ -2658,6 +2745,8 @@ export async function resumeStoryOpeningGeneration(
         initialFailureMessage: rewriting
           ? "Narration review requested one rewrite."
           : undefined,
+        initialRevisionSource: rewriting ? action.source : undefined,
+        onProgress: progressObserver,
         chapterWriterUsageOverride: replayWriter
           ? {
               usageTokens: checkpoint.draft.writerUsageTokens,

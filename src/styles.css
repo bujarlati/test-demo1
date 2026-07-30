@@ -253,6 +253,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .creation-orbit, .generation-glyph { display: grid; width: 54px; height: 54px; place-items: center; margin-bottom: 20px; border-radius: 50%; color: var(--jade); background: var(--jade-soft); animation: breathe 1.8s ease-in-out infinite; }
 @keyframes breathe { 50% { transform: scale(1.06); box-shadow: 0 0 0 11px rgba(15,116,106,0.06); } }
 .creation-dialog h2, .generation-card h2 { margin-bottom: 22px; color: var(--ink); font-family: "Songti SC", STSong, serif; font-size: 25px; }
+.creation-dialog__detail { margin: -10px 0 19px; color: var(--ink-2); font-size: 11px; line-height: 1.7; }
+.creation-dialog > .creation-dialog__background-note { margin-top: 20px; }
+.creation-dialog__leave { width: 100%; margin-top: 10px; }
+.creation-dialog > .creation-dialog__connection-note { margin-top: 12px; padding: 9px 11px; border-radius: 9px; color: #785f35; background: #f4edda; }
 .creation-dialog ol, .generation-card ol { margin: 0; padding: 0; list-style: none; }
 .creation-dialog li, .generation-card li { display: flex; align-items: center; gap: 11px; margin: 12px 0; color: #89918e; font-size: 12px; }
 .creation-dialog li > span, .generation-card li > span { display: grid; width: 23px; height: 23px; place-items: center; border: 1px solid #d1d6d2; border-radius: 50%; font-size: 9px; }

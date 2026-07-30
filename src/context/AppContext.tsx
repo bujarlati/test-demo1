@@ -102,7 +102,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return {
         ...current,
         pendingJobs: current.pendingJobs.map((job) => job.id === status.jobId
-          ? { ...job, status: status.status }
+          ? {
+              ...job,
+              status: status.status,
+              openingProgress: status.progress ?? job.openingProgress,
+            }
           : job),
       };
     });

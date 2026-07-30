@@ -5,6 +5,7 @@ import type {
   CreateStoryResult,
   GenerationJob,
   ModelConnection,
+  OpeningJobProgress,
   NarrationReviewDecisionInput,
   OpeningJobStatusPayload,
   PendingNarrationReviewView,
@@ -27,6 +28,8 @@ import {
   type OpeningFailureObserver,
   type OpeningGenerationCheckpoint,
   type OpeningGenerationOutcome,
+  type OpeningProgressObserver,
+  type OpeningProgressUpdate,
 } from "./modelGateway";
 import { recordFailedJobUsage } from "./modelUsage";
 import {
@@ -88,6 +91,7 @@ export interface OpeningJobPipeline {
     context: PreparedStoryOpening["context"],
     connection: ModelConnection,
     failureObserver?: OpeningFailureObserver,
+    progressObserver?: OpeningProgressObserver,
   ): Promise<OpeningGenerationOutcome>;
   resume(
     checkpoint: OpeningGenerationCheckpoint,
@@ -95,6 +99,7 @@ export interface OpeningJobPipeline {
       { kind: "rewrite"; source: "user" | "timeout" },
     connection: ModelConnection,
     failureObserver?: OpeningFailureObserver,
+    progressObserver?: OpeningProgressObserver,
   ): Promise<OpeningGenerationOutcome>;
 }
 
@@ -185,19 +190,21 @@ function projectPendingReview(
 
 function defaultPipeline(): OpeningJobPipeline {
   return {
-    begin: (context, connection, observer) => beginStoryOpeningGeneration(
+    begin: (context, connection, failureObserver, progressObserver) => beginStoryOpeningGeneration(
       context,
       connection,
       undefined,
       OPENING_JOB_TOKEN_BUDGET,
-      observer,
+      failureObserver,
+      progressObserver,
     ),
-    resume: (checkpoint, action, connection, observer) => resumeStoryOpeningGeneration(
+    resume: (checkpoint, action, connection, failureObserver, progressObserver) => resumeStoryOpeningGeneration(
       checkpoint,
       action,
       connection,
       undefined,
-      observer,
+      failureObserver,
+      progressObserver,
     ),
   };
 }
@@ -261,6 +268,51 @@ export class OpeningJobService {
       }));
       await this.persistence.save();
     };
+  }
+
+  private async updateProgress(
+    job: GenerationJob,
+    update: OpeningProgressUpdate | {
+      stage: "saving";
+      activity: "saving";
+      draftNumber: 1 | 2;
+    },
+  ): Promise<void> {
+    const current = job.openingProgress;
+    const currentIdentity = current
+      ? JSON.stringify({
+          stage: current.stage,
+          activity: current.activity,
+          draftNumber: current.draftNumber,
+          ...("revisionSource" in current ? {
+            revisionSource: current.revisionSource,
+            revisionReason: current.revisionReason,
+          } : {}),
+        })
+      : null;
+    const nextIdentity = JSON.stringify(update);
+    if (currentIdentity === nextIdentity) {
+      await this.persistence.save();
+      return;
+    }
+    const updatedAt = this.now().toISOString();
+    job.openingProgress = {
+      ...update,
+      version: 1,
+      seq: (current?.seq ?? 0) + 1,
+      stageStartedAt: updatedAt,
+      updatedAt,
+    } as OpeningJobProgress;
+    await this.persistence.save();
+  }
+
+  private progressObserver(job: GenerationJob): OpeningProgressObserver {
+    return (update) => this.updateProgress(job, update);
+  }
+
+  private trackBackgroundTask(task: Promise<void>): void {
+    this.backgroundTasks.add(task);
+    void task.finally(() => this.backgroundTasks.delete(task));
   }
 
   private async writeReviewFeedback(
@@ -419,10 +471,20 @@ export class OpeningJobService {
       return { jobId: job.id, status: "completed", storyId: job.storyId };
     }
     if (job.status === "failed") return jobFailurePayload(job, this.store);
-    if (job.status === "running") return { jobId: job.id, status: "running" };
+    if (job.status === "running") {
+      return {
+        jobId: job.id,
+        status: "running",
+        progress: job.openingProgress ?? null,
+      };
+    }
     const review = await this.persistence.getNarrationReviewCaseForOwner(job.ownerId, job.id);
     if (!review || review.status !== "pending") {
-      return { jobId: job.id, status: "running" };
+      return {
+        jobId: job.id,
+        status: "running",
+        progress: job.openingProgress ?? null,
+      };
     }
     if (!review.encryptedPayload) {
       throw httpError("待确认内容已经失效，请安全重试开书。", 409, "narration_review_state_unavailable");
@@ -431,6 +493,7 @@ export class OpeningJobService {
     return {
       jobId: job.id,
       status: "awaiting_user_review",
+      progress: job.openingProgress ?? null,
       review: projectPendingReview(review, payload),
     };
   }
@@ -515,6 +578,7 @@ export class OpeningJobService {
     return {
       jobId: job.id,
       status: "awaiting_user_review",
+      progress: job.openingProgress ?? null,
       review: projectPendingReview(review, storedPayload),
     };
   }
@@ -537,6 +601,11 @@ export class OpeningJobService {
     outcome: Extract<OpeningGenerationOutcome, { status: "completed" }>,
     caseId?: string,
   ): Promise<Story> {
+    await this.updateProgress(job, {
+      stage: "saving",
+      activity: "saving",
+      draftNumber: outcome.narrationPermit.attempt >= 2 ? 2 : 1,
+    });
     const gate = this.publicationGate(owner);
     const story = this.dependencies.applyOpening
       ? this.dependencies.applyOpening(prepared, connection, outcome, gate)
@@ -653,7 +722,10 @@ export class OpeningJobService {
     }
   }
 
-  async start(input: StartOpeningJobInput): Promise<CreateStoryResult> {
+  async start(
+    input: StartOpeningJobInput,
+    runInBackground = false,
+  ): Promise<CreateStoryResult> {
     const priorStoryId = await this.persistence.findStoryCreationRequest(input.owner.id, input.idempotencyKey);
     if (priorStoryId) {
       const story = await this.persistence.loadStory(input.owner.id, priorStoryId);
@@ -691,6 +763,15 @@ export class OpeningJobService {
       cost: 0,
       costEstimated: true,
       createdAt: createdAt.toISOString(),
+      openingProgress: {
+        version: 1,
+        seq: 1,
+        stage: "planning",
+        activity: "planning",
+        draftNumber: null,
+        stageStartedAt: createdAt.toISOString(),
+        updatedAt: createdAt.toISOString(),
+      },
       filterSummary: "规划两个阅读体验并生成第一章。",
     };
     this.store.jobs.unshift(job);
@@ -703,36 +784,59 @@ export class OpeningJobService {
     }
 
     const prepared = prepareStoryOpening(input.input, input.owner.id);
-    let automaticReviews: OpeningNarrationReviewTrace[] = [];
-    try {
-      const outcome = await this.pipeline.begin(
-        prepared.context,
-        connection,
-        this.failureObserver(job, createdAt.getTime()),
-      );
-      if (outcome.status === "awaiting_user_review") {
-        const status = await this.pauseForReview(job, prepared, outcome);
-        return { kind: "job", job: status };
+    const generate = async (): Promise<CreateStoryResult> => {
+      let automaticReviews: OpeningNarrationReviewTrace[] = [];
+      try {
+        const outcome = await this.pipeline.begin(
+          prepared.context,
+          connection,
+          this.failureObserver(job, createdAt.getTime()),
+          this.progressObserver(job),
+        );
+        if (outcome.status === "awaiting_user_review") {
+          const status = await this.pauseForReview(job, prepared, outcome);
+          return { kind: "job", job: status };
+        }
+        automaticReviews = outcome.narrationReviews ?? [];
+        const story = await this.completeJob(job, input.owner, connection, prepared, outcome);
+        await this.writeAutomaticFeedback(
+          job,
+          connection.routes.extractor,
+          outcome.narrationReviews ?? [],
+          true,
+        );
+        return { kind: "completed", story };
+      } catch (error) {
+        const failedReviews = openingNarrationReviewsFromError(error);
+        if (failedReviews.length > 0) automaticReviews = failedReviews;
+        await this.failJob(job, error, createdAt.getTime());
+        await this.writeAutomaticFeedback(job, connection.routes.extractor, automaticReviews, false);
+        if (error instanceof Error && !("status" in error)) {
+          Object.assign(error, { status: /体验|沉浸|Schema|第一章|开篇/.test(error.message) ? 422 : 502 });
+        }
+        throw error;
       }
-      automaticReviews = outcome.narrationReviews ?? [];
-      const story = await this.completeJob(job, input.owner, connection, prepared, outcome);
-      await this.writeAutomaticFeedback(
-        job,
-        connection.routes.extractor,
-        outcome.narrationReviews ?? [],
-        true,
-      );
-      return { kind: "completed", story };
-    } catch (error) {
-      const failedReviews = openingNarrationReviewsFromError(error);
-      if (failedReviews.length > 0) automaticReviews = failedReviews;
-      await this.failJob(job, error, createdAt.getTime());
-      await this.writeAutomaticFeedback(job, connection.routes.extractor, automaticReviews, false);
-      if (error instanceof Error && !("status" in error)) {
-        Object.assign(error, { status: /体验|沉浸|Schema|第一章|开篇/.test(error.message) ? 422 : 502 });
-      }
-      throw error;
-    }
+    };
+
+    if (!runInBackground) return generate();
+    const task = generate()
+      .then(() => undefined)
+      .catch((error) => {
+        console.error(`[OPENING-JOB] 后台开书失败：${sanitizeGenerationFailureMessage(error)}`);
+      });
+    this.trackBackgroundTask(task);
+    return {
+      kind: "job",
+      job: {
+        jobId: job.id,
+        status: "running",
+        progress: job.openingProgress ?? null,
+      },
+    };
+  }
+
+  async startInBackground(input: StartOpeningJobInput): Promise<CreateStoryResult> {
+    return this.start(input, true);
   }
 
   async decideNarrationReview(
@@ -792,9 +896,27 @@ export class OpeningJobService {
     );
     job.status = "running";
     job.filterSummary = decision.decision === "keep" ? "正在保留原文并完成其他质量检查。" : "正在按你的选择重写第一章。";
-    await this.persistence.save();
+    if (decision.decision === "keep") {
+      await this.updateProgress(job, {
+        stage: "reviewing",
+        activity: "checking",
+        draftNumber: payload.checkpoint.attempt >= 2 ? 2 : 1,
+      });
+    } else {
+      await this.updateProgress(job, {
+        stage: "reviewing",
+        activity: "revising",
+        draftNumber: 2,
+        revisionSource: "user",
+        revisionReason: "narration_needs_polish",
+      });
+    }
     this.enqueueClaimedCase(claimed.id);
-    return { jobId: job.id, status: "running" };
+    return {
+      jobId: job.id,
+      status: "running",
+      progress: job.openingProgress ?? null,
+    };
   }
 
   private async expireReview(
@@ -817,8 +939,7 @@ export class OpeningJobService {
     const task = this.resumeClaimedCase(caseId).catch((error) => {
       console.error(`[NARRATION-REVIEW] 后台恢复失败：${sanitizeGenerationFailureMessage(error)}`);
     });
-    this.backgroundTasks.add(task);
-    void task.finally(() => this.backgroundTasks.delete(task));
+    this.trackBackgroundTask(task);
   }
 
   async resumeClaimedCase(caseId: string): Promise<void> {
@@ -859,7 +980,6 @@ export class OpeningJobService {
       job.status = "running";
       job.tokens = payload.checkpoint.accumulatedTokens;
       job.usageEstimated = payload.checkpoint.usageEstimated;
-      await this.persistence.save();
       const action = review.status === "kept"
         ? {
             kind: "keep" as const,
@@ -870,6 +990,21 @@ export class OpeningJobService {
             kind: "rewrite" as const,
             source: review.status === "timeout_rewrite" ? "timeout" as const : "user" as const,
           };
+      if (action.kind === "keep") {
+        await this.updateProgress(job, {
+          stage: "reviewing",
+          activity: "checking",
+          draftNumber: payload.checkpoint.attempt >= 2 ? 2 : 1,
+        });
+      } else {
+        await this.updateProgress(job, {
+          stage: "reviewing",
+          activity: "revising",
+          draftNumber: 2,
+          revisionSource: action.source,
+          revisionReason: "narration_needs_polish",
+        });
+      }
       let automaticReviews = structuredClone(payload.checkpoint.reviewTrace ?? []);
       try {
         const outcome = await this.pipeline.resume(
@@ -877,6 +1012,7 @@ export class OpeningJobService {
           action,
           connection,
           this.failureObserver(job, startedAt),
+          this.progressObserver(job),
         );
         if (outcome.status === "awaiting_user_review") {
           await this.pauseForReview(job, payload.prepared, outcome, review.id);

@@ -298,7 +298,7 @@ function awaitingOutcome(
 
 function serviceFixture(
   mode: "completed" | "awaiting" | "failed",
-  beginOverride?: OpeningGenerationOutcome,
+  beginOverride?: OpeningGenerationOutcome | Promise<OpeningGenerationOutcome>,
 ) {
   const store = createSeedStore();
   store.stories = [];
@@ -391,6 +391,37 @@ test("opening job completes synchronously and commits one story exactly once", a
   assert.equal(fixture.store.stories.length, 1);
 });
 
+test("a background opening returns persisted progress before generation completes", async () => {
+  let completeGeneration!: (outcome: OpeningGenerationOutcome) => void;
+  const pendingOutcome = new Promise<OpeningGenerationOutcome>((resolve) => {
+    completeGeneration = resolve;
+  });
+  const fixture = serviceFixture("completed", pendingOutcome);
+
+  const result = await fixture.service.startInBackground({
+    owner: fixture.owner,
+    input: storyInput,
+    connectionId: fixture.connection.id,
+    idempotencyKey: "opening-background-1",
+  });
+
+  assert.equal(result.kind, "job");
+  if (result.kind !== "job" || result.job.status !== "running") {
+    throw new Error("expected a running background opening");
+  }
+  assert.equal(result.job.progress?.stage, "planning");
+  assert.equal(result.job.progress?.seq, 1);
+  assert.equal(fixture.store.stories.length, 0);
+  assert.equal(fixture.beginCalls, 1);
+
+  completeGeneration(completedOutcome());
+  await fixture.service.waitForIdle();
+
+  assert.equal((await fixture.service.getStatus(fixture.owner.id, result.job.jobId)).status, "completed");
+  assert.equal(fixture.store.stories.length, 1);
+  assert.equal(fixture.store.jobs[0].openingProgress?.stage, "saving");
+});
+
 test("automatic narration decisions persist structured feedback without sentence text", async () => {
   const fixture = serviceFixture("completed", automaticRewriteOutcome());
   await fixture.service.start({
@@ -473,10 +504,10 @@ test("awaiting jobs expose only owner-scoped review data and resume once", async
     decision: "keep" as const,
     shareRedactedContext: false,
   };
-  assert.deepEqual(
-    await fixture.service.decideNarrationReview(fixture.owner.id, result.job.jobId, decision),
-    { jobId: result.job.jobId, status: "running" },
-  );
+  const decisionStatus = await fixture.service.decideNarrationReview(fixture.owner.id, result.job.jobId, decision);
+  assert.equal(decisionStatus.jobId, result.job.jobId);
+  assert.equal(decisionStatus.status, "running");
+  if (decisionStatus.status === "running") assert.equal(decisionStatus.progress?.activity, "checking");
   await fixture.service.waitForIdle();
   assert.equal(fixture.resumeCalls, 1);
   assert.equal((await fixture.service.getStatus(fixture.owner.id, result.job.jobId)).status, "completed");

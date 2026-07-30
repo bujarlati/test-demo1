@@ -9,6 +9,7 @@ import {
   createInitialOpeningJobState,
   openingJobReducer,
   openingJobSecondsRemaining,
+  openingProgressPresentation,
   recoverOpeningJobId,
 } from "../openingJobState";
 import { composeCustomTone, CUSTOM_TONE_WORD_MAX_LENGTH, DEFAULT_STORY_LENGTH, getGenreOption, STORY_GENRES, STORY_LENGTH_OPTIONS, STORY_TONES, type StoryGenre, type StoryLengthPlanId } from "../storyConfig";
@@ -74,7 +75,6 @@ export function NewStoryPage() {
   const [customToneWords, setCustomToneWords] = useState<[string, string]>(["", ""]);
   const [lengthPlan, setLengthPlan] = useState<StoryLengthPlanId>(DEFAULT_STORY_LENGTH.id);
   const [inspiration, setInspiration] = useState("");
-  const [stage, setStage] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [openingJob, dispatchOpeningJob] = useReducer(
     openingJobReducer,
@@ -107,6 +107,7 @@ export function NewStoryPage() {
   const isGenerating = openingJob.phase === "starting" || openingJob.phase === "polling";
   const isAwaitingReview = openingJob.phase === "awaiting_user_review" || openingJob.phase === "submitting_decision";
   const isBusy = isGenerating || isAwaitingReview || openingJob.phase === "completed";
+  const progressView = openingProgressPresentation(openingJob.progress);
   const secondsRemaining = openingJob.review
     ? openingJobSecondsRemaining(openingJob.review.deadlineAt, nowMs)
     : 0;
@@ -128,12 +129,6 @@ export function NewStoryPage() {
   }, []);
 
   useEffect(() => {
-    if (!isGenerating) return;
-    const timer = window.setInterval(() => setStage((value) => Math.min(3, value + 1)), 900);
-    return () => window.clearInterval(timer);
-  }, [isGenerating]);
-
-  useEffect(() => {
     if (!isAwaitingReview) return;
     setNowMs(Date.now());
     const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
@@ -142,9 +137,15 @@ export function NewStoryPage() {
 
   useEffect(() => {
     if (openingJob.phase !== "idle" || openingJob.jobId) return;
-    const recoveredJobId = recoverOpeningJobId(data?.pendingJobs ?? [], requestedJobId);
+    const pendingJobs = data?.pendingJobs ?? [];
+    const recoveredJobId = recoverOpeningJobId(pendingJobs, requestedJobId);
     if (!recoveredJobId) return;
-    dispatchOpeningJob({ type: "recover_job", jobId: recoveredJobId });
+    const recoveredJob = pendingJobs.find((job) => job.id === recoveredJobId);
+    dispatchOpeningJob({
+      type: "recover_job",
+      jobId: recoveredJobId,
+      progress: recoveredJob?.openingProgress ?? null,
+    });
     if (!requestedJobId) navigate(`/new?job=${encodeURIComponent(recoveredJobId)}`, { replace: true });
   }, [data?.pendingJobs, navigate, openingJob.jobId, openingJob.phase, requestedJobId]);
 
@@ -170,7 +171,7 @@ export function NewStoryPage() {
         dispatchOpeningJob({
           type: "poll_error",
           requestId,
-          message: error instanceof Error ? error.message : "暂时无法读取生成进度，系统会继续重试。",
+          message: "暂时无法刷新最新进度，后台任务仍会继续；正在重新连接……",
         });
       } finally {
         if (!disposed) timer = window.setTimeout(() => void poll(), 2_000);
@@ -224,7 +225,6 @@ export function NewStoryPage() {
       dispatchOpeningJob({ type: "reset_after_failure", idempotencyKey });
     }
     dispatchOpeningJob({ type: "start" });
-    setStage(0);
     try {
       const result = await api.createStory({
         genre,
@@ -471,19 +471,25 @@ export function NewStoryPage() {
       </div>
 
       {isGenerating && (
-        <div className="creation-overlay" role="status" aria-live="polite">
-          <div className="creation-dialog">
+        <div className="creation-overlay">
+          <div className="creation-dialog" role="dialog" aria-modal="true" aria-labelledby="opening-progress-title">
             <span className="creation-orbit" aria-hidden="true"><Sparkles size={22} /></span>
-            <h2>故事正在找到自己的方向</h2>
+            <div className="creation-dialog__live" role="status" aria-live="polite">
+              <h2 id="opening-progress-title">{progressView.title}</h2>
+              <p className="creation-dialog__detail">{progressView.detail}</p>
+            </div>
             <ol>
-              {["生成故事基因与世界规则", "认识第一位角色", "选择冲突与代价", "写下第一章"].map((item, index) => (
-                <li key={item} className={index < stage ? "done" : index === stage ? "active" : ""}>
-                  <span>{index < stage ? <Check size={14} /> : index + 1}</span>{item}
+              {["构思故事蓝图", "写作第一稿", "审校与修订", "保存到书架"].map((item, index) => (
+                <li key={item} className={index < progressView.stepIndex ? "done" : index === progressView.stepIndex ? "active" : ""}>
+                  <span>{index < progressView.stepIndex ? <Check size={14} /> : index + 1}</span>{item}
                 </li>
               ))}
             </ol>
-            <p>不需要继续输入，完成后会自动翻开第一页。</p>
-            {openingJob.error && <p className="opening-job-inline-error" role="alert">{openingJob.error}</p>}
+            <p className="creation-dialog__background-note">
+              复杂稿件可能需要一次修订，因此会多花几分钟。你可以先回书架，生成会在后台继续。
+            </p>
+            <Link className="button button--ghost creation-dialog__leave" to="/">先回书架</Link>
+            {openingJob.error && <p className="creation-dialog__connection-note" role="status">{openingJob.error}</p>}
           </div>
         </div>
       )}

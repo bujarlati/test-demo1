@@ -6,6 +6,7 @@ import {
   resumeStoryOpeningGeneration,
   type OpeningGenerationOutcome,
   type OpeningModelCompleter,
+  type OpeningProgressUpdate,
 } from "../server/modelGateway";
 import { detectNarrationCandidates, narrationArtifactHash } from "../server/narrationPolicy";
 import { applyGeneratedStoryOpening, prepareStoryOpening } from "../server/openingService";
@@ -232,12 +233,24 @@ test("semantic allow completes the same draft and automatic rewrite uses at most
   }
 
   const rewritten = workflowFixture(["rewrite", "allow"]);
+  const rewrittenProgress: OpeningProgressUpdate[] = [];
   const rewrittenOutcome = await beginStoryOpeningGeneration(
     rewritten.context,
     rewritten.connection,
     rewritten.complete,
+    undefined,
+    undefined,
+    (update) => rewrittenProgress.push(update),
   );
   assert.equal(rewrittenOutcome.status, "completed");
+  assert.deepEqual(
+    rewrittenProgress.map((progress) => progress.activity),
+    ["writing", "checking", "revising", "checking"],
+  );
+  assert.equal(rewrittenProgress[2].stage, "reviewing");
+  if (rewrittenProgress[2].activity === "revising") {
+    assert.equal(rewrittenProgress[2].revisionReason, "narration_needs_polish");
+  }
   assert.equal(rewritten.writerCalls, 2);
   assert.equal(rewritten.reviewerCalls, 2);
   assert.deepEqual(rewritten.calls, [
@@ -316,13 +329,20 @@ test("ask_user rewrite resumes at attempt two without rerunning the planner", as
     fixture.complete,
   ));
   const callsBeforeResume = fixture.calls.length;
+  const resumedProgress: OpeningProgressUpdate[] = [];
   const completed = await resumeStoryOpeningGeneration(
     awaiting.checkpoint,
     { kind: "rewrite", source: "user" },
     fixture.connection,
     fixture.complete,
+    undefined,
+    (update) => resumedProgress.push(update),
   );
   assert.equal(completed.status, "completed");
+  assert.equal(resumedProgress[0].activity, "revising");
+  if (resumedProgress[0].activity === "revising") {
+    assert.equal(resumedProgress[0].revisionSource, "user");
+  }
   assert.deepEqual(fixture.calls.slice(callsBeforeResume), ["writer-route", "reviewer-route"]);
   assert.equal(fixture.writerCalls, 2);
   if (completed.status === "completed") {

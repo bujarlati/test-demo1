@@ -833,6 +833,49 @@ export interface NarrationReviewMetricBucket {
 
 export type GenerationJobStatus = "completed" | "running" | "awaiting_user_review" | "failed";
 
+export type OpeningRevisionReasonCode =
+  | "content_incomplete"
+  | "experience_not_clear"
+  | "structure_needs_adjustment"
+  | "narration_needs_polish"
+  | "quality_needs_adjustment";
+
+interface OpeningJobProgressBase {
+  version: 1;
+  seq: number;
+  stageStartedAt: string;
+  updatedAt: string;
+}
+
+export type OpeningJobProgress =
+  | (OpeningJobProgressBase & {
+      stage: "planning";
+      activity: "planning";
+      draftNumber: null;
+    })
+  | (OpeningJobProgressBase & {
+      stage: "drafting";
+      activity: "writing";
+      draftNumber: 1;
+    })
+  | (OpeningJobProgressBase & {
+      stage: "reviewing";
+      activity: "checking";
+      draftNumber: 1 | 2;
+    })
+  | (OpeningJobProgressBase & {
+      stage: "reviewing";
+      activity: "revising";
+      draftNumber: 2;
+      revisionSource: "quality" | "user" | "timeout";
+      revisionReason: OpeningRevisionReasonCode;
+    })
+  | (OpeningJobProgressBase & {
+      stage: "saving";
+      activity: "saving";
+      draftNumber: 1 | 2;
+    });
+
 export interface GenerationJob {
   id: string;
   ownerId: string;
@@ -854,6 +897,7 @@ export interface GenerationJob {
   cost: number;
   costEstimated?: boolean;
   createdAt: string;
+  openingProgress?: OpeningJobProgress;
   candidateTrace?: NarrativeCandidate[];
   filterSummary?: string;
   contextTrace?: Array<{
@@ -903,10 +947,11 @@ export interface NarrationReviewDecisionInput {
 }
 
 export type OpeningJobStatusPayload =
-  | { jobId: string; status: "running" }
+  | { jobId: string; status: "running"; progress?: OpeningJobProgress | null }
   | {
       jobId: string;
       status: "awaiting_user_review";
+      progress?: OpeningJobProgress | null;
       review: PendingNarrationReviewView;
     }
   | { jobId: string; status: "completed"; storyId: string }
