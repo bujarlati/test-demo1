@@ -18,10 +18,14 @@ import { createPortal } from "react-dom";
 import type { OwnerPublicationState, Story } from "../types";
 import { BookCover } from "./BookCover";
 
-export type PublicationPreviewStory = Pick<
+type PublicationPreviewBase = Pick<
   Story,
-  "id" | "title" | "subtitle" | "genre" | "tone" | "length" | "coverTheme" | "status" | "canonVersion" | "chapters"
+  "id" | "title" | "subtitle" | "genre" | "tone" | "length" | "coverTheme" | "status" | "canonVersion"
 >;
+export type PublicationPreviewStory = PublicationPreviewBase & (
+  | { chapters: Story["chapters"]; chapterCount?: never }
+  | { chapterCount: number; chapters?: never }
+);
 
 interface StoryPublicationDialogProps {
   open: boolean;
@@ -109,7 +113,8 @@ export function StoryPublicationDialog({
   const status = publication?.status ?? "private";
   const isActive = status === "active";
   const isSuspended = status === "admin_suspended";
-  const canPublish = story.status !== "archived" && story.chapters.length > 0;
+  const chapterCount = story.chapterCount ?? story.chapters?.length ?? 0;
+  const canPublish = story.status !== "archived" && chapterCount > 0;
 
   return createPortal(
     <div
@@ -155,7 +160,7 @@ export function StoryPublicationDialog({
               <aside className="publication-preview">
                 <BookCover title={story.title} subtitle={story.subtitle} theme={story.coverTheme} size="medium" />
                 <div className="publication-preview__meta">
-                  <span>{story.genre}</span><span>{story.length}</span><span>{story.chapters.length} 章</span>
+                  <span>{story.genre}</span><span>{story.length}</span><span>{chapterCount} 章</span>
                 </div>
                 <strong>当前正史 v{story.canonVersion}</strong>
                 <small>成功新增章节或修订当前 Revision 后，公开版本自动同步。</small>

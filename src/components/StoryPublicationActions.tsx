@@ -22,7 +22,7 @@ import {
 
 interface StoryPublicationActionsProps {
   story: PublicationPreviewStory;
-  mode?: "toolbar" | "panel";
+  mode?: "toolbar" | "panel" | "library";
 }
 
 function requestMessage(error: unknown, fallback: string): string {
@@ -180,6 +180,23 @@ export function StoryPublicationActions({ story, mode = "toolbar" }: StoryPublic
       <>
         <button type="button" onClick={openDialog} aria-label="公开与分享作品">
           <Share2 size={18} /><span>{publication?.status === "active" ? "已公开" : "分享"}</span>
+        </button>
+        {dialog}
+      </>
+    );
+  }
+
+  if (mode === "library") {
+    return (
+      <>
+        <button
+          className="button button--soft story-publication-trigger story-publication-trigger--library"
+          type="button"
+          aria-haspopup="dialog"
+          aria-label={`公开与分享《${story.title}》`}
+          onClick={openDialog}
+        >
+          <Share2 size={16} /><span>{publication?.status === "active" ? "管理公开" : "公开 / 分享"}</span>
         </button>
         {dialog}
       </>

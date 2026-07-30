@@ -2,6 +2,7 @@ import { ArrowRight, BookOpenText, Clock3, Compass, LoaderCircle, Plus, Sparkles
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { BookCover } from "../components/BookCover";
+import { StoryPublicationActions } from "../components/StoryPublicationActions";
 import { ErrorState, LoadingState } from "../components/States";
 import { useApp } from "../context/AppContext";
 import { formatRelativeDate } from "../utils";
@@ -77,6 +78,9 @@ export function LibraryPage() {
               <Link className="button button--primary button--large" to={`/story/${activeStory.id}`}>
                 继续第 {activeStory.currentChapterNumber} 章 <ArrowRight size={18} />
               </Link>
+              {data.features.publicStorySharing && (
+                <StoryPublicationActions story={activeStory} mode="library" />
+              )}
               <Link className="text-link" to={`/story/${activeStory.id}/archive`}>查看故事档案</Link>
             </div>
           </div>
@@ -107,19 +111,26 @@ export function LibraryPage() {
 
         <div className="story-grid">
           {otherStories.map((story) => (
-            <Link className="story-tile" to={`/story/${story.id}`} key={story.id}>
-              <BookCover title={story.title} subtitle={story.subtitle} theme={story.coverTheme} size="medium" />
-              <div className="story-tile__body">
-                <span className="story-tile__genre">{story.genre} · {story.tone}</span>
-                <h3>{story.title}</h3>
-                <p>{story.subtitle}</p>
-                <div className="progress-row progress-row--compact">
-                  <span className="progress-track"><span style={{ width: `${story.progress * 100}%` }} /></span>
-                  <small>第 {story.currentChapterNumber} 章</small>
+            <article className="story-tile story-tile--with-actions" key={story.id}>
+              <Link className="story-tile__main" to={`/story/${story.id}`}>
+                <BookCover title={story.title} subtitle={story.subtitle} theme={story.coverTheme} size="medium" />
+                <div className="story-tile__body">
+                  <span className="story-tile__genre">{story.genre} · {story.tone}</span>
+                  <h3>{story.title}</h3>
+                  <p>{story.subtitle}</p>
+                  <div className="progress-row progress-row--compact">
+                    <span className="progress-track"><span style={{ width: `${story.progress * 100}%` }} /></span>
+                    <small>第 {story.currentChapterNumber} 章</small>
+                  </div>
                 </div>
+              </Link>
+              <footer className="story-tile__footer">
                 <span className="story-tile__time">{formatRelativeDate(story.updatedAt)}更新</span>
-              </div>
-            </Link>
+                {data.features.publicStorySharing && (
+                  <StoryPublicationActions story={story} mode="library" />
+                )}
+              </footer>
+            </article>
           ))}
           <Link className="story-tile story-tile--new" to="/new">
             <span className="new-story-glyph"><Plus size={28} /></span>
