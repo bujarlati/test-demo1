@@ -166,8 +166,9 @@ test("PostgreSQL pauses atomically, enforces owner scope, and claims one decisio
     await database.migrate();
     await database.migrate();
     const store = createSeedStore();
+    const sourceJob = store.jobs[0]!;
+    sourceJob.status = "running";
     await database.saveSnapshot(store);
-    const sourceJob = store.jobs[0];
     const job: GenerationJob = {
       ...sourceJob,
       status: "awaiting_user_review" as GenerationJob["status"],

@@ -8,6 +8,7 @@ import {
   type NarrationReviewDecisionClaim,
   type NarrationReviewFeedbackRecord,
 } from "../narrationReviewState";
+import { DELETED_STORY_PLACEHOLDER } from "../storyDeletion";
 import type { DatabaseExecutor } from "./types";
 
 interface NarrationReviewCaseRow {
@@ -87,18 +88,70 @@ function assertPauseInput(job: GenerationJob, review: NarrationReviewCaseRecord)
   }
 }
 
-async function upsertGenerationJob(
+interface LockedGenerationJobRow {
+  owner_id: string;
+  story_id: string;
+  status: GenerationJob["status"];
+}
+
+function narrationReviewStateUnavailable(): Error {
+  return Object.assign(new Error("Narration review state is unavailable."), {
+    code: "narration_review_state_unavailable" as const,
+  });
+}
+
+async function lockGenerationJob(
+  executor: DatabaseExecutor,
+  jobId: string,
+): Promise<LockedGenerationJobRow | null> {
+  const result = await executor.query<LockedGenerationJobRow>(
+    `SELECT owner_id, story_id, status FROM xumo_generation_jobs
+     WHERE id = $1
+     FOR UPDATE`,
+    [jobId],
+  );
+  return result.rows[0] ?? null;
+}
+
+async function lockMatchingGenerationJob(
+  executor: DatabaseExecutor,
+  job: GenerationJob,
+): Promise<LockedGenerationJobRow | null> {
+  const result = await executor.query<LockedGenerationJobRow>(
+    `SELECT owner_id, story_id, status FROM xumo_generation_jobs
+     WHERE id = $1
+       AND owner_id = $2
+       AND story_id = $3
+       AND task = $4
+       AND created_at = $5::timestamptz
+     FOR UPDATE`,
+    [job.id, job.ownerId, job.storyId, job.task, job.createdAt],
+  );
+  return result.rows[0] ?? null;
+}
+
+function isLiveBoundJob(
+  locked: LockedGenerationJobRow | null,
+  job: GenerationJob,
+): boolean {
+  return locked !== null
+    && locked.owner_id === job.ownerId
+    && locked.story_id === job.storyId
+    && (locked.status === "running" || locked.status === "awaiting_user_review");
+}
+
+async function updateGenerationJob(
   executor: DatabaseExecutor,
   job: GenerationJob,
 ): Promise<void> {
-  await executor.query(
-    `INSERT INTO xumo_generation_jobs(id, owner_id, story_id, task, status, created_at, payload)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-     ON CONFLICT (id) DO UPDATE SET owner_id = excluded.owner_id, story_id = excluded.story_id,
-       task = excluded.task, status = excluded.status, created_at = excluded.created_at,
-       payload = excluded.payload`,
-    [job.id, job.ownerId, job.storyId, job.task, job.status, job.createdAt, stableJson(job)],
+  const result = await executor.query<{ id: string }>(
+    `UPDATE xumo_generation_jobs
+     SET status = $2, payload = $3::jsonb
+     WHERE id = $1
+     RETURNING id`,
+    [job.id, job.status, stableJson(job)],
   );
+  if (result.rows.length === 0) throw narrationReviewStateUnavailable();
 }
 
 async function insertReviewCase(
@@ -147,7 +200,11 @@ export class NarrationReviewPostgresRepository {
   ): Promise<void> {
     assertPauseInput(job, review);
     await this.executor.transaction(async (transaction) => {
-      await upsertGenerationJob(transaction, job);
+      const locked = await lockMatchingGenerationJob(transaction, job);
+      if (!isLiveBoundJob(locked, job)) {
+        throw narrationReviewStateUnavailable();
+      }
+      await updateGenerationJob(transaction, job);
       await insertReviewCase(transaction, review);
     });
   }
@@ -257,6 +314,8 @@ export class NarrationReviewPostgresRepository {
   ): Promise<boolean> {
     assertPauseInput(job, review);
     return this.executor.transaction(async (transaction) => {
+      const locked = await lockMatchingGenerationJob(transaction, job);
+      if (!isLiveBoundJob(locked, job)) return false;
       const retired = await transaction.query<{ id: string }>(
         `UPDATE xumo_narration_review_cases
          SET status = 'resolved', encrypted_payload = NULL, resolved_at = $4,
@@ -267,7 +326,7 @@ export class NarrationReviewPostgresRepository {
         [oldCaseId, review.jobId, review.ownerId, resolvedAt],
       );
       if (retired.rows.length === 0) return false;
-      await upsertGenerationJob(transaction, job);
+      await updateGenerationJob(transaction, job);
       await insertReviewCase(transaction, review);
       return true;
     });
@@ -305,7 +364,13 @@ export class NarrationReviewPostgresRepository {
   }
 
   async upsertNarrationReviewFeedback(feedback: NarrationReviewFeedbackRecord): Promise<void> {
-    await this.executor.query(
+    await this.executor.transaction(async (transaction) => {
+      const locked = await lockGenerationJob(transaction, feedback.jobId);
+      if (!locked || locked.owner_id !== feedback.ownerId) {
+        throw narrationReviewStateUnavailable();
+      }
+      if (locked.story_id === DELETED_STORY_PLACEHOLDER) return;
+      await transaction.query(
       `INSERT INTO xumo_narration_review_feedback(
          id, case_id, job_id, owner_id, candidate_id, rule_id, rule_version, location,
          model, reported_decision, decision, confidence, threshold, resolution_source,
@@ -368,6 +433,7 @@ export class NarrationReviewPostgresRepository {
         feedback.updatedAt,
       ],
     );
+    });
   }
 
   async deleteExpiredNarrationReviewData(now: string): Promise<NarrationReviewCleanupCounts> {
