@@ -19,6 +19,7 @@ import type {
   NarrationReviewFeedbackRecord,
 } from "../narrationReviewState";
 import type { PublicStorySharingModule } from "../publicStorySharing";
+import type { PersistStoryDeletionInput, StoryDeletionResult } from "../storyDeletion";
 
 export interface QueryResult<Row = Record<string, unknown>> {
   rows: Row[];
@@ -62,6 +63,7 @@ export interface PersistenceDatabase {
   isEmpty(): Promise<boolean>;
   loadRuntimeStore(): Promise<AppStore>;
   saveSnapshot(store: AppStore, rollbackOnFailure?: () => void): Promise<void>;
+  deleteOwnedStory(input: PersistStoryDeletionInput): Promise<StoryDeletionResult>;
   findUserByEmail(normalizedEmail: string): Promise<UserAccount | null>;
   findUserBySessionTokenHash(tokenHash: string): Promise<UserAccount | null>;
   register(user: UserAccount, session: AuthSession, event: AuditEvent): Promise<void>;

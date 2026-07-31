@@ -30,6 +30,18 @@ import {
   createPublicStorySharingModule,
   type PublicStorySharingModule,
 } from "../publicStorySharing";
+import {
+  assertStoryDeletionTitle,
+  createStoryDeletionAudit,
+  DELETED_STORY_PLACEHOLDER,
+  sanitizeGenerationFailureAfterStoryDeletion,
+  sanitizeGenerationJobAfterStoryDeletion,
+  sanitizeStoryAuditAfterDeletion,
+  storyDeletionBusyError,
+  storyNotFoundError,
+  type PersistStoryDeletionInput,
+  type StoryDeletionResult,
+} from "../storyDeletion";
 import { summarizeStory } from "../storyService";
 import { NarrationReviewPostgresRepository } from "./narrationReviewRepository";
 import { PublicStoryPostgresRepository } from "./publicStoryRepository";
@@ -296,6 +308,8 @@ export class PostgresDatabase implements PersistenceDatabase {
   readonly publicStories: PublicStoryPostgresRepository;
   readonly publicStorySharing: PublicStorySharingModule;
   private saveQueue = Promise.resolve();
+  private readonly deletedStoryIds = new Set<string>();
+  private readonly uncertainStoryIds = new Set<string>();
   private readonly fingerprints = new Map<string, string>();
   private readonly narrationReviews: NarrationReviewPostgresRepository;
 
@@ -360,6 +374,43 @@ export class PostgresDatabase implements PersistenceDatabase {
 
   private markSaved(table: string, id: string, payload: unknown): void {
     this.markLoaded(table, id, payload);
+  }
+
+  private async enqueueMutation<T>(work: () => Promise<T>): Promise<T> {
+    let result!: T;
+    const task = this.saveQueue.catch(() => undefined).then(async () => {
+      result = await work();
+    });
+    this.saveQueue = task;
+    await task;
+    return result;
+  }
+
+  private async resolveUncertainStoryIds(): Promise<void> {
+    for (const storyId of this.uncertainStoryIds) {
+      const authoritativeStory = await this.executor.query(
+        "SELECT 1 FROM xumo_stories WHERE id = $1",
+        [storyId],
+      );
+      if (authoritativeStory.rows.length > 0) {
+        this.deletedStoryIds.delete(storyId);
+      } else {
+        this.deletedStoryIds.add(storyId);
+      }
+      this.uncertainStoryIds.delete(storyId);
+    }
+  }
+
+  private sanitizeAuditForDeletedStory(event: AuditEvent): AuditEvent {
+    const metadataStoryId = event.metadata?.storyId;
+    const deletedStoryId = this.deletedStoryIds.has(event.targetId)
+      ? event.targetId
+      : typeof metadataStoryId === "string" && this.deletedStoryIds.has(metadataStoryId)
+        ? metadataStoryId
+        : null;
+    return deletedStoryId
+      ? sanitizeStoryAuditAfterDeletion(event, deletedStoryId)
+      : event;
   }
 
   async loadRuntimeStore(): Promise<AppStore> {
@@ -699,11 +750,15 @@ export class PostgresDatabase implements PersistenceDatabase {
     const task = async () => {
       const marks: Array<[string, string, unknown]> = [];
       try {
+        await this.resolveUncertainStoryIds();
         await this.executor.transaction(async (transaction) => {
           for (const user of snapshot.users) {
-            if (!this.changed("user", user.id, user)) continue;
-            await this.upsertUser(transaction, user, false);
-            marks.push(["user", user.id, user]);
+            const persistedUser = user.activeStoryId && this.deletedStoryIds.has(user.activeStoryId)
+              ? { ...user, activeStoryId: null }
+              : user;
+            if (!this.changed("user", persistedUser.id, persistedUser)) continue;
+            await this.upsertUser(transaction, persistedUser, false);
+            marks.push(["user", persistedUser.id, persistedUser]);
           }
           for (const session of snapshot.sessions) await this.upsertSession(transaction, session);
           for (const connection of snapshot.connections) {
@@ -718,23 +773,31 @@ export class PostgresDatabase implements PersistenceDatabase {
             marks.push(["connection", connection.id, connection]);
           }
           for (const story of snapshot.stories) {
+            if (this.deletedStoryIds.has(story.id)) continue;
             if (!this.changed("story", story.id, story)) continue;
             await this.upsertStory(transaction, story);
             marks.push(["story", story.id, story]);
           }
           for (const job of snapshot.jobs) {
-            if (!this.changed("job", job.id, job)) continue;
+            const persistedJob = this.deletedStoryIds.has(job.storyId)
+              ? sanitizeGenerationJobAfterStoryDeletion(job)
+              : job;
+            if (!this.changed("job", persistedJob.id, persistedJob)) continue;
             await transaction.query(
               `INSERT INTO xumo_generation_jobs(id, owner_id, story_id, task, status, created_at, payload)
                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                ON CONFLICT (id) DO UPDATE SET owner_id = excluded.owner_id, story_id = excluded.story_id,
                  task = excluded.task, status = excluded.status, created_at = excluded.created_at, payload = excluded.payload`,
-              [job.id, job.ownerId, job.storyId, job.task, job.status, job.createdAt, stableJson(job)],
+              [persistedJob.id, persistedJob.ownerId, persistedJob.storyId, persistedJob.task,
+                persistedJob.status, persistedJob.createdAt, stableJson(persistedJob)],
             );
-            marks.push(["job", job.id, job]);
+            marks.push(["job", persistedJob.id, persistedJob]);
           }
           for (const failure of snapshot.generationFailures) {
-            if (!this.changed("failure", failure.id, failure)) continue;
+            const persistedFailure = this.deletedStoryIds.has(failure.storyId)
+              ? sanitizeGenerationFailureAfterStoryDeletion(failure)
+              : failure;
+            if (!this.changed("failure", persistedFailure.id, persistedFailure)) continue;
             await transaction.query(
               `INSERT INTO xumo_generation_failure_observations(
                  id, job_id, owner_id, story_id, task, stage, classifier_version, category, reason_code, fingerprint,
@@ -746,36 +809,38 @@ export class PostgresDatabase implements PersistenceDatabase {
                  $18, $19, $20::jsonb
                ) ON CONFLICT (id) DO NOTHING`,
               [
-                failure.id,
-                failure.jobId,
-                failure.ownerId,
-                failure.storyId,
-                failure.task,
-                failure.stage,
-                failure.classifierVersion,
-                failure.category,
-                failure.reasonCode,
-                failure.fingerprint,
-                failure.model,
-                failure.connectionId,
-                failure.promptVersion,
-                failure.attempt,
-                failure.terminal,
-                failure.retryable,
-                failure.latencyMs,
-                failure.tokens,
-                failure.createdAt,
-                stableJson(failure),
+                persistedFailure.id,
+                persistedFailure.jobId,
+                persistedFailure.ownerId,
+                persistedFailure.storyId,
+                persistedFailure.task,
+                persistedFailure.stage,
+                persistedFailure.classifierVersion,
+                persistedFailure.category,
+                persistedFailure.reasonCode,
+                persistedFailure.fingerprint,
+                persistedFailure.model,
+                persistedFailure.connectionId,
+                persistedFailure.promptVersion,
+                persistedFailure.attempt,
+                persistedFailure.terminal,
+                persistedFailure.retryable,
+                persistedFailure.latencyMs,
+                persistedFailure.tokens,
+                persistedFailure.createdAt,
+                stableJson(persistedFailure),
               ],
             );
-            marks.push(["failure", failure.id, failure]);
+            marks.push(["failure", persistedFailure.id, persistedFailure]);
           }
           for (const event of snapshot.auditEvents) {
-            if (!this.changed("audit", event.id, event)) continue;
-            await this.upsertAudit(transaction, event);
-            marks.push(["audit", event.id, event]);
+            const persistedAudit = this.sanitizeAuditForDeletedStory(event);
+            if (!this.changed("audit", persistedAudit.id, persistedAudit)) continue;
+            await this.upsertAudit(transaction, persistedAudit);
+            marks.push(["audit", persistedAudit.id, persistedAudit]);
           }
           for (const decision of snapshot.safetyDecisions) {
+            if (decision.storyId && this.deletedStoryIds.has(decision.storyId)) continue;
             if (!this.changed("safety", decision.id, decision)) continue;
             await transaction.query(
               `INSERT INTO xumo_safety_decisions(id, actor_user_id, story_id, created_at, payload)
@@ -786,6 +851,7 @@ export class PostgresDatabase implements PersistenceDatabase {
             marks.push(["safety", decision.id, decision]);
           }
           for (const report of snapshot.contentReports) {
+            if (report.storyId && this.deletedStoryIds.has(report.storyId)) continue;
             if (!this.changed("report", report.id, report)) continue;
             await transaction.query(
               `INSERT INTO xumo_content_reports(id, reporter_user_id, story_id, status, created_at, updated_at, payload)
@@ -805,6 +871,7 @@ export class PostgresDatabase implements PersistenceDatabase {
             );
           }
           for (const request of snapshot.storyCreationRequests) {
+            if (this.deletedStoryIds.has(request.storyId)) continue;
             await transaction.query(
               `INSERT INTO xumo_story_creation_requests(user_id, idempotency_key, story_id, created_at)
                VALUES ($1, $2, $3, $4)
@@ -819,8 +886,155 @@ export class PostgresDatabase implements PersistenceDatabase {
         throw error;
       }
     };
-    this.saveQueue = this.saveQueue.catch(() => undefined).then(task);
-    await this.saveQueue;
+    await this.enqueueMutation(task);
+  }
+
+  async deleteOwnedStory(input: PersistStoryDeletionInput): Promise<StoryDeletionResult> {
+    const result = await this.enqueueMutation(async () => {
+      await this.resolveUncertainStoryIds();
+      let tombstoneAdded = false;
+      try {
+        return await this.executor.transaction(async (transaction) => {
+          const storyRows = await transaction.query<{
+            title: string;
+            chapter_count: number;
+            was_current: boolean;
+            was_published: boolean;
+          }>(
+            `SELECT s.title, s.chapter_count,
+                    (u.active_story_id = s.id) AS was_current,
+                    EXISTS (
+                      SELECT 1 FROM xumo_story_publications p
+                      WHERE p.story_id = s.id AND p.status = 'active'
+                    ) AS was_published
+             FROM xumo_stories s
+             JOIN xumo_users u ON u.id = s.owner_id
+             WHERE s.id = $1 AND s.owner_id = $2
+             FOR UPDATE OF s, u`,
+            [input.storyId, input.ownerId],
+          );
+          const row = storyRows.rows[0];
+          if (!row) throw storyNotFoundError();
+          assertStoryDeletionTitle(row.title, input.confirmationTitle);
+
+          const lockedJobs = await transaction.query<{ id: string; status: GenerationJob["status"] }>(
+            `SELECT id, status FROM xumo_generation_jobs
+             WHERE story_id = $1
+             ORDER BY id
+             FOR UPDATE`,
+            [input.storyId],
+          );
+          if (lockedJobs.rows.some((job) => job.status === "running" || job.status === "awaiting_user_review")) {
+            throw storyDeletionBusyError();
+          }
+          this.deletedStoryIds.add(input.storyId);
+          tombstoneAdded = true;
+
+          const feedbackRows = await transaction.query<{ id: string }>(
+            `SELECT id FROM xumo_narration_review_feedback
+             WHERE job_id IN (SELECT id FROM xumo_generation_jobs WHERE story_id = $1)`,
+            [input.storyId],
+          );
+          for (const feedbackRow of feedbackRows.rows) {
+            await transaction.query(
+              `UPDATE xumo_narration_review_feedback
+               SET content_hash = $2, consented_excerpt_ciphertext = NULL, excerpt_expires_at = NULL
+               WHERE id = $1`,
+              [feedbackRow.id, fingerprint({ deletedNarrationFeedbackId: feedbackRow.id })],
+            );
+          }
+          await transaction.query(
+            `DELETE FROM xumo_narration_review_cases
+             WHERE job_id IN (SELECT id FROM xumo_generation_jobs WHERE story_id = $1)`,
+            [input.storyId],
+          );
+
+          const jobs = await transaction.query<{ id: string; payload: unknown }>(
+            "SELECT id, payload FROM xumo_generation_jobs WHERE story_id = $1",
+            [input.storyId],
+          );
+          for (const jobRow of jobs.rows) {
+            const job = sanitizeGenerationJobAfterStoryDeletion(parseJson<GenerationJob>(jobRow.payload));
+            await transaction.query(
+              "UPDATE xumo_generation_jobs SET story_id = $2, payload = $3::jsonb WHERE id = $1",
+              [jobRow.id, DELETED_STORY_PLACEHOLDER, stableJson(job)],
+            );
+          }
+
+          const failures = await transaction.query<{ id: string; payload: unknown }>(
+            "SELECT id, payload FROM xumo_generation_failure_observations WHERE story_id = $1",
+            [input.storyId],
+          );
+          for (const failureRow of failures.rows) {
+            const failure = sanitizeGenerationFailureAfterStoryDeletion(
+              parseJson<GenerationFailureObservation>(failureRow.payload),
+            );
+            await transaction.query(
+              `UPDATE xumo_generation_failure_observations
+               SET story_id = $2, fingerprint = $3, payload = $4::jsonb WHERE id = $1`,
+              [failureRow.id, DELETED_STORY_PLACEHOLDER, failure.fingerprint, stableJson(failure)],
+            );
+          }
+
+          await transaction.query("DELETE FROM xumo_safety_decisions WHERE story_id = $1", [input.storyId]);
+          await transaction.query("DELETE FROM xumo_content_reports WHERE story_id = $1", [input.storyId]);
+
+          const affectedAudits = await transaction.query<AuditRow>(
+            `SELECT id, actor_user_id, action, target_type, target_id, created_at, payload
+             FROM xumo_audit_events
+             WHERE target_id = $1
+                OR payload #>> '{metadata,storyId}' = $1
+                OR payload ->> 'storyId' = $1`,
+            [input.storyId],
+          );
+          for (const auditRow of affectedAudits.rows) {
+            const event = sanitizeStoryAuditAfterDeletion(toAuditEvent(auditRow), input.storyId);
+            await transaction.query(
+              "UPDATE xumo_audit_events SET target_id = $2, payload = $3::jsonb WHERE id = $1",
+              [auditRow.id, event.targetId, stableJson(event)],
+            );
+          }
+
+          await transaction.query(
+            "UPDATE xumo_users SET active_story_id = NULL WHERE active_story_id = $1",
+            [input.storyId],
+          );
+          await transaction.query(
+            "DELETE FROM xumo_stories WHERE id = $1 AND owner_id = $2",
+            [input.storyId, input.ownerId],
+          );
+
+          const deletionResult: StoryDeletionResult = {
+            wasCurrentStory: row.was_current,
+            wasPublished: row.was_published,
+            hadChapters: row.chapter_count > 0,
+          };
+          await this.upsertAudit(
+            transaction,
+            createStoryDeletionAudit(input.ownerId, input.auditId, input.deletedAt, deletionResult),
+          );
+          return deletionResult;
+        });
+      } catch (error) {
+        if (tombstoneAdded) {
+          try {
+            const authoritativeStory = await this.executor.query(
+              "SELECT 1 FROM xumo_stories WHERE id = $1",
+              [input.storyId],
+            );
+            if (authoritativeStory.rows.length > 0) {
+              this.deletedStoryIds.delete(input.storyId);
+            }
+            this.uncertainStoryIds.delete(input.storyId);
+          } catch {
+            this.uncertainStoryIds.add(input.storyId);
+          }
+        }
+        throw error;
+      }
+    });
+    this.fingerprints.delete(`story:${input.storyId}`);
+    return result;
   }
 
   private async upsertUser(executor: DatabaseExecutor, user: UserAccount, insertOnly: boolean): Promise<void> {
@@ -1047,6 +1261,7 @@ export class PostgresDatabase implements PersistenceDatabase {
   }
 
   async close(): Promise<void> {
+    await this.saveQueue.catch(() => undefined);
     await this.executor.close();
   }
 }
