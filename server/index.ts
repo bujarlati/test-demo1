@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import express, { type NextFunction, type Request, type Response } from "express";
+import express, { type Response } from "express";
 import { z } from "zod";
 import type { ChapterGenerationStatusPayload, ContentReport, GenerationJob, ModelConnection, OpsMetrics, OpsQualityBucket, PublicationModerationOverview, Story, UserAccount } from "../src/types";
 import { isStoryTone, STORY_GENRES, STORY_LENGTH_OPTIONS, type StoryGenre, type StoryLengthPlanId } from "../src/storyConfig";
@@ -48,6 +48,7 @@ import {
   contextualNarrationReviewEnabled,
   deleteExpiredNarrationReviewData,
   failExpiredNarrationReviewCase,
+  deleteOwnedStory,
   listRecoverableNarrationReviews,
   findStoredGenerationJob,
   getNarrationReviewCaseById,
@@ -115,6 +116,11 @@ import {
 import { readingExperienceCadenceAuditEvents } from "./readingExperience";
 import { createPublicStoryRouter } from "./publicStoryRoutes";
 import { publicStorySharingEnabled } from "./publicStorySharing";
+import { apiErrorHandler } from "./apiError";
+import {
+  createStoryDeletionRouter,
+  createStoryMutationLockManager,
+} from "./storyDeletionRoutes";
 
 interface HostedStaticAsset {
   body: string;
@@ -161,7 +167,7 @@ if (interruptedJobs.length > 0) {
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST?.trim() || "0.0.0.0";
 const projectRoot = process.cwd();
-const storyMutationLocks = new Set<string>();
+const storyMutationLocks = createStoryMutationLockManager();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
 const storyCoreWriteWindows = new Map<string, { count: number; resetAt: number }>();
@@ -626,6 +632,11 @@ app.use("/api", (_request, response, next) => {
   next();
 });
 app.use("/api", authenticate(store, (hash) => findUserBySessionTokenHash(store, hash)));
+app.use("/api", createStoryDeletionRouter({
+  storyMutationLocks,
+  deleteStory: (input) => deleteOwnedStory(store, input).then(() => undefined),
+  ownsStory: async (ownerId, storyId) => (await loadOwnedStory(store, ownerId, storyId)) !== null,
+}));
 app.use("/api", createPublicStoryRouter({
   getSharingModule: requirePublicStorySharingModule,
   persistReport: async (input) => {
@@ -744,10 +755,6 @@ app.get("/api/stories/:storyId/state", (request, response) => {
 app.post("/api/stories/:storyId/constraints", async (request, response) => {
   const user = currentUser(response);
   const storedStory = storyOrThrow(request.params.storyId, user);
-  if (storyMutationLocks.has(storedStory.id)) {
-    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
-    return;
-  }
   const body = createConstraintSchema.parse(request.body);
   const idempotencyKey = body.idempotencyKey ?? request.header("idempotency-key");
   if (!idempotencyKey) {
@@ -755,7 +762,11 @@ app.post("/api/stories/:storyId/constraints", async (request, response) => {
     return;
   }
   assertStoryCoreWriteRate(user.id, storedStory.id);
-  storyMutationLocks.add(storedStory.id);
+  const storyMutation = storyMutationLocks.tryAcquire(storedStory.id, user.id);
+  if (!storyMutation.acquired) {
+    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
+    return;
+  }
   try {
     const nextStory = structuredClone(storedStory);
     const constraint = createStoryConstraint(nextStory, { ...body, source: "reader", idempotencyKey });
@@ -775,17 +786,13 @@ app.post("/api/stories/:storyId/constraints", async (request, response) => {
     });
     response.status(201).json({ constraint, worldState: projectStoryWorldState(nextStory), duplicate: false });
   } finally {
-    storyMutationLocks.delete(storedStory.id);
+    storyMutation.release();
   }
 });
 
 app.post("/api/stories/:storyId/events", async (request, response) => {
   const user = currentUser(response);
   const storedStory = storyOrThrow(request.params.storyId, user);
-  if (storyMutationLocks.has(storedStory.id)) {
-    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
-    return;
-  }
   const body = appendEventSchema.parse(request.body);
   const idempotencyKey = body.idempotencyKey ?? request.header("idempotency-key");
   if (!idempotencyKey) {
@@ -793,7 +800,11 @@ app.post("/api/stories/:storyId/events", async (request, response) => {
     return;
   }
   assertStoryCoreWriteRate(user.id, storedStory.id);
-  storyMutationLocks.add(storedStory.id);
+  const storyMutation = storyMutationLocks.tryAcquire(storedStory.id, user.id);
+  if (!storyMutation.acquired) {
+    response.status(409).json({ message: "故事正在提交其他正史变更，请稍后重试。" });
+    return;
+  }
   try {
     const nextStory = structuredClone(storedStory);
     const narrative = describeReaderStoryEvent(nextStory, { ...body, idempotencyKey });
@@ -814,7 +825,7 @@ app.post("/api/stories/:storyId/events", async (request, response) => {
     });
     response.status(201).json({ event, worldState: projectStoryWorldState(nextStory), duplicate: false });
   } finally {
-    storyMutationLocks.delete(storedStory.id);
+    storyMutation.release();
   }
 });
 
@@ -1024,6 +1035,13 @@ async function generateChapter(
   emit: (event: string, payload: unknown) => void,
 ): Promise<GenerationResult> {
   const storedStory = storyOrThrow(storyId, user);
+  const storyMutation = storyMutationLocks.tryAcquire(storedStory.id, user.id);
+  if (!storyMutation.acquired) {
+    const error = new Error("这个故事已有续章作业在运行，请等待当前作业完成。");
+    Object.assign(error, { status: 409 });
+    throw error;
+  }
+  try {
   if (storedStory.status === "active" && storedStory.chapters.length >= storedStory.targetChapterCount) {
     if (!finalizeStoryIfTargetReached(storedStory)) {
       const error = new Error("故事已达到目标章数，但结局契约尚未完整兑现；已阻止继续追加章节，请先修订终章。");
@@ -1034,11 +1052,6 @@ async function generateChapter(
   }
   if (storedStory.status !== "active") {
     const error = new Error(storedStory.status === "paused" ? "故事已暂停；恢复连载后才能生成下一章。" : "这个故事已结束或归档，不能继续生成。");
-    Object.assign(error, { status: 409 });
-    throw error;
-  }
-  if (storyMutationLocks.has(storedStory.id)) {
-    const error = new Error("这个故事已有续章作业在运行，请等待当前作业完成。");
     Object.assign(error, { status: 409 });
     throw error;
   }
@@ -1064,7 +1077,6 @@ async function generateChapter(
   }
   const reservation = await reserveIdempotencyKey(user.id, body.idempotencyKey);
   if (reservation.duplicate) return duplicateGenerationResult(storedStory, user.id, body.idempotencyKey);
-  storyMutationLocks.add(storedStory.id);
   const baselineStory = structuredClone(storedStory);
   const story = structuredClone(baselineStory);
   const startedAt = performance.now();
@@ -1494,8 +1506,9 @@ async function generateChapter(
     });
     await persist();
     throw error;
+  }
   } finally {
-    storyMutationLocks.delete(story.id);
+    storyMutation.release();
   }
 }
 
@@ -1604,15 +1617,17 @@ app.post("/api/stories/:storyId/messages", async (request, response) => {
       eventId: z.string().min(1).optional(),
     }).optional(),
   }).parse(request.body);
+  const storyMutation = storyMutationLocks.tryAcquire(storedStory.id, user.id);
+  if (!storyMutation.acquired) {
+    response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
+    return;
+  }
+  try {
   const safety = recordSafetyDecision(store, user.id, "reader_message", body.message, storedStory.id);
   audit(store, user.id, `safety.${safety.decision}`, "story", storedStory.id, { surface: safety.surface });
   await persist();
   assertSafetyAllowed(safety);
   storedStory = storyOrThrow(request.params.storyId, user);
-  if (storyMutationLocks.has(storedStory.id)) {
-    response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
-    return;
-  }
   if (await hasIdempotencyKey(user.id, body.idempotencyKey)) {
     response.json({ story: storedStory, duplicate: true });
     return;
@@ -1623,7 +1638,6 @@ app.post("/api/stories/:storyId/messages", async (request, response) => {
     response.json({ story: storedStory, duplicate: true });
     return;
   }
-  storyMutationLocks.add(storedStory.id);
   const story = structuredClone(storedStory);
   const storyIndex = storyIndexOrThrow(storedStory.id);
   const previousJobs = structuredClone(store.jobs);
@@ -1655,10 +1669,11 @@ app.post("/api/stories/:storyId/messages", async (request, response) => {
     store.auditEvents = previousAuditEvents;
     await releaseStoredIdempotencyKey(store, user.id, body.idempotencyKey);
     throw error;
-  } finally {
-    storyMutationLocks.delete(storedStory.id);
   }
   response.status(201).json({ story, message, duplicate: false });
+  } finally {
+    storyMutation.release();
+  }
 });
 
 app.put("/api/stories/:storyId/reading-progress", async (request, response) => {
@@ -1749,10 +1764,12 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
   const user = currentUser(response);
   const storedStory = storyOrThrow(request.params.storyId, user);
   const body = generateSchema.parse(request.body);
-  if (storyMutationLocks.has(storedStory.id)) {
+  const storyMutation = storyMutationLocks.tryAcquire(storedStory.id, user.id);
+  if (!storyMutation.acquired) {
     response.status(409).json({ message: "这个故事正在提交另一项正史变更，请稍后重试。" });
     return;
   }
+  try {
   if (await hasIdempotencyKey(user.id, body.idempotencyKey)) {
     const priorRollback = storedStory.retcons.find(
       (item) => item.kind === "rollback" && item.reversesRetconId === request.params.retconId,
@@ -1766,7 +1783,6 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
     response.json({ story: storedStory, duplicate: true });
     return;
   }
-  storyMutationLocks.add(storedStory.id);
   const story = structuredClone(storedStory);
   const storyIndex = storyIndexOrThrow(storedStory.id);
   const previousAuditEvents = structuredClone(store.auditEvents);
@@ -1784,10 +1800,11 @@ app.post("/api/stories/:storyId/retcons/:retconId/rollback", async (request, res
     store.auditEvents = previousAuditEvents;
     await releaseStoredIdempotencyKey(store, user.id, body.idempotencyKey);
     throw error;
-  } finally {
-    storyMutationLocks.delete(storedStory.id);
   }
   response.json({ story, retcon });
+  } finally {
+    storyMutation.release();
+  }
 });
 
 app.post("/api/stories/:storyId/canon-changes/read", async (request, response) => {
@@ -2121,22 +2138,7 @@ if (process.env.NODE_ENV === "production") {
   });
 }
 
-app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
-  if (error instanceof z.ZodError) {
-    response.status(400).json({ message: "提交内容不完整或格式不正确。", issues: error.issues });
-    return;
-  }
-  const status =
-    error instanceof Error && "status" in error && typeof error.status === "number"
-      ? error.status
-      : 500;
-  const message = error instanceof Error ? error.message : "服务器处理失败。";
-  console.error(`[api] ${message}`);
-  const safetyDecisionId = error instanceof Error && "safetyDecisionId" in error && typeof error.safetyDecisionId === "string"
-    ? error.safetyDecisionId
-    : undefined;
-  response.status(status).json({ message, ...(safetyDecisionId ? { safetyDecisionId } : {}) });
-});
+app.use(apiErrorHandler);
 
 app.listen(port, host, () => {
   console.log(`Xumo API listening on http://${host}:${port}`);

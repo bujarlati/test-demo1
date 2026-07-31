@@ -124,7 +124,10 @@ export function authenticate(
         ? await resolveUser(hash)
         : session ? store.users.find((item) => item.id === session.userId) ?? null : null;
       if (!user) {
-        response.status(401).json({ message: "请登录后继续。" });
+        response.status(401).json({
+          message: "请登录后继续。",
+          code: "authentication_required",
+        });
         return;
       }
       response.locals.user = user;
