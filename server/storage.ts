@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppStore, AuditEvent, AuthSession, NarrationReviewMetricBucket, Story, UserAccount } from "../src/types";
@@ -29,6 +29,16 @@ import {
   summarizeGenerationFailures,
   upgradeGenerationFailureObservation,
 } from "./failureTelemetry";
+import {
+  applyStoryDeletionToStore,
+  assertStoryDeletionTitle,
+  createStoryDeletionAudit,
+  hasActiveStoryWork,
+  storyDeletionBusyError,
+  storyNotFoundError,
+  type PersistStoryDeletionInput,
+  type StoryDeletionResult,
+} from "./storyDeletion";
 
 export const dataDirectory = process.env.XUMO_DATA_DIRECTORY?.trim()
   || (process.env.NODE_ENV === "production" ? "/tmp/xumo-data" : path.join(process.cwd(), "server", "data"));
@@ -367,6 +377,79 @@ export async function saveStore(store: AppStore, rollbackOnFailure?: () => void)
   }
   await enqueueStoreSave(store, rollbackOnFailure);
 }
+
+type StoryDeletionCommand = Pick<
+  PersistStoryDeletionInput,
+  "ownerId" | "storyId" | "confirmationTitle"
+>;
+
+interface StoryDeletionStorageDependencies {
+  getDatabase(): PersistenceDatabase | null;
+  save(store: AppStore, rollbackOnFailure?: () => void): Promise<void>;
+  now(): string;
+  createAuditId(): string;
+}
+
+export function createStoryDeletionStorage(dependencies: StoryDeletionStorageDependencies) {
+  return async (
+    store: AppStore,
+    input: StoryDeletionCommand,
+  ): Promise<StoryDeletionResult> => {
+    const persistence = dependencies.getDatabase();
+    const persistenceInput: PersistStoryDeletionInput = {
+      ...input,
+      auditId: dependencies.createAuditId(),
+      deletedAt: dependencies.now(),
+    };
+
+    if (persistence) {
+      // The transaction owns the authoritative title and job state. Runtime data can
+      // be stale after another process committed, so it must never veto PostgreSQL.
+      const result = await persistence.deleteOwnedStory(persistenceInput);
+      applyStoryDeletionToStore(
+        store,
+        input.ownerId,
+        input.storyId,
+        createStoryDeletionAudit(
+          input.ownerId,
+          persistenceInput.auditId,
+          persistenceInput.deletedAt,
+          result,
+        ),
+      );
+      return result;
+    }
+
+    const story = store.stories.find(
+      (candidate) => candidate.id === input.storyId && candidate.ownerId === input.ownerId,
+    );
+    if (!story) throw storyNotFoundError();
+    assertStoryDeletionTitle(story.title, input.confirmationTitle);
+    if (hasActiveStoryWork(store, input.storyId)) throw storyDeletionBusyError();
+
+    const owner = store.users.find((user) => user.id === input.ownerId);
+    const result: StoryDeletionResult = {
+      wasCurrentStory: owner?.activeStoryId === input.storyId,
+      wasPublished: false,
+      hadChapters: story.chapters.length > 0,
+    };
+    const rollback = applyStoryDeletionToStore(
+      store,
+      input.ownerId,
+      input.storyId,
+      createStoryDeletionAudit(input.ownerId, persistenceInput.auditId, persistenceInput.deletedAt, result),
+    );
+    await dependencies.save(store, rollback);
+    return result;
+  };
+}
+
+export const deleteOwnedStory = createStoryDeletionStorage({
+  getDatabase: () => database,
+  save: saveStore,
+  now: () => new Date().toISOString(),
+  createAuditId: () => `audit_${randomUUID().slice(0, 10)}`,
+});
 
 export async function loadLegacyStoreFromFile(filePath: string): Promise<AppStore> {
   const contents = await readFile(filePath, "utf8");
