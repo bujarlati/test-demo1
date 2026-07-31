@@ -1,4 +1,5 @@
 import { ApiError, ApiTransportError } from "./api";
+import type { BootstrapPayload } from "./types";
 
 const DEFAULT_PROBE_DELAYS_MS = [100, 300, 700] as const;
 const DEFAULT_PROBE_TIMEOUT_MS = 600;
@@ -33,6 +34,24 @@ export class StoryDeletionOutcomeUnknownError extends Error {
   }
 }
 
+export type StoryDeletionBootstrapRefreshOutcome =
+  | { kind: "refreshed"; payload: BootstrapPayload }
+  | { kind: "authentication_required" }
+  | { kind: "unavailable" };
+
+export async function refreshStoryDeletionBootstrapBestEffort(
+  loadBootstrap: () => Promise<BootstrapPayload>,
+): Promise<StoryDeletionBootstrapRefreshOutcome> {
+  try {
+    return { kind: "refreshed", payload: await loadBootstrap() };
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      return { kind: "authentication_required" };
+    }
+    return { kind: "unavailable" };
+  }
+}
+
 interface DeleteStoryWithReconciliationOptions {
   storyId: string;
   confirmationTitle: string;
@@ -46,6 +65,7 @@ interface DeleteStoryWithReconciliationOptions {
 type ProbeResult =
   | { kind: "exists" }
   | { kind: "absent" }
+  | { kind: "pending" }
   | { kind: "transport"; error: ApiTransportError }
   | { kind: "server_error"; error: ApiError }
   | { kind: "timeout" };
@@ -54,6 +74,9 @@ function classifyProbeError(error: unknown): ProbeResult {
   if (error instanceof ApiError) {
     if (error.status === 404) return { kind: "absent" };
     if (error.status >= 500) return { kind: "server_error", error };
+    if (error.status === 409 && error.code === "story_delete_busy") {
+      return { kind: "pending" };
+    }
     throw error;
   }
   if (error instanceof ApiTransportError) return { kind: "transport", error };

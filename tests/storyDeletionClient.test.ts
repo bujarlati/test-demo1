@@ -79,6 +79,39 @@ test("a lost response is reconciled after delayed probes confirm 404", async () 
   assert.deepEqual(delays, [10, 20, 40]);
 });
 
+test("a deletion-in-progress probe is retried until authoritative absence", async () => {
+  let probes = 0;
+  await deleteStoryWithReconciliation({
+    storyId: "story_a",
+    confirmationTitle: "故事 A",
+    deleteRequest: async () => { throw transportError(); },
+    probeStory: async () => {
+      probes += 1;
+      if (probes < 3) throw new ApiError("删除仍在提交", 409, "story_delete_busy");
+      throw new ApiError("故事不存在", 404, "story_not_found");
+    },
+    probeDelaysMs: [0, 0, 0],
+    wait: async () => undefined,
+  });
+  assert.equal(probes, 3);
+});
+
+test("a final deletion-in-progress probe reports an unknown outcome, not a failed deletion", async () => {
+  await assert.rejects(
+    deleteStoryWithReconciliation({
+      storyId: "story_a",
+      confirmationTitle: "故事 A",
+      deleteRequest: async () => { throw transportError(); },
+      probeStory: async () => {
+        throw new ApiError("删除仍在提交", 409, "story_delete_busy");
+      },
+      probeDelaysMs: [0, 0],
+      wait: async () => undefined,
+    }),
+    (error: unknown) => error instanceof StoryDeletionOutcomeUnknownError,
+  );
+});
+
 test("a final existence probe reports a clear deletion failure", async () => {
   let probes = 0;
   await assert.rejects(
@@ -318,11 +351,31 @@ test("shared API requests wrap fetch TypeError as ApiTransportError", async () =
   });
 });
 
+test("shared API requests wrap response-body TypeError as ApiTransportError", async () => {
+  const bodyError = new TypeError("response body interrupted");
+  await withBrowserGlobals(async () => {
+    const response = new Response("{}", {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    Object.defineProperty(response, "json", {
+      value: async () => { throw bodyError; },
+    });
+    return response;
+  }, async () => {
+    await assert.rejects(
+      api.probeOwnedStory("story_a"),
+      (error: unknown) => error instanceof ApiTransportError && error.cause === bodyError,
+    );
+  });
+});
+
 test("api.probeOwnedStory uses the encoded read-only state route and preserves 404", async () => {
   let calls = 0;
   await withBrowserGlobals(async (input, init) => {
     calls += 1;
     assert.equal(String(input), "/api/stories/story%2Fwith%20space/state");
+    assert.equal(init?.cache, "no-store");
     assert.equal(init?.method, undefined);
     assert.equal(init?.body, undefined);
     assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer test-token");

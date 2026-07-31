@@ -13,7 +13,11 @@ import {
   sanitizeGenerationJobAfterStoryDeletion,
 } from "../server/storyDeletion";
 import { createSeedStore } from "../server/seed";
-import { createStoreSaveQueue, createStoryDeletionStorage } from "../server/storage";
+import {
+  cacheUserForRuntime,
+  createStoreSaveQueue,
+  createStoryDeletionStorage,
+} from "../server/storage";
 import type { PersistenceDatabase } from "../server/database/types";
 
 function deletionDatabase(deleteOwnedStory: PersistenceDatabase["deleteOwnedStory"]): PersistenceDatabase {
@@ -462,4 +466,61 @@ test("JSON deletion rollback restores the full pre-delete store after persistenc
     /injected JSON persistence failure/u,
   );
   assert.deepEqual(store, before);
+});
+
+test("JSON deletion does not expose staged absence while its durable save is blocked or fails", async () => {
+  const store = createSeedStore();
+  const story = store.stories[0]!;
+  const owner = store.users.find((user) => user.id === story.ownerId)!;
+  owner.activeStoryId = story.id;
+  const before = structuredClone(store);
+  let markSaveStarted!: () => void;
+  const saveStarted = new Promise<void>((resolve) => { markSaveStarted = resolve; });
+  let finishSave!: () => void;
+  const saveCanFinish = new Promise<void>((resolve) => { finishSave = resolve; });
+  const deleteStory = createStoryDeletionStorage({
+    getDatabase: () => null,
+    save: async (stagedStore) => {
+      assert.equal(stagedStore.stories.some((candidate) => candidate.id === story.id), false);
+      markSaveStarted();
+      await saveCanFinish;
+      throw new Error("injected blocked JSON save failure");
+    },
+    now: () => "2026-07-30T10:00:00.000Z",
+    createAuditId: () => "audit_json_blocked_failure",
+  });
+
+  const deletion = deleteStory(store, {
+    ownerId: owner.id,
+    storyId: story.id,
+    confirmationTitle: story.title,
+  });
+  await saveStarted;
+  assert.deepEqual(store, before, "live state must remain readable until durable commit");
+  finishSave();
+  await assert.rejects(deletion, /injected blocked JSON save failure/u);
+  assert.deepEqual(store, before, "failed persistence must not require a live-store rollback");
+});
+
+test("a late authentication result cannot recache a tombstoned active story", async () => {
+  const store = createSeedStore();
+  const sourceUser = store.users[0]!;
+  const storyId = store.stories.find((story) => story.ownerId === sourceUser.id)!.id;
+  const staleUser = { ...sourceUser, activeStoryId: storyId };
+  store.users = [];
+  const tombstones = new Set<string>();
+  let finishQuery!: (user: typeof staleUser) => void;
+  const delayedQuery = new Promise<typeof staleUser>((resolve) => { finishQuery = resolve; });
+  const lateCache = delayedQuery.then((user) => cacheUserForRuntime(
+    store,
+    user,
+    (candidateStoryId) => tombstones.has(candidateStoryId),
+  ));
+
+  tombstones.add(storyId);
+  finishQuery(staleUser);
+  const returnedUser = await lateCache;
+  assert.equal(returnedUser.activeStoryId, null);
+  assert.equal(store.users[0]?.activeStoryId, null);
+  assert.equal(staleUser.activeStoryId, storyId, "the stale query object should not be mutated");
 });

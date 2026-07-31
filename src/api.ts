@@ -109,7 +109,12 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new ApiError(message, response.status, code, details);
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    if (error instanceof TypeError) throw new ApiTransportError(error);
+    throw error;
+  }
 }
 
 export interface GenerationStreamUpdate {
@@ -318,7 +323,10 @@ export const api = {
       body: JSON.stringify({ confirmationTitle }),
     }),
   probeOwnedStory: (storyId: string, signal?: AbortSignal) =>
-    request<unknown>(`/api/stories/${encodeURIComponent(storyId)}/state`, { signal }),
+    request<unknown>(`/api/stories/${encodeURIComponent(storyId)}/state`, {
+      signal,
+      cache: "no-store",
+    }),
   worldState: (storyId: string) => request<StoryWorldState>(`/api/stories/${storyId}/state`),
   createConstraint: (
     story: Story,

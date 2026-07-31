@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { api, ApiError, authStore } from "../api";
+import { refreshStoryDeletionBootstrapBestEffort } from "../storyDeletion";
 import {
   reconcileStoryDeletionState,
   type StoryDeletionShelfReconciliation,
@@ -24,6 +25,7 @@ interface AppContextValue {
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   reconcileStoryDeletion: (input: StoryDeletionShelfReconciliation) => void;
+  refreshAfterStoryDeletion: () => Promise<void>;
   reconcileOpeningJobStatus: (status: OpeningJobStatusPayload) => void;
   reconcilePublicProfile: (profile: PublicProfile) => void;
   loadMoreStories: () => Promise<void>;
@@ -132,6 +134,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setData((current) => reconcileStoryDeletionState(current, input));
   }, []);
 
+  const refreshAfterStoryDeletion = useCallback(async () => {
+    const token = authStore.get();
+    if (!token) return;
+
+    const result = await refreshStoryDeletionBootstrapBestEffort(api.bootstrap);
+    if (authStore.get() !== token) return;
+
+    if (result.kind === "refreshed") {
+      setData(result.payload);
+      setError(null);
+      setAuthRequired(false);
+      return;
+    }
+
+    if (result.kind === "authentication_required") {
+      authStore.clear();
+      setData(null);
+      setAuthRequired(true);
+      setError(null);
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await api.logout();
@@ -157,11 +181,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       logout,
       refresh,
       reconcileStoryDeletion,
+      refreshAfterStoryDeletion,
       reconcileOpeningJobStatus,
       reconcilePublicProfile,
       loadMoreStories,
     }),
-    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, reconcilePublicProfile, reconcileStoryDeletion, refresh, register],
+    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, reconcilePublicProfile, reconcileStoryDeletion, refresh, refreshAfterStoryDeletion, register],
   );
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

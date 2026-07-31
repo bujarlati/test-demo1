@@ -8,6 +8,7 @@ import {
   createPublicStoryRouter,
   type PublicStoryModerationAuditInput,
   type PublicStoryRequestObservation,
+  type RunPublicStoryMutation,
   type PersistPublicStoryReport,
 } from "../server/publicStoryRoutes";
 import {
@@ -149,6 +150,7 @@ async function startRouteHarness(options: {
   persistReport?: PersistPublicStoryReport;
   observeRequest?: (observation: PublicStoryRequestObservation) => void;
   recordModerationAudit?: (input: PublicStoryModerationAuditInput) => Promise<void>;
+  runStoryMutation?: RunPublicStoryMutation;
 } = {}): Promise<RouteHarness> {
   const app = express();
   app.disable("x-powered-by");
@@ -162,6 +164,7 @@ async function startRouteHarness(options: {
     persistReport: options.persistReport ?? defaultPersistReport(),
     observeRequest: options.observeRequest,
     recordModerationAudit: options.recordModerationAudit ?? (async () => undefined),
+    runStoryMutation: options.runStoryMutation ?? (async (_storyId, _actorUserId, mutation) => mutation()),
   }));
   app.get("/api/private-probe", (_request, response) => {
     response.json({ ok: true });
@@ -504,6 +507,72 @@ test("public reports resolve the current revision before persisting bounded meta
   });
   assert.equal("paragraphs" in (persistedInput ?? {}), false);
   assert.equal("body" in (persistedInput ?? {}), false);
+});
+
+test("report and moderation hold one story mutation lease across their complete async chains", async (t) => {
+  const mutationScopes: Array<{ storyId: string; actorUserId: string; steps: string[] }> = [];
+  let activeScope: { storyId: string; actorUserId: string; steps: string[] } | null = null;
+  const runStoryMutation: RunPublicStoryMutation = async (storyId, actorUserId, mutation) => {
+    assert.equal(activeScope, null);
+    const scope = { storyId, actorUserId, steps: [] };
+    mutationScopes.push(scope);
+    activeScope = scope;
+    try {
+      return await mutation();
+    } finally {
+      activeScope = null;
+    }
+  };
+  const sharing = fakeSharingModule({
+    validateReportTarget: async (_viewerId, storyId, chapterId) => {
+      assert.ok(activeScope);
+      activeScope.steps.push("validate-report");
+      return { storyId, chapterId, revisionId: "revision_current" };
+    },
+    moderate: async (_adminUserId, storyId, input) => {
+      assert.ok(activeScope);
+      activeScope.steps.push("moderate");
+      return fakeSharingModule().moderate(admin.id, storyId, input);
+    },
+  });
+  const harness = await startRouteHarness({
+    user: admin,
+    getSharingModule: () => sharing,
+    runStoryMutation,
+    persistReport: async (input) => {
+      assert.ok(activeScope);
+      activeScope.steps.push("persist-report");
+      return defaultPersistReport()(input);
+    },
+    recordModerationAudit: async () => {
+      assert.ok(activeScope);
+      activeScope.steps.push("audit-moderation");
+    },
+  });
+  t.after(() => harness.close());
+
+  const report = await requestJson(harness, "/api/public-stories/story_public/reports", {
+    method: "POST",
+    body: JSON.stringify({ chapterId: "chapter_1", reason: "章节疑似违规" }),
+  });
+  assert.equal(report.response.status, 201);
+  const moderation = await requestJson(harness, "/api/ops/publications/story_public/suspend", {
+    method: "POST",
+    body: JSON.stringify({ reason: "等待人工复核" }),
+  });
+  assert.equal(moderation.response.status, 200);
+  assert.deepEqual(mutationScopes, [
+    {
+      storyId: "story_public",
+      actorUserId: admin.id,
+      steps: ["validate-report", "persist-report"],
+    },
+    {
+      storyId: "story_public",
+      actorUserId: admin.id,
+      steps: ["moderate", "audit-moderation"],
+    },
+  ]);
 });
 
 test("public success payloads are no-store and contain only the public projections", async (t) => {

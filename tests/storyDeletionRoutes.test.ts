@@ -12,7 +12,9 @@ import { apiErrorHandler } from "../server/apiError";
 import {
   createStoryDeletionRouter,
   createStoryMutationLockManager,
+  loadStoryUnlessDeleting,
   type StoryDeletionRouterOptions,
+  runWithStoryMutationLease,
   type StoryMutationLockManager,
 } from "../server/storyDeletionRoutes";
 import {
@@ -208,6 +210,7 @@ test("two concurrent deletes for one story invoke storage only once", async (t) 
 
   const first = requestDelete(harness, "story_a", { confirmationTitle: "故事 A" });
   while (calls === 0) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(manager.isDeleting("story_a"), true);
   const second = await requestDelete(harness, "story_a", { confirmationTitle: "故事 A" });
   assert.equal(second.status, 409);
   assert.equal((await responseJson(second)).code, "story_delete_busy");
@@ -343,6 +346,7 @@ test("lock leases are idempotent and stale release cannot unlock a successor", (
   assert.deepEqual(manager.tryAcquire("story_a", otherUser.id), {
     acquired: false,
     ownerId: owner.id,
+    kind: "mutation",
   });
   first.release();
   const second = manager.tryAcquire("story_a", otherUser.id);
@@ -353,4 +357,106 @@ test("lock leases are idempotent and stale release cannot unlock a successor", (
   second.release();
   second.release();
   assert.equal(manager.has("story_a"), false);
+});
+
+test("mutation leases and deletion leases expose deletion state separately", () => {
+  const manager = createStoryMutationLockManager();
+  const mutation = manager.tryAcquire("story_a", owner.id);
+  assert.equal(mutation.acquired, true);
+  assert.equal(manager.isDeleting("story_a"), false);
+  if (!mutation.acquired) throw new Error("expected a mutation lease");
+  mutation.release();
+
+  const deletion = manager.tryAcquire("story_a", owner.id, "deletion");
+  assert.equal(deletion.acquired, true);
+  assert.equal(manager.isDeleting("story_a"), true);
+  if (!deletion.acquired) throw new Error("expected a deletion lease");
+  deletion.release();
+  assert.equal(manager.isDeleting("story_a"), false);
+});
+
+test("a story load that finishes after deletion starts reports pending instead of false absence", async () => {
+  const manager = createStoryMutationLockManager();
+  let finishLoad!: (story: { id: string }) => void;
+  const pendingLoad = new Promise<{ id: string }>((resolve) => { finishLoad = resolve; });
+  const loaded = loadStoryUnlessDeleting(manager, "story_a", owner.id, () => pendingLoad);
+
+  const deletion = manager.tryAcquire("story_a", owner.id, "deletion");
+  assert.equal(deletion.acquired, true);
+  finishLoad({ id: "story_a" });
+  await assert.rejects(
+    loaded,
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "story_delete_busy",
+  );
+  if (deletion.acquired) deletion.release();
+});
+
+test("an owner gets pending even when the database load would return null", async () => {
+  const manager = createStoryMutationLockManager();
+  const deletion = manager.tryAcquire("story_private", owner.id, "deletion");
+  assert.equal(deletion.acquired, true);
+  try {
+    await assert.rejects(
+      loadStoryUnlessDeleting(manager, "story_private", owner.id, async () => {
+        assert.fail("the owner should be rejected before loading a tombstoned story");
+      }),
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && error.code === "story_delete_busy",
+    );
+  } finally {
+    if (deletion.acquired) deletion.release();
+  }
+});
+
+test("a deletion lease does not reveal a null story to another user", async () => {
+  const manager = createStoryMutationLockManager();
+  const deletion = manager.tryAcquire("story_private", owner.id, "deletion");
+  assert.equal(deletion.acquired, true);
+  try {
+    assert.equal(
+      await loadStoryUnlessDeleting(manager, "story_private", otherUser.id, async () => null),
+      null,
+    );
+  } finally {
+    if (deletion.acquired) deletion.release();
+  }
+});
+
+test("the shared mutation wrapper excludes deletion for the complete async mutation", async () => {
+  const manager = createStoryMutationLockManager();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let finishMutation!: () => void;
+  const canFinish = new Promise<void>((resolve) => { finishMutation = resolve; });
+  const mutation = runWithStoryMutationLease(manager, "story_a", otherUser.id, async () => {
+    markStarted();
+    await canFinish;
+    return "saved";
+  });
+  await started;
+
+  assert.deepEqual(manager.tryAcquire("story_a", owner.id, "deletion"), {
+    acquired: false,
+    ownerId: otherUser.id,
+    kind: "mutation",
+  });
+  finishMutation();
+  assert.equal(await mutation, "saved");
+
+  const deletion = manager.tryAcquire("story_a", owner.id, "deletion");
+  assert.equal(deletion.acquired, true);
+  if (deletion.acquired) deletion.release();
+
+  await assert.rejects(
+    runWithStoryMutationLease(manager, "story_a", otherUser.id, async () => {
+      throw new Error("mutation failed");
+    }),
+    /mutation failed/u,
+  );
+  const afterFailure = manager.tryAcquire("story_a", owner.id, "deletion");
+  assert.equal(afterFailure.acquired, true);
+  if (afterFailure.acquired) afterFailure.release();
 });

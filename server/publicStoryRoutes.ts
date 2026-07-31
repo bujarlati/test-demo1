@@ -21,6 +21,12 @@ export type PersistPublicStoryReport = (
   input: PublicStoryReportInput,
 ) => Promise<ContentReport>;
 
+export type RunPublicStoryMutation = <Result>(
+  storyId: string,
+  actorUserId: string,
+  mutation: () => Promise<Result>,
+) => Promise<Result>;
+
 export type PublicStoryObservedRoute =
   | "publication.status"
   | "publication.publish"
@@ -53,6 +59,7 @@ export interface PublicStoryRouterOptions {
   persistReport: PersistPublicStoryReport;
   observeRequest?: (observation: PublicStoryRequestObservation) => void;
   recordModerationAudit?: (input: PublicStoryModerationAuditInput) => Promise<void>;
+  runStoryMutation: RunPublicStoryMutation;
 }
 
 interface PublicStoryRouteLocals {
@@ -309,17 +316,19 @@ export function createPublicStoryRouter(options: PublicStoryRouterOptions): Rout
     const user = currentUser(response);
     const { publicStoryId } = publicStoryIdParamsSchema.parse(request.params);
     const input = publicReportInputSchema.parse(request.body);
-    const target = await sharingModule(response, options.getSharingModule).validateReportTarget(
-      user.id,
-      publicStoryId,
-      input.chapterId,
-    );
-    const report = await options.persistReport({
-      reporterUserId: user.id,
-      storyId: target.storyId,
-      chapterId: target.chapterId,
-      revisionId: target.revisionId,
-      reason: input.reason,
+    const report = await options.runStoryMutation(publicStoryId, user.id, async () => {
+      const target = await sharingModule(response, options.getSharingModule).validateReportTarget(
+        user.id,
+        publicStoryId,
+        input.chapterId,
+      );
+      return options.persistReport({
+        reporterUserId: user.id,
+        storyId: target.storyId,
+        chapterId: target.chapterId,
+        revisionId: target.revisionId,
+        reason: input.reason,
+      });
     });
     response.status(201).json(report);
   }));
@@ -328,16 +337,19 @@ export function createPublicStoryRouter(options: PublicStoryRouterOptions): Rout
     const user = currentAdmin(response);
     const { publicStoryId } = publicStoryIdParamsSchema.parse(request.params);
     const { reason } = suspendInputSchema.parse(request.body);
-    const result = await sharingModule(response, options.getSharingModule).moderate(user.id, publicStoryId, {
-      action: "suspend",
-      reason,
-    });
-    await options.recordModerationAudit?.({
-      actorUserId: user.id,
-      storyId: publicStoryId,
-      action: "suspend",
-      reason: result.adminReason ?? reason,
-      resultingStatus: result.status,
+    const result = await options.runStoryMutation(publicStoryId, user.id, async () => {
+      const moderated = await sharingModule(response, options.getSharingModule).moderate(user.id, publicStoryId, {
+        action: "suspend",
+        reason,
+      });
+      await options.recordModerationAudit?.({
+        actorUserId: user.id,
+        storyId: publicStoryId,
+        action: "suspend",
+        reason: moderated.adminReason ?? reason,
+        resultingStatus: moderated.status,
+      });
+      return moderated;
     });
     response.json(result);
   }));
@@ -345,14 +357,17 @@ export function createPublicStoryRouter(options: PublicStoryRouterOptions): Rout
   router.post("/ops/publications/:publicStoryId/restore", asyncRoute(async (request, response) => {
     const user = currentAdmin(response);
     const { publicStoryId } = publicStoryIdParamsSchema.parse(request.params);
-    const result = await sharingModule(response, options.getSharingModule).moderate(user.id, publicStoryId, {
-      action: "restore",
-    });
-    await options.recordModerationAudit?.({
-      actorUserId: user.id,
-      storyId: publicStoryId,
-      action: "restore",
-      resultingStatus: result.status,
+    const result = await options.runStoryMutation(publicStoryId, user.id, async () => {
+      const moderated = await sharingModule(response, options.getSharingModule).moderate(user.id, publicStoryId, {
+        action: "restore",
+      });
+      await options.recordModerationAudit?.({
+        actorUserId: user.id,
+        storyId: publicStoryId,
+        action: "restore",
+        resultingStatus: moderated.status,
+      });
+      return moderated;
     });
     response.json(result);
   }));

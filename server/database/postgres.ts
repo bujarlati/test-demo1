@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -319,6 +319,10 @@ export class PostgresDatabase implements PersistenceDatabase {
     this.publicStorySharing = createPublicStorySharingModule(this.publicStories);
   }
 
+  isStoryDeleted(storyId: string): boolean {
+    return this.deletedStoryIds.has(storyId) || this.uncertainStoryIds.has(storyId);
+  }
+
   async migrate(): Promise<void> {
     await this.executor.execute(`
       CREATE TABLE IF NOT EXISTS xumo_schema_migrations (
@@ -386,18 +390,23 @@ export class PostgresDatabase implements PersistenceDatabase {
     return result;
   }
 
+  private async resolveUncertainStoryId(storyId: string): Promise<void> {
+    if (!this.uncertainStoryIds.has(storyId)) return;
+    const authoritativeStory = await this.executor.query(
+      "SELECT 1 FROM xumo_stories WHERE id = $1",
+      [storyId],
+    );
+    if (authoritativeStory.rows.length > 0) {
+      this.deletedStoryIds.delete(storyId);
+    } else {
+      this.deletedStoryIds.add(storyId);
+    }
+    this.uncertainStoryIds.delete(storyId);
+  }
+
   private async resolveUncertainStoryIds(): Promise<void> {
-    for (const storyId of this.uncertainStoryIds) {
-      const authoritativeStory = await this.executor.query(
-        "SELECT 1 FROM xumo_stories WHERE id = $1",
-        [storyId],
-      );
-      if (authoritativeStory.rows.length > 0) {
-        this.deletedStoryIds.delete(storyId);
-      } else {
-        this.deletedStoryIds.add(storyId);
-      }
-      this.uncertainStoryIds.delete(storyId);
+    for (const storyId of [...this.uncertainStoryIds]) {
+      await this.resolveUncertainStoryId(storyId);
     }
   }
 
@@ -693,6 +702,8 @@ export class PostgresDatabase implements PersistenceDatabase {
   }
 
   async loadStory(ownerId: string, storyId: string): Promise<Story | null> {
+    await this.resolveUncertainStoryId(storyId);
+    if (this.deletedStoryIds.has(storyId)) return null;
     const storyResult = await this.executor.query<StoryRow>(
       "SELECT id, owner_id, updated_at, payload FROM xumo_stories WHERE id = $1 AND owner_id = $2",
       [storyId, ownerId],
@@ -741,6 +752,8 @@ export class PostgresDatabase implements PersistenceDatabase {
       ...(row.has_unread_revision ? { hasUnreadRevision: true } : {}),
     }));
     const story = { ...parseJson<Omit<Story, "chapters">>(storyRow.payload), chapters } as Story;
+    await this.resolveUncertainStoryId(storyId);
+    if (this.deletedStoryIds.has(storyId)) return null;
     this.markLoaded("story", story.id, story);
     return story;
   }
@@ -893,6 +906,7 @@ export class PostgresDatabase implements PersistenceDatabase {
     const result = await this.enqueueMutation(async () => {
       await this.resolveUncertainStoryIds();
       let tombstoneAdded = false;
+      let deletionResult: StoryDeletionResult | null = null;
       try {
         return await this.executor.transaction(async (transaction) => {
           const storyRows = await transaction.query<{
@@ -928,6 +942,11 @@ export class PostgresDatabase implements PersistenceDatabase {
             throw storyDeletionBusyError();
           }
           this.deletedStoryIds.add(input.storyId);
+          deletionResult = {
+            wasCurrentStory: row.was_current,
+            wasPublished: row.was_published,
+            hadChapters: row.chapter_count > 0,
+          };
           tombstoneAdded = true;
 
           const feedbackRows = await transaction.query<{ id: string }>(
@@ -936,11 +955,15 @@ export class PostgresDatabase implements PersistenceDatabase {
             [input.storyId],
           );
           for (const feedbackRow of feedbackRows.rows) {
+            const anonymizedId = "narration_feedback_deleted_" + randomUUID();
+            const anonymizedCandidateId = "narration_candidate_deleted_" + randomUUID();
+            const anonymizedContentHash = randomBytes(32).toString("hex");
             await transaction.query(
               `UPDATE xumo_narration_review_feedback
-               SET content_hash = $2, consented_excerpt_ciphertext = NULL, excerpt_expires_at = NULL
+               SET id = $2, candidate_id = $3, content_hash = $4,
+                   consented_excerpt_ciphertext = NULL, excerpt_expires_at = NULL
                WHERE id = $1`,
-              [feedbackRow.id, fingerprint({ deletedNarrationFeedbackId: feedbackRow.id })],
+              [feedbackRow.id, anonymizedId, anonymizedCandidateId, anonymizedContentHash],
             );
           }
           await transaction.query(
@@ -1004,11 +1027,6 @@ export class PostgresDatabase implements PersistenceDatabase {
             [input.storyId, input.ownerId],
           );
 
-          const deletionResult: StoryDeletionResult = {
-            wasCurrentStory: row.was_current,
-            wasPublished: row.was_published,
-            hadChapters: row.chapter_count > 0,
-          };
           await this.upsertAudit(
             transaction,
             createStoryDeletionAudit(input.ownerId, input.auditId, input.deletedAt, deletionResult),
@@ -1024,6 +1042,9 @@ export class PostgresDatabase implements PersistenceDatabase {
             );
             if (authoritativeStory.rows.length > 0) {
               this.deletedStoryIds.delete(input.storyId);
+            } else if (deletionResult) {
+              this.uncertainStoryIds.delete(input.storyId);
+              return deletionResult;
             }
             this.uncertainStoryIds.delete(input.storyId);
           } catch {

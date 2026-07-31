@@ -16,7 +16,7 @@ export function ArchivePage() {
   const { storyId = "" } = useParams();
   const toast = useToast();
   const navigate = useNavigate();
-  const { reconcileStoryDeletion, refresh } = useApp();
+  const { reconcileStoryDeletion, refresh, refreshAfterStoryDeletion } = useApp();
   const [story, setStory] = useState<Story | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<ArchiveTab>("characters");
@@ -104,6 +104,7 @@ export function ArchivePage() {
       setDeletionOpen(false);
       navigate("/", { replace: true });
       toast("故事已永久删除。");
+      void refreshAfterStoryDeletion();
     } catch (requestError) {
       setDeletionError(requestError instanceof Error ? requestError.message : "故事删除失败，请重试。");
     } finally {

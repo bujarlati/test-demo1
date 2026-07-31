@@ -120,6 +120,8 @@ import { apiErrorHandler } from "./apiError";
 import {
   createStoryDeletionRouter,
   createStoryMutationLockManager,
+  loadStoryUnlessDeleting,
+  runWithStoryMutationLease,
 } from "./storyDeletionRoutes";
 
 interface HostedStaticAsset {
@@ -639,6 +641,9 @@ app.use("/api", createStoryDeletionRouter({
 }));
 app.use("/api", createPublicStoryRouter({
   getSharingModule: requirePublicStorySharingModule,
+  runStoryMutation: (storyId, actorUserId, mutation) => runWithStoryMutationLease(
+    storyMutationLocks, storyId, actorUserId, mutation,
+  ),
   persistReport: async (input) => {
     const createdAt = new Date().toISOString();
     const report: ContentReport = {
@@ -675,7 +680,10 @@ app.use("/api", createPublicStoryRouter({
 app.param("storyId", async (request, response, next, storyId) => {
   try {
     const user = currentUser(response);
-    const story = await loadOwnedStory(store, user.id, String(storyId));
+    const normalizedStoryId = String(storyId);
+    const story = await loadStoryUnlessDeleting(storyMutationLocks, normalizedStoryId, user.id, () => (
+      loadOwnedStory(store, user.id, normalizedStoryId)
+    ));
     if (!story) {
       response.status(404).json({ message: "故事不存在或不属于当前账号。" });
       return;
@@ -748,6 +756,7 @@ app.get("/api/stories/:storyId", async (request, response) => {
 });
 
 app.get("/api/stories/:storyId/state", (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
   const story = storyOrThrow(request.params.storyId, currentUser(response));
   response.json(projectStoryWorldState(story));
 });

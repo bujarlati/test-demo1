@@ -5,6 +5,7 @@ import { PostgresDatabase } from "../server/database/postgres";
 import type { DatabaseExecutor, QueryResult } from "../server/database/types";
 import { createGenerationFailureObservation } from "../server/failureTelemetry";
 import { createSeedStore } from "../server/seed";
+import { createStoryDeletionStorage } from "../server/storage";
 import { DELETED_STORY_PLACEHOLDER } from "../server/storyDeletion";
 import { PGlite, PGliteExecutor } from "./helpers/pglite";
 
@@ -178,6 +179,99 @@ class StoryDeleteGateExecutor implements DatabaseExecutor {
   }
 }
 
+interface CommitAcknowledgementLossState {
+  armed: boolean;
+  deletedInsideTransaction: boolean;
+}
+
+class CommitAcknowledgementLostExecutor implements DatabaseExecutor {
+  constructor(
+    private readonly inner: DatabaseExecutor,
+    readonly state: CommitAcknowledgementLossState = {
+      armed: false,
+      deletedInsideTransaction: false,
+    },
+    private readonly insideTransaction = false,
+  ) {}
+
+  async query<Row = Record<string, unknown>>(
+    sql: string,
+    parameters?: unknown[],
+  ): Promise<QueryResult<Row>> {
+    if (this.state.armed && this.insideTransaction && /DELETE FROM xumo_stories/u.test(sql)) {
+      this.state.deletedInsideTransaction = true;
+    }
+    return this.inner.query<Row>(sql, parameters);
+  }
+
+  execute(sql: string): Promise<void> {
+    return this.inner.execute(sql);
+  }
+
+  async transaction<T>(work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> {
+    const result = await this.inner.transaction((executor) => work(
+      new CommitAcknowledgementLostExecutor(executor, this.state, true),
+    ));
+    if (this.state.armed && this.state.deletedInsideTransaction) {
+      this.state.deletedInsideTransaction = false;
+      throw new Error("injected commit acknowledgement loss");
+    }
+    return result;
+  }
+
+  close(): Promise<void> {
+    return this.inner.close();
+  }
+}
+
+interface StaleStoryLoadState {
+  armed: boolean;
+  captured: Deferred;
+  release: Deferred;
+  blocked: boolean;
+}
+
+class StaleStoryLoadExecutor implements DatabaseExecutor {
+  constructor(
+    private readonly inner: DatabaseExecutor,
+    readonly state: StaleStoryLoadState = {
+      armed: false,
+      captured: deferred(),
+      release: deferred(),
+      blocked: false,
+    },
+  ) {}
+
+  async query<Row = Record<string, unknown>>(
+    sql: string,
+    parameters?: unknown[],
+  ): Promise<QueryResult<Row>> {
+    if (this.state.armed
+      && !this.state.blocked
+      && /SELECT id, owner_id, updated_at, payload FROM xumo_stories WHERE id/u.test(sql)) {
+      this.state.blocked = true;
+      const captured = await this.inner.query<Row>(sql, parameters);
+      this.state.captured.resolve();
+      await this.state.release.promise;
+      return captured;
+    }
+    return this.inner.query<Row>(sql, parameters);
+  }
+
+  execute(sql: string): Promise<void> {
+    return this.inner.execute(sql);
+  }
+
+  transaction<T>(work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> {
+    return this.inner.transaction((executor) => work(new StaleStoryLoadExecutor(executor, this.state)));
+  }
+
+  close(): Promise<void> {
+    this.state.release.resolve();
+    return this.inner.close();
+  }
+}
+
 interface DeletionFixture {
   seed: ReturnType<typeof createSeedStore>;
   story: ReturnType<typeof createSeedStore>["stories"][number];
@@ -186,6 +280,11 @@ interface DeletionFixture {
   job: GenerationJob;
   failure: GenerationFailureObservation;
   sentinels: string[];
+  feedbackIdentity: {
+    id: string;
+    candidateId: string;
+    contentHash: string;
+  };
 }
 
 function createDeletionFixture(prefix: string): DeletionFixture {
@@ -279,6 +378,12 @@ function createDeletionFixture(prefix: string): DeletionFixture {
     metadata: { storyId: story.id, reason: sentinel("AUDIT") },
   });
 
+  const feedbackCandidateId = "narration_candidate_" + "c".repeat(20);
+  const feedbackIdentity = {
+    id: "narration_feedback_" + job.id + "_" + feedbackCandidateId,
+    candidateId: feedbackCandidateId,
+    contentHash: "b".repeat(64),
+  };
   return {
     seed,
     story,
@@ -294,12 +399,17 @@ function createDeletionFixture(prefix: string): DeletionFixture {
       "PRIVATE_REVIEW_TAG",
       "PRIVATE_FEEDBACK_IV",
       "PRIVATE_FEEDBACK_TAG",
+      feedbackIdentity.id,
+      feedbackIdentity.candidateId,
+      feedbackIdentity.contentHash,
     ],
+    feedbackIdentity,
   };
 }
 
 async function insertLinkedDatabaseRows(pglite: PGlite, fixture: DeletionFixture): Promise<void> {
   const { story, owner, reader, job } = fixture;
+  const { id: feedbackId, candidateId, contentHash } = fixture.feedbackIdentity;
   const prefix = job.id.slice("job_".length);
   await pglite.query(
     `INSERT INTO xumo_story_publications(story_id, owner_id, status, first_published_at, status_updated_at)
@@ -337,15 +447,17 @@ async function insertLinkedDatabaseRows(pglite: PGlite, fixture: DeletionFixture
        rewrite_count, rewrite_succeeded, job_completed, latency_ms, content_hash,
        consented_excerpt_ciphertext, excerpt_expires_at, created_at, updated_at
      ) VALUES (
-       $1, $2, $3, $4, 'candidate', 'rule', 'v1', 'body', 'model',
-       'allow', 'allow', 0.9, 0.85, 'user', 'keep', 0, true, true, 12, repeat('b', 64),
-       $5::jsonb, now(), now(), now()
+       $1, $2, $3, $4, $5, 'rule', 'v1', 'body', 'model',
+       'allow', 'allow', 0.9, 0.85, 'user', 'keep', 0, true, true, 12, $6,
+       $7::jsonb, now(), now(), now()
      )`,
     [
-      `feedback_${prefix}`,
+      feedbackId,
       `case_${prefix}`,
       job.id,
       owner.id,
+      candidateId,
+      contentHash,
       JSON.stringify({ version: 1, iv: "PRIVATE_FEEDBACK_IV", tag: "PRIVATE_FEEDBACK_TAG", ciphertext: `PRIVATE_${prefix}_REVIEW_EXCERPT_SENTINEL` }),
     ],
   );
@@ -481,14 +593,20 @@ test("PostgreSQL permanently deletes content and retains only scrubbed operation
     assert.notEqual(savedFailure.rows[0]?.fingerprint, failure.fingerprint);
 
     const feedback = await pglite.query<{
+      id: string;
+      candidate_id: string;
       case_id: string | null;
       content_hash: string;
       consented_excerpt_ciphertext: unknown;
       excerpt_expires_at: string | null;
     }>(
-      "SELECT case_id, content_hash, consented_excerpt_ciphertext, excerpt_expires_at FROM xumo_narration_review_feedback WHERE job_id = $1",
+      "SELECT id, candidate_id, case_id, content_hash, consented_excerpt_ciphertext, excerpt_expires_at FROM xumo_narration_review_feedback WHERE job_id = $1",
       [job.id],
     );
+    assert.match(feedback.rows[0]?.id ?? "", /^narration_feedback_deleted_[0-9a-f-]{36}$/u);
+    assert.match(feedback.rows[0]?.candidate_id ?? "", /^narration_candidate_deleted_[0-9a-f-]{36}$/u);
+    assert.notEqual(feedback.rows[0]?.id, fixture.feedbackIdentity.id);
+    assert.notEqual(feedback.rows[0]?.candidate_id, fixture.feedbackIdentity.candidateId);
     assert.equal(feedback.rows[0]?.case_id, null);
     assert.equal(feedback.rows[0]?.consented_excerpt_ciphertext, null);
     assert.equal(feedback.rows[0]?.excerpt_expires_at, null);
@@ -638,6 +756,11 @@ test("an uncertain deletion blocks writes and recovers through an authoritative 
     assert.equal(blockedStory.rows[0]?.subtitle, story.subtitle);
 
     failing.failureState.armed = false;
+    const recoveredProbe = await database.loadStory(owner.id, story.id);
+    assert.equal(recoveredProbe?.id, story.id);
+    assert.equal(recoveredProbe?.title, story.title);
+    assert.equal(database.isStoryDeleted(story.id), false);
+
     const recoveredSnapshot = structuredClone(seed);
     recoveredSnapshot.stories.find((candidate) => candidate.id === story.id)!.subtitle = "AUTHORITY_QUERY_RECOVERED";
     await database.saveSnapshot(recoveredSnapshot);
@@ -743,5 +866,79 @@ test("PostgreSQL close drains an in-flight queued deletion before closing its ex
     } else {
       await database.close();
     }
+  }
+});
+
+test("a load captured before deletion cannot return or recache the story after deletion commits", async () => {
+  const pglite = new PGlite();
+  const staleLoadExecutor = new StaleStoryLoadExecutor(new PGliteExecutor(pglite));
+  const database = new PostgresDatabase(staleLoadExecutor);
+  let pendingLoad: Promise<unknown> | null = null;
+  try {
+    await database.migrate();
+    const fixture = createDeletionFixture("LATE_LOAD");
+    const { seed, story, owner } = fixture;
+    await database.saveSnapshot(seed);
+    staleLoadExecutor.state.armed = true;
+
+    pendingLoad = database.loadStory(owner.id, story.id);
+    await staleLoadExecutor.state.captured.promise;
+    await database.deleteOwnedStory({
+      ownerId: owner.id,
+      storyId: story.id,
+      confirmationTitle: story.title,
+      auditId: "audit_late_load_delete",
+      deletedAt: "2026-07-30T10:00:00.000Z",
+    });
+    assert.equal(database.isStoryDeleted(story.id), true);
+    staleLoadExecutor.state.release.resolve();
+    assert.equal(await pendingLoad, null);
+    pendingLoad = null;
+  } finally {
+    staleLoadExecutor.state.release.resolve();
+    if (pendingLoad) await pendingLoad.catch(() => undefined);
+    await database.close();
+  }
+});
+
+test("commit acknowledgement loss returns committed deletion and still cleans runtime state", async () => {
+  const pglite = new PGlite();
+  const acknowledgementLoss = new CommitAcknowledgementLostExecutor(new PGliteExecutor(pglite));
+  const database = new PostgresDatabase(acknowledgementLoss);
+  try {
+    await database.migrate();
+    const fixture = createDeletionFixture("ACK_LOSS");
+    const { seed, story, owner } = fixture;
+    await database.saveSnapshot(seed);
+    const runtimeStore = structuredClone(seed);
+    const deleteStory = createStoryDeletionStorage({
+      getDatabase: () => database,
+      save: async () => assert.fail("PostgreSQL deletion must not save JSON"),
+      now: () => "2026-07-30T10:00:00.000Z",
+      createAuditId: () => "audit_acknowledgement_loss",
+    });
+    acknowledgementLoss.state.armed = true;
+
+    const result = await deleteStory(runtimeStore, {
+      ownerId: owner.id,
+      storyId: story.id,
+      confirmationTitle: story.title,
+    });
+
+    assert.deepEqual(result, {
+      wasCurrentStory: true,
+      wasPublished: false,
+      hadChapters: true,
+    });
+    assert.equal(runtimeStore.stories.some((candidate) => candidate.id === story.id), false);
+    assert.equal(database.isStoryDeleted(story.id), true);
+    assert.equal(await database.loadStory(owner.id, story.id), null);
+    const authoritative = await pglite.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM xumo_stories WHERE id = $1",
+      [story.id],
+    );
+    assert.equal(authoritative.rows[0]?.count, "0");
+  } finally {
+    await database.close();
   }
 });

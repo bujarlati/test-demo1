@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { ApiError } from "../src/api";
+import { refreshStoryDeletionBootstrapBestEffort } from "../src/storyDeletion";
 import type { BootstrapPayload, GenerationJob, StorySummary } from "../src/types";
 import { reconcileStoryDeletionState } from "../src/storyDeletionState";
 
@@ -70,6 +72,41 @@ function bootstrap(): BootstrapPayload {
     recoverableJobs: [job("recovery_delete", "story_delete"), job("recovery_keep", "story_keep")],
   };
 }
+
+test("a successful post-deletion bootstrap returns authoritative shelf data", async () => {
+  const payload = bootstrap();
+
+  assert.deepEqual(
+    await refreshStoryDeletionBootstrapBestEffort(async () => payload),
+    { kind: "refreshed", payload },
+  );
+});
+
+test("a post-deletion bootstrap 401 is reported as normal authentication expiry", async () => {
+  assert.deepEqual(
+    await refreshStoryDeletionBootstrapBestEffort(async () => {
+      throw new ApiError("登录已过期", 401, "authentication_required");
+    }),
+    { kind: "authentication_required" },
+  );
+});
+
+test("post-deletion bootstrap failures other than 401 are absorbed", async () => {
+  const failures = [
+    new ApiError("服务暂不可用", 503, "service_unavailable"),
+    new TypeError("fetch failed"),
+    new Error("unexpected bootstrap failure"),
+  ];
+
+  for (const failure of failures) {
+    assert.deepEqual(
+      await refreshStoryDeletionBootstrapBestEffort(async () => {
+        throw failure;
+      }),
+      { kind: "unavailable" },
+    );
+  }
+});
 
 test("shelf reconciliation removes a loaded story and clears all local references", () => {
   const current = bootstrap();
@@ -167,6 +204,44 @@ test("the permanent-deletion entry is exclusive to ArchivePage", async () => {
   for (const source of forbiddenSources) {
     assert.doesNotMatch(source, /StoryDeletionDialog|story-danger-zone|永久删除故事/);
   }
+});
+
+test("successful deletion keeps immediate feedback and starts an authoritative refresh afterward", async () => {
+  const archiveSource = await readFile(
+    new URL("../src/pages/ArchivePage.tsx", import.meta.url),
+    "utf8",
+  );
+  const contextSource = await readFile(
+    new URL("../src/context/AppContext.tsx", import.meta.url),
+    "utf8",
+  );
+  const reconcileAt = archiveSource.indexOf("reconcileStoryDeletion({");
+  const navigateAt = archiveSource.indexOf('navigate("/", { replace: true });', reconcileAt);
+  const toastAt = archiveSource.indexOf('toast("故事已永久删除。");', navigateAt);
+  const refreshAt = archiveSource.indexOf("void refreshAfterStoryDeletion();", toastAt);
+
+  assert.ok(reconcileAt >= 0, "successful deletion should reconcile the optimistic shelf state");
+  assert.ok(navigateAt > reconcileAt, "navigation should follow optimistic reconciliation");
+  assert.ok(toastAt > navigateAt, "the success toast should follow navigation");
+  assert.ok(refreshAt > toastAt, "the best-effort authoritative refresh should run after feedback");
+  assert.match(contextSource, /refreshAfterStoryDeletion: \(\) => Promise<void>/);
+  assert.match(contextSource, /refreshStoryDeletionBootstrapBestEffort\(api\.bootstrap\)/);
+  assert.match(contextSource, /if \(result\.kind === "refreshed"\)[\s\S]*setData\(result\.payload\);[\s\S]*setError\(null\);[\s\S]*setAuthRequired\(false\);/);
+  assert.match(contextSource, /if \(result\.kind === "authentication_required"\)[\s\S]*authStore\.clear\(\);[\s\S]*setData\(null\);[\s\S]*setAuthRequired\(true\);[\s\S]*setError\(null\);/);
+});
+
+test("the owned-story probe route disables caching before both success and not-found lookup paths", async () => {
+  const source = await readFile(new URL("../server/index.ts", import.meta.url), "utf8");
+  const routeAt = source.indexOf('app.get("/api/stories/:storyId/state"');
+  const headerAt = source.indexOf(
+    'response.setHeader("Cache-Control", "private, no-store");',
+    routeAt,
+  );
+  const lookupAt = source.indexOf("const story = storyOrThrow", routeAt);
+
+  assert.ok(routeAt >= 0, "the owned-story state route should exist");
+  assert.ok(headerAt > routeAt, "the route should set a private no-store response header");
+  assert.ok(lookupAt > headerAt, "the no-store header must be set before lookup can return 404");
 });
 
 test("the deletion dialog retains the accessible busy and error contract", async () => {

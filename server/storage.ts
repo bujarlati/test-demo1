@@ -433,13 +433,15 @@ export function createStoryDeletionStorage(dependencies: StoryDeletionStorageDep
       wasPublished: false,
       hadChapters: story.chapters.length > 0,
     };
-    const rollback = applyStoryDeletionToStore(
-      store,
+    const stagedStore = structuredClone(store);
+    applyStoryDeletionToStore(
+      stagedStore,
       input.ownerId,
       input.storyId,
       createStoryDeletionAudit(input.ownerId, persistenceInput.auditId, persistenceInput.deletedAt, result),
     );
-    await dependencies.save(store, rollback);
+    await dependencies.save(stagedStore);
+    Object.assign(store, stagedStore);
     return result;
   };
 }
@@ -456,17 +458,24 @@ export async function loadLegacyStoreFromFile(filePath: string): Promise<AppStor
   return normalizeStore(JSON.parse(contents) as AppStore);
 }
 
-function cacheUser(store: AppStore, user: UserAccount): void {
-  const index = store.users.findIndex((item) => item.id === user.id);
-  if (index >= 0) store.users[index] = user;
-  else store.users.push(user);
+export function cacheUserForRuntime(
+  store: AppStore,
+  user: UserAccount,
+  isStoryDeleted: (storyId: string) => boolean = (storyId) => database?.isStoryDeleted(storyId) ?? false,
+): UserAccount {
+  const safeUser = user.activeStoryId && isStoryDeleted(user.activeStoryId)
+    ? { ...user, activeStoryId: null }
+    : user;
+  const index = store.users.findIndex((item) => item.id === safeUser.id);
+  if (index >= 0) store.users[index] = safeUser;
+  else store.users.push(safeUser);
+  return safeUser;
 }
 
 export async function findUserByEmail(store: AppStore, email: string): Promise<UserAccount | null> {
   if (database) {
     const user = await database.findUserByEmail(email);
-    if (user) cacheUser(store, user);
-    return user;
+    return user ? cacheUserForRuntime(store, user) : null;
   }
   return store.users.find((item) => item.email.toLowerCase() === email.trim().toLowerCase()) ?? null;
 }
@@ -474,8 +483,7 @@ export async function findUserByEmail(store: AppStore, email: string): Promise<U
 export async function findUserBySessionTokenHash(store: AppStore, hash: string): Promise<UserAccount | null> {
   if (database) {
     const user = await database.findUserBySessionTokenHash(hash);
-    if (user) cacheUser(store, user);
-    return user;
+    return user ? cacheUserForRuntime(store, user) : null;
   }
   const session = store.sessions.find((item) => item.tokenHash === hash && Date.parse(item.expiresAt) > Date.now());
   return session ? store.users.find((item) => item.id === session.userId) ?? null : null;
@@ -489,7 +497,7 @@ export async function registerUser(
 ): Promise<void> {
   if (database) {
     await database.register(user, session, event);
-    cacheUser(store, user);
+    cacheUserForRuntime(store, user);
     store.auditEvents.unshift(event);
     store.auditEvents = store.auditEvents.slice(0, 500);
     return;
@@ -645,6 +653,9 @@ export async function listNarrationReviewMetrics(
 }
 
 export async function loadOwnedStory(store: AppStore, ownerId: string, storyId: string): Promise<Story | null> {
+  // Tombstones, including uncertain commit outcomes, must bypass runtime cache.
+  // Postgres resolves uncertainty authoritatively before returning.
+  if (database?.isStoryDeleted(storyId)) return database.loadStory(ownerId, storyId);
   const cached = store.stories.find((story) => story.id === storyId && story.ownerId === ownerId);
   if (cached) return cached;
   if (!database) return null;

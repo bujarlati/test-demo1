@@ -172,15 +172,19 @@ test("feedback committed before deletion is scrubbed by deletion", async () => {
 
     const saved = await harness.pglite.query<{
       content_hash: string;
+      id: string;
+      candidate_id: string;
       consented_excerpt_ciphertext: unknown;
       excerpt_expires_at: unknown;
     }>(
-      `SELECT content_hash, consented_excerpt_ciphertext, excerpt_expires_at
-       FROM xumo_narration_review_feedback WHERE id = $1`,
-      [feedback.id],
+      `SELECT id, candidate_id, content_hash, consented_excerpt_ciphertext, excerpt_expires_at
+       FROM xumo_narration_review_feedback WHERE job_id = $1`,
+      [feedback.jobId],
     );
     assert.equal(saved.rows.length, 1);
     assert.notEqual(saved.rows[0]?.content_hash, feedback.contentHash);
+    assert.notEqual(saved.rows[0]?.id, feedback.id);
+    assert.notEqual(saved.rows[0]?.candidate_id, feedback.candidateId);
     assert.equal(saved.rows[0]?.consented_excerpt_ciphertext, null);
     assert.equal(saved.rows[0]?.excerpt_expires_at, null);
   } finally {

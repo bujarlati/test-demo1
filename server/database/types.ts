@@ -59,6 +59,7 @@ export interface PersistenceDatabase {
   readonly kind: "postgresql";
   readonly publicStories: PublicStoryReadRepository;
   readonly publicStorySharing: PublicStorySharingModule;
+  isStoryDeleted(storyId: string): boolean;
   migrate(): Promise<void>;
   isEmpty(): Promise<boolean>;
   loadRuntimeStore(): Promise<AppStore>;

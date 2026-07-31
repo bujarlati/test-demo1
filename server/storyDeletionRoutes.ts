@@ -12,26 +12,34 @@ type DeleteStoryCommand = Pick<
   "ownerId" | "storyId" | "confirmationTitle"
 >;
 
+export type StoryMutationLeaseKind = "mutation" | "deletion";
 export type StoryMutationLease = () => void;
 
 export type StoryMutationLockAttempt =
   | { acquired: true; release: StoryMutationLease }
-  | { acquired: false; ownerId: string };
+  | { acquired: false; ownerId: string; kind: StoryMutationLeaseKind };
 
 export interface StoryMutationLockManager {
   has(storyId: string): boolean;
-  tryAcquire(storyId: string, ownerId: string): StoryMutationLockAttempt;
+  isDeleting(storyId: string): boolean;
+  isDeletingBy(storyId: string, ownerId: string): boolean;
+  tryAcquire(storyId: string, ownerId: string, kind?: StoryMutationLeaseKind): StoryMutationLockAttempt;
 }
 
 export function createStoryMutationLockManager(): StoryMutationLockManager {
-  const leases = new Map<string, { ownerId: string; token: symbol }>();
+  const leases = new Map<string, { ownerId: string; token: symbol; kind: StoryMutationLeaseKind }>();
   return {
     has: (storyId) => leases.has(storyId),
-    tryAcquire: (storyId, ownerId) => {
+    isDeleting: (storyId) => leases.get(storyId)?.kind === "deletion",
+    isDeletingBy: (storyId, ownerId) => {
+      const lease = leases.get(storyId);
+      return lease?.kind === "deletion" && lease.ownerId === ownerId;
+    },
+    tryAcquire: (storyId, ownerId, kind = "mutation") => {
       const current = leases.get(storyId);
-      if (current) return { acquired: false, ownerId: current.ownerId };
+      if (current) return { acquired: false, ownerId: current.ownerId, kind: current.kind };
       const token = Symbol(storyId);
-      leases.set(storyId, { ownerId, token });
+      leases.set(storyId, { ownerId, token, kind });
       let released = false;
       return {
         acquired: true,
@@ -43,6 +51,37 @@ export function createStoryMutationLockManager(): StoryMutationLockManager {
       };
     },
   };
+}
+
+export async function runWithStoryMutationLease<Result>(
+  manager: StoryMutationLockManager,
+  storyId: string,
+  actorUserId: string,
+  mutation: () => Promise<Result>,
+): Promise<Result> {
+  const lease = manager.tryAcquire(storyId, actorUserId);
+  if (!lease.acquired) throw storyDeletionBusyError();
+  try {
+    return await mutation();
+  } finally {
+    lease.release();
+  }
+}
+
+export async function loadStoryUnlessDeleting<Result>(
+  manager: StoryMutationLockManager,
+  storyId: string,
+  requesterOwnerId: string,
+  load: () => Promise<Result | null>,
+): Promise<Result | null> {
+  if (manager.isDeletingBy(storyId, requesterOwnerId)) throw storyDeletionBusyError();
+  const result = await load();
+  if (manager.isDeletingBy(storyId, requesterOwnerId)
+    || (result !== null && manager.isDeleting(storyId))) {
+    throw storyDeletionBusyError();
+  }
+
+  return result;
 }
 
 export interface StoryDeletionRouterOptions {
@@ -81,7 +120,7 @@ export function createStoryDeletionRouter(options: StoryDeletionRouterOptions): 
     const user = currentUser(response);
     const { storyId } = paramsSchema.parse(request.params);
     const { confirmationTitle } = bodySchema.parse(request.body);
-    const lock = options.storyMutationLocks.tryAcquire(storyId, user.id);
+    const lock = options.storyMutationLocks.tryAcquire(storyId, user.id, "deletion");
     if (!lock.acquired) {
       if (lock.ownerId === user.id) throw storyDeletionBusyError();
       // A different user can hold only a short, unverified lease. Preserve ownership
