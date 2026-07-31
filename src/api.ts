@@ -69,16 +69,29 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiTransportError extends Error {
+  constructor(cause: TypeError) {
+    super("网络连接失败，请检查网络后重试。", { cause });
+    this.name = "ApiTransportError";
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const token = authStore.get();
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...init?.headers,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (error) {
+    if (error instanceof TypeError) throw new ApiTransportError(error);
+    throw error;
+  }
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     let code: string | undefined;
@@ -299,6 +312,13 @@ export const api = {
       method: "POST",
     }),
   story: (storyId: string) => request<Story>(`/api/stories/${storyId}`),
+  deleteStory: (storyId: string, confirmationTitle: string) =>
+    request<void>(`/api/stories/${encodeURIComponent(storyId)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirmationTitle }),
+    }),
+  probeOwnedStory: (storyId: string, signal?: AbortSignal) =>
+    request<unknown>(`/api/stories/${encodeURIComponent(storyId)}/state`, { signal }),
   worldState: (storyId: string) => request<StoryWorldState>(`/api/stories/${storyId}/state`),
   createConstraint: (
     story: Story,
