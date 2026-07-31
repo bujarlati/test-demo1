@@ -8,6 +8,10 @@ import {
   useState,
 } from "react";
 import { api, ApiError, authStore } from "../api";
+import {
+  reconcileStoryDeletionState,
+  type StoryDeletionShelfReconciliation,
+} from "../storyDeletionState";
 import type { BootstrapPayload, OpeningJobStatusPayload, PublicProfile } from "../types";
 
 interface AppContextValue {
@@ -19,6 +23,7 @@ interface AppContextValue {
   register: (name: string, email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
+  reconcileStoryDeletion: (input: StoryDeletionShelfReconciliation) => void;
   reconcileOpeningJobStatus: (status: OpeningJobStatusPayload) => void;
   reconcilePublicProfile: (profile: PublicProfile) => void;
   loadMoreStories: () => Promise<void>;
@@ -122,6 +127,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     } : current);
   }, []);
 
+  const reconcileStoryDeletion = useCallback((input: StoryDeletionShelfReconciliation) => {
+    setError(null);
+    setData((current) => reconcileStoryDeletionState(current, input));
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await api.logout();
@@ -146,11 +156,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       register,
       logout,
       refresh,
+      reconcileStoryDeletion,
       reconcileOpeningJobStatus,
       reconcilePublicProfile,
       loadMoreStories,
     }),
-    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, reconcilePublicProfile, refresh, register],
+    [authRequired, data, error, loading, loadMoreStories, login, logout, reconcileOpeningJobStatus, reconcilePublicProfile, reconcileStoryDeletion, refresh, register],
   );
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

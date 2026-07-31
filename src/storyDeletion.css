@@ -1,0 +1,236 @@
+.story-danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 28px;
+  padding: 22px 24px;
+  border: 1px solid rgba(142, 69, 52, 0.42);
+  border-radius: 16px;
+  background: #fbf2ed;
+}
+
+.story-danger-zone h2 {
+  margin: 4px 0 6px;
+  color: #8e4534;
+  font-family: "Songti SC", STSong, serif;
+  font-size: 20px;
+}
+
+.story-danger-zone p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.story-danger-zone .button {
+  flex: 0 0 auto;
+}
+
+.story-deletion-backdrop {
+  z-index: 280;
+}
+
+.story-deletion-dialog {
+  display: grid;
+  width: min(500px, 100%);
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.68);
+  border-radius: 20px;
+  background: #fffdf8;
+  box-shadow: 0 28px 90px rgba(35, 18, 15, 0.38);
+}
+
+.story-deletion-dialog:focus-visible {
+  outline: 3px solid #8e4534;
+  outline-offset: 3px;
+}
+
+.story-deletion-dialog > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  padding: 24px 26px 20px;
+  border-bottom: 1px solid #eadbd4;
+}
+
+.story-deletion-dialog > header h2 {
+  margin: 5px 0 0;
+  color: var(--ink);
+  font-family: "Songti SC", STSong, serif;
+  font-size: 25px;
+}
+
+.story-deletion-dialog > header > button {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--ink-2);
+  background: #f2ebe6;
+  cursor: pointer;
+}
+
+.story-deletion-dialog > header > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.story-deletion-dialog__icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 50%;
+  color: #8e4534;
+  background: #f5dfd5;
+}
+
+.story-deletion-dialog__body {
+  display: grid;
+  min-height: 0;
+  align-content: start;
+  gap: 18px;
+  overflow-y: auto;
+  padding: 24px 26px;
+  overscroll-behavior: contain;
+}
+
+.story-deletion-dialog__body > p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.story-deletion-dialog label {
+  display: grid;
+  gap: 7px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.story-deletion-dialog label strong {
+  overflow-wrap: anywhere;
+  color: #8e4534;
+  font-size: 15px;
+}
+
+.story-deletion-dialog input {
+  width: 100%;
+  height: 44px;
+  padding: 0 12px;
+  border: 1px solid #9f8a81;
+  border-radius: 10px;
+  color: var(--ink);
+  background: #fff;
+}
+
+.story-deletion-dialog input[readonly] {
+  color: var(--ink-2);
+  background: #f4efeb;
+}
+
+.story-deletion-dialog input[aria-invalid="true"] {
+  border-color: #7a392d;
+}
+
+.story-deletion-dialog input:focus-visible {
+  border-color: #7a392d;
+  outline: 3px solid #7a392d;
+  outline-offset: 2px;
+}
+
+.story-deletion-dialog__body > .story-deletion-dialog__error {
+  padding: 10px 12px;
+  border-radius: 9px;
+  color: #743326;
+  background: #fae8df;
+  font-weight: 650;
+}
+
+.story-deletion-dialog > footer {
+  display: flex;
+  min-height: 74px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 15px 26px;
+  border-top: 1px solid #eadbd4;
+  background: #faf6f1;
+}
+
+.story-deletion-dialog__status {
+  margin-right: auto;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 640px) {
+  .story-danger-zone {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 20px 18px;
+  }
+
+  .story-danger-zone .button {
+    width: 100%;
+  }
+
+  .story-deletion-backdrop {
+    padding: 12px;
+  }
+
+  .story-deletion-dialog > header,
+  .story-deletion-dialog__body {
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+
+  .story-deletion-dialog > footer {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+
+  .story-deletion-dialog__status {
+    min-height: 18px;
+    grid-column: 1 / -1;
+    margin-right: 0;
+  }
+
+  .story-deletion-dialog > footer .button {
+    width: 100%;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+}
+
+@media (max-height: 520px) {
+  .story-deletion-dialog > header {
+    padding-top: 14px;
+    padding-bottom: 12px;
+  }
+
+  .story-deletion-dialog__body {
+    gap: 12px;
+    padding-top: 14px;
+    padding-bottom: 14px;
+  }
+
+  .story-deletion-dialog > footer {
+    min-height: 62px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}

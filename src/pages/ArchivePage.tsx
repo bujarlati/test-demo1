@@ -1,11 +1,13 @@
 import { Archive, ArrowLeft, BookMarked, Eye, EyeOff, Heart, Pause, Play, ShieldCheck, Sparkles, Trash2, UsersRound } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { ErrorState, LoadingState } from "../components/States";
+import { StoryDeletionDialog } from "../components/StoryDeletionDialog";
 import { StoryPublicationActions } from "../components/StoryPublicationActions";
 import { useApp } from "../context/AppContext";
 import { useToast } from "../context/ToastContext";
+import { deleteStoryWithReconciliation } from "../storyDeletion";
 import type { Story } from "../types";
 
 type ArchiveTab = "characters" | "world" | "clues" | "preferences";
@@ -14,11 +16,15 @@ export function ArchivePage() {
   const { storyId = "" } = useParams();
   const toast = useToast();
   const navigate = useNavigate();
-  const { refresh } = useApp();
+  const { reconcileStoryDeletion, refresh } = useApp();
   const [story, setStory] = useState<Story | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<ArchiveTab>("characters");
   const [showSpoilers, setShowSpoilers] = useState(false);
+  const [deletionOpen, setDeletionOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deletionError, setDeletionError] = useState<string | null>(null);
+  const deletionSubmittingRef = useRef(false);
 
   const load = async () => {
     try {
@@ -75,6 +81,34 @@ export function ArchivePage() {
       }
     } catch (requestError) {
       toast(requestError instanceof Error ? requestError.message : "故事状态更新失败。", "error");
+    }
+  };
+
+  const deleteStory = async (confirmationTitle: string) => {
+    if (deletionSubmittingRef.current) return;
+    deletionSubmittingRef.current = true;
+    setDeleting(true);
+    setDeletionError(null);
+    try {
+      await deleteStoryWithReconciliation({
+        storyId: story.id,
+        confirmationTitle,
+        deleteRequest: api.deleteStory,
+        probeStory: api.probeOwnedStory,
+      });
+      reconcileStoryDeletion({
+        storyId: story.id,
+        chapterCount: story.chapters.length,
+        countedInShelf: story.status !== "archived",
+      });
+      setDeletionOpen(false);
+      navigate("/", { replace: true });
+      toast("故事已永久删除。");
+    } catch (requestError) {
+      setDeletionError(requestError instanceof Error ? requestError.message : "故事删除失败，请重试。");
+    } finally {
+      deletionSubmittingRef.current = false;
+      setDeleting(false);
     }
   };
 
@@ -190,6 +224,34 @@ export function ArchivePage() {
           )}
         </section>
       </div>
+
+      <section className="story-danger-zone" aria-labelledby="story-danger-title">
+        <div>
+          <span className="eyebrow">危险操作</span>
+          <h2 id="story-danger-title">永久删除这个故事</h2>
+          <p>与“移出书架”不同，永久删除会清除正文、版本历史、分享链接和读者进度。</p>
+        </div>
+        <button
+          className="button button--danger"
+          type="button"
+          aria-haspopup="dialog"
+          onClick={() => {
+            setDeletionError(null);
+            setDeletionOpen(true);
+          }}
+        >
+          <Trash2 size={16} /> 永久删除故事
+        </button>
+      </section>
+
+      <StoryDeletionDialog
+        open={deletionOpen}
+        storyTitle={story.title}
+        busy={deleting}
+        error={deletionError}
+        onClose={() => { if (!deletionSubmittingRef.current) setDeletionOpen(false); }}
+        onConfirm={deleteStory}
+      />
     </div>
   );
 }
