@@ -3607,7 +3607,7 @@ test("opening writer admission includes model-refined custom axes", async () => 
     () => generateStoryOpeningWithConnection(context, connection, async () => {
       calls += 1;
       return { value: plan, usageTokens: 100, usageEstimated: false };
-    }, 11_000),
+    }, 12_000),
     (error: Error & { usageTokens?: number }) => {
       assert.match(error.message, /剩余 Token.*开篇正文.*未启动/);
       assert.equal(error.usageTokens, 100);

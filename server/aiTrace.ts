@@ -14,6 +14,8 @@ export interface AiTraceEvent {
   timeoutMs?: number;
   maxTokens?: number;
   reportedTokens?: number;
+  finishReason?: string;
+  responseCharacters?: number;
   httpStatus?: number;
   system?: string;
   prompt?: string;

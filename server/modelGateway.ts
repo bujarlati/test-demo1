@@ -672,6 +672,7 @@ export interface CompleteJsonDependencies {
   modelFetcher?: CompletionModelFetcher;
   retryDelay?: (milliseconds: number) => Promise<void>;
   overallTimeoutMs?: number;
+  truncationTokenTiers?: readonly number[];
   remainingTokens?: number;
   stage?: string;
   now?: () => number;
@@ -686,7 +687,7 @@ export type JsonModelCompleter = <T>(
   prompt: string,
   timeout?: number,
   maxTokens?: number,
-  dependencies?: Pick<CompleteJsonDependencies, "overallTimeoutMs" | "remainingTokens" | "stage" | "validateJson">,
+  dependencies?: Pick<CompleteJsonDependencies, "overallTimeoutMs" | "truncationTokenTiers" | "remainingTokens" | "stage" | "validateJson">,
 ) => Promise<{ value: T; usageTokens: number; usageEstimated: boolean }>;
 
 function estimatedCompletionFailureTokens(system: string, prompt: string, maxTokens: number): number {
@@ -699,6 +700,23 @@ function reportedCompletionUsage(payload: unknown): number | undefined {
   if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) return undefined;
   const rounded = Math.round(total);
   return rounded > 0 ? rounded : undefined;
+}
+
+function completionFinishReason(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const chatReason = (payload as {
+    choices?: Array<{ finish_reason?: unknown }>;
+  }).choices?.[0]?.finish_reason;
+  if (typeof chatReason === "string" && chatReason.trim()) return chatReason.trim();
+  const response = payload as {
+    status?: unknown;
+    incomplete_details?: { reason?: unknown };
+  };
+  if (response.status !== "incomplete") return undefined;
+  const incompleteReason = response.incomplete_details?.reason;
+  return typeof incompleteReason === "string" && incompleteReason.trim()
+    ? incompleteReason.trim()
+    : "incomplete";
 }
 
 function completionApiFor(connection: ModelConnection): OpenAICompletionApi {
@@ -765,6 +783,7 @@ async function readChatCompletionStream(
 ): Promise<{
   content: string;
   reportedTokens: number | undefined;
+  finishReason: string | undefined;
 }> {
   if (!response.body) throw new Error("模型流式响应没有可读取的正文。");
   const reader = response.body.getReader();
@@ -772,6 +791,7 @@ async function readChatCompletionStream(
   let eventBuffer = "";
   let content = "";
   let reportedTokens: number | undefined;
+  let finishReason: string | undefined;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -796,10 +816,17 @@ async function readChatCompletionStream(
           const data = line.slice(5).trim();
           if (!data || data === "[DONE]") continue;
           const payload = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+            choices?: Array<{
+              delta?: { content?: string; reasoning_content?: string };
+              finish_reason?: unknown;
+            }>;
             usage?: { total_tokens?: number };
           };
-          const delta = payload.choices?.[0]?.delta?.content;
+          const choice = payload.choices?.[0];
+          const delta = choice?.delta?.content;
+          if (typeof choice?.finish_reason === "string" && choice.finish_reason.trim()) {
+            finishReason = choice.finish_reason.trim();
+          }
           if (typeof delta === "string") {
             content += delta;
             if (Buffer.byteLength(content, "utf8") > MAX_STREAM_CONTENT_BYTES) {
@@ -820,7 +847,7 @@ async function readChatCompletionStream(
     await reader.cancel().catch(() => undefined);
     throw error;
   }
-  return { content, reportedTokens };
+  return { content, reportedTokens, finishReason };
 }
 
 export async function completeJson<T>(
@@ -870,13 +897,17 @@ export async function completeJson<T>(
     : model === connection.routes.writer || model === connection.routes.extractor;
   const disableArkDeepThinking = isVolcengineArkConnection(connection) && /^doubao-seed-/i.test(model) &&
     isNonPlanningGenerationStage;
-  const completionBody = (requestSystem: string, requestPrompt: string): Record<string, unknown> => {
+  const completionBody = (
+    requestSystem: string,
+    requestPrompt: string,
+    requestMaxTokens: number,
+  ): Record<string, unknown> => {
     const body: Record<string, unknown> = completionApi === "responses"
       ? {
           model,
           instructions: requestSystem,
           input: requestPrompt,
-          max_output_tokens: maxTokens,
+          max_output_tokens: requestMaxTokens,
           stream: false,
         }
       : {
@@ -887,7 +918,7 @@ export async function completeJson<T>(
           ],
           temperature: model === connection.routes.extractor ? 0.2 : 0.7,
           stream: streamStructuredResponse,
-          max_tokens: maxTokens,
+          max_tokens: requestMaxTokens,
         };
     if (disableArkDeepThinking) body.thinking = { type: "disabled" };
     if (completionApi === "chat_completions") {
@@ -897,7 +928,9 @@ export async function completeJson<T>(
       if (useConciseQwenExtractorOutput) body.enable_thinking = false;
       if (
         connection.capabilities?.jsonSchema &&
-        (model === connection.routes.writer || useConciseQwenExtractorOutput)
+        (model === connection.routes.writer ||
+          useConciseQwenExtractorOutput ||
+          (isVolcengineArkConnection(connection) && model === connection.routes.planner))
       ) {
         body.response_format = { type: "json_object" };
       }
@@ -905,9 +938,17 @@ export async function completeJson<T>(
     return body;
   };
   const maximumAttempts = 3;
+  const truncationTokenTiers = [...new Set([maxTokens, ...(dependencies.truncationTokenTiers ?? [])]
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => Math.ceil(value))
+    .filter((value) => value >= maxTokens))]
+    .sort((left, right) => left - right)
+    .slice(0, maximumAttempts);
+  let currentMaxTokens = truncationTokenTiers[0] ?? maxTokens;
+  const largestConfiguredMaxTokens = truncationTokenTiers.at(-1) ?? currentMaxTokens;
   const logicalOverallTimeout = dependencies.overallTimeoutMs === undefined
     ? streamStructuredResponse
-      ? streamedCompletionOverallTimeout(timeout, maxTokens)
+      ? streamedCompletionOverallTimeout(timeout, largestConfiguredMaxTokens)
       : timeout
     : Math.max(timeout, dependencies.overallTimeoutMs);
   const deadlineAt = now() + logicalOverallTimeout;
@@ -957,14 +998,14 @@ export async function completeJson<T>(
     }
   };
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
-    const body = completionBody(requestSystem, requestPrompt);
-    const conservativeFailureTokens = estimatedCompletionFailureTokens(requestSystem, requestPrompt, maxTokens);
+    const body = completionBody(requestSystem, requestPrompt, currentMaxTokens);
+    const conservativeFailureTokens = estimatedCompletionFailureTokens(requestSystem, requestPrompt, currentMaxTokens);
     try {
       assertModelCallTokenBudget({
         remainingTokens: retryTokenBudget - priorFailureTokens,
         system: requestSystem,
         prompt: requestPrompt,
-        maxOutputTokens: maxTokens,
+        maxOutputTokens: currentMaxTokens,
         stage: attempt === 1 ? retryStage : `${retryStage}重试`,
       });
     } catch (error) {
@@ -982,7 +1023,7 @@ export async function completeJson<T>(
       attempt,
       completionApi,
       timeoutMs: Math.max(1, Math.min(timeout, remainingOverallTimeout)),
-      maxTokens,
+      maxTokens: currentMaxTokens,
       system: requestSystem,
       prompt: requestPrompt,
       providerRequest: body,
@@ -1030,6 +1071,7 @@ export async function completeJson<T>(
     }
     let content: string | undefined;
     let reportedTokens: number | undefined;
+    let finishReason: string | undefined;
     let providerPayload: unknown;
     if (streamStructuredResponse) {
       let streamedFailureTokens: number | undefined;
@@ -1039,6 +1081,7 @@ export async function completeJson<T>(
         });
         content = streamed.content;
         reportedTokens = streamed.reportedTokens;
+        finishReason = streamed.finishReason;
       } catch (error) {
         const reason = error instanceof Error ? error.message : "未知流式响应错误";
         const failureTokens = streamedFailureTokens ?? conservativeFailureTokens;
@@ -1079,16 +1122,53 @@ export async function completeJson<T>(
         ? responsesOutputText(providerPayload)
         : (providerPayload as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
       reportedTokens = reportedCompletionUsage(providerPayload);
+      finishReason = completionFinishReason(providerPayload);
     }
+    const responseCharacters = typeof content === "string" ? content.length : 0;
     await trace("response", {
       attempt,
       httpStatus: response.status,
       reportedTokens,
+      finishReason,
+      responseCharacters,
       providerPayload,
       rawContent: content,
     });
     const failureTokens = reportedTokens ?? conservativeFailureTokens;
     const failureUsageEstimated = reportedTokens === undefined;
+    const normalizedFinishReason = finishReason?.toLowerCase();
+    const outputWasTruncated = normalizedFinishReason === "length" ||
+      normalizedFinishReason === "max_output_tokens" ||
+      normalizedFinishReason === "max_tokens";
+    if (outputWasTruncated) {
+      const truncationFailure = Object.assign(
+        new Error(
+          "模型 " + model + " 输出达到 " + currentMaxTokens +
+          " Token 上限，响应在 " + responseCharacters + " 个字符处被截断。",
+        ),
+        {
+          code: "model_output_truncated",
+          finishReason,
+          maxTokens: currentMaxTokens,
+          responseCharacters,
+        },
+      );
+      await trace("error", {
+        attempt,
+        reportedTokens,
+        finishReason,
+        responseCharacters,
+        maxTokens: currentMaxTokens,
+        error: truncationFailure.message,
+      });
+      addFailedAttempt(failureTokens, failureUsageEstimated);
+      const nextMaxTokens = truncationTokenTiers.find((tier) => tier > currentMaxTokens);
+      if (attempt < maximumAttempts && nextMaxTokens !== undefined) {
+        currentMaxTokens = nextMaxTokens;
+        continue;
+      }
+      throw attachModelUsage(truncationFailure, priorFailureTokens, priorUsageEstimated);
+    }
     if (typeof content !== "string" || !content.trim()) {
       const reason = `JSON 解析错误：模型 ${model} 没有返回可用内容。`;
       await trace("error", {
@@ -1192,6 +1272,7 @@ export async function completeJson<T>(
 }
 
 const OPENING_PLANNER_OVERALL_TIMEOUT_MS = 600_000;
+export const OPENING_PLANNER_OUTPUT_TOKEN_TIERS = Object.freeze([4_000, 6_000, 8_000] as const);
 
 export interface OpeningCompletionRequest {
   connection: ModelConnection;
@@ -1201,6 +1282,7 @@ export interface OpeningCompletionRequest {
   timeout: number;
   maxTokens: number;
   overallTimeoutMs?: number;
+  truncationTokenTiers?: readonly number[];
   remainingTokens: number;
   stage: string;
   validateJson?: (value: unknown) => string[];
@@ -1229,6 +1311,7 @@ const defaultOpeningCompleter: OpeningModelCompleter = async (request) => comple
   request.maxTokens,
   {
     overallTimeoutMs: request.overallTimeoutMs,
+    truncationTokenTiers: request.truncationTokenTiers,
     remainingTokens: request.remainingTokens,
     stage: request.stage,
     validateJson: request.validateJson,
@@ -1966,8 +2049,9 @@ export async function generateStoryOpeningWithConnection(
       "规划必须使两个词在同一故事机制中兼容；体验硬承诺优先于题材默认套路。",
     ].join("\n"),
     timeout: GENERATION_STAGE_TIMEOUT_MS.planner,
-    maxTokens: 2_600,
+    maxTokens: OPENING_PLANNER_OUTPUT_TOKEN_TIERS[0],
     overallTimeoutMs: OPENING_PLANNER_OVERALL_TIMEOUT_MS,
+    truncationTokenTiers: OPENING_PLANNER_OUTPUT_TOKEN_TIERS,
     remainingTokens: tokenBudget,
     stage: "开篇规划",
     validateJson: openingPlanValidationIssues,

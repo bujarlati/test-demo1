@@ -34,6 +34,12 @@ function errorMessage(error: unknown): string {
 export function classifyGenerationFailure(error: unknown): FailureClassification {
   const message = errorMessage(error);
   const code = error instanceof Error && "code" in error ? String(error.code) : "";
+  if (
+    code === "model_output_truncated" ||
+    /输出达到\s*\d+\s*Token\s*上限.+截断/i.test(message)
+  ) {
+    return { category: "budget", reasonCode: "model_output_truncated", retryable: true };
+  }
   if (code === "chapter_editorial_revision_required") {
     const firstIssue = (error as Error & {
       editorialIssues?: Array<{ code?: unknown }>;

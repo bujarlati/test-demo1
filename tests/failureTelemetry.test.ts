@@ -57,6 +57,18 @@ test("generation failures receive stable reason codes without retaining user con
   assert.equal(observation.createdAt, "2026-07-22T01:02:03.000Z");
 });
 
+test("provider length truncation keeps a dedicated retryable failure code", () => {
+  const error = Object.assign(
+    new Error("模型 doubao 输出达到 8000 Token 上限，响应在 7000 个字符处被截断。"),
+    { code: "model_output_truncated" },
+  );
+  assert.deepEqual(classifyGenerationFailure(error), {
+    category: "budget",
+    reasonCode: "model_output_truncated",
+    retryable: true,
+  });
+});
+
 test("real production-shaped failures are separated into actionable patterns", () => {
   const cases: Array<[string, string]> = [
     ["模型 deepseek 的流式响应无效：aborted。；故事未创建，可以安全重试。", "model_transport"],
